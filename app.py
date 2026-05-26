@@ -1285,7 +1285,7 @@ def main():
     add_css()
 
     st.title("📅 ひだまり帳")
-    st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
+    st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
         "メニュー",
