@@ -619,11 +619,11 @@ def page_calendar():
     today = date.today()
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        year = st.number_input("年", min_value=2020, max_value=2100, value=today.year, step=1)
+        year = st.number_input("", min_value=2020, max_value=2100, value=today.year, step=1)
     with col2:
-        month = st.number_input("月", min_value=1, max_value=12, value=today.month, step=1)
+        month = st.number_input("", min_value=1, max_value=12, value=today.month, step=1)
     with col3:
-        st.markdown('<div class="small-note">紙の壁カレンダー</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-note"></div>', unsafe_allow_html=True)
 
     render_calendar(int(year), int(month))
 
