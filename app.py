@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.1.2
+ひだまり帳 Ver1.1.3
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり帳 Ver1.1.2"
+APP_TITLE = "ひだまり帳 Ver1.1.3"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -1343,13 +1343,14 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.1.2")
+    st.title("📅 ひだまり帳 Ver1.1.3")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
         "メニュー",
         [
             "月間カレンダー",
+            "今日は何ある",
             "予定登録",
             "予定検索・更新・削除",
             "写真メモ一覧",
@@ -1363,6 +1364,8 @@ def main():
 
     if menu == "月間カレンダー":
         page_calendar()
+    elif menu == "今日は何ある":
+        page_today()
     elif menu == "予定登録":
         page_event_register()
     elif menu == "予定検索・更新・削除":
