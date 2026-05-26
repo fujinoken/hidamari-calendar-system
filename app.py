@@ -1478,7 +1478,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="wide")
     init_db()
     add_css()
-
+ st.title("📅 ひだまり帳 Ver1.2.0")
 
     menu = st.sidebar.radio(
         "メニュー",
