@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり現場カレンダー Ver1.3.6
+ひだまり帳 ひだまり帳 Ver1.0
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり現場カレンダー Ver1.3.6"
+APP_TITLE = "ひだまり帳 ひだまり帳 Ver1.0"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -1284,7 +1284,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり現場カレンダー Ver1.3.6")
+    st.title("📅 ひだまり帳 ひだまり帳 Ver1.0")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
 
     menu = st.sidebar.radio(
