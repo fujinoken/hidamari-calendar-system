@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり帳 ひだまり帳 Ver1.0"
+APP_TITLE = "ひだまり帳 "
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
