@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり現場カレンダー Ver1.3.3
+ひだまり現場カレンダー Ver1.3.4
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり現場カレンダー Ver1.3.3"
+APP_TITLE = "ひだまり現場カレンダー Ver1.3.4"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -398,13 +398,14 @@ def add_css():
     .sunday { color: #c0392b; }
     .saturday { color: #1f4e79; }
     .event-line {
-        font-size: 0.82rem;
+        font-size: 0.78rem;
         line-height: 1.35;
         margin: 3px 0;
         padding: 3px 5px;
-        border-radius: 7px;
+        border-radius: 5px;
         background: #f6efe6;
         overflow-wrap: anywhere;
+        border-left: 3px solid #bfae9b;
     }
     .important {
         background: #ffe9e0;
@@ -449,15 +450,94 @@ def html_escape(text):
     )
 
 
+def set_selected_event(event_id):
+    st.session_state["selected_calendar_event_id"] = int(event_id)
+
+
+def get_event_by_id(event_id):
+    if not event_id:
+        return pd.DataFrame()
+    return fetch_df("SELECT * FROM events WHERE id=? LIMIT 1", (int(event_id),))
+
+
+def render_event_detail_panel():
+    event_id = st.session_state.get("selected_calendar_event_id")
+    if not event_id:
+        st.info("カレンダー内の予定ボタンを押すと、ここに詳細が表示されます。")
+        return
+
+    ev_df = get_event_by_id(event_id)
+    if ev_df.empty:
+        st.warning("選択された予定が見つかりません。")
+        st.session_state["selected_calendar_event_id"] = None
+        return
+
+    ev = ev_df.iloc[0]
+    st.markdown("---")
+    st.subheader("予定詳細")
+    st.markdown(f"### {ev['event_date']}｜{ev['category']}｜{ev['title']}")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.write(f"**利用者**：{ev['user_name'] or ''}")
+        st.caption(f"利用者ID：{ev['user_id'] or ''}")
+    with c2:
+        st.write(f"**時間**：{ev['start_time'] or ''} 〜 {ev['end_time'] or ''}")
+    with c3:
+        st.write(f"**担当**：{ev['staff_name'] or ''}")
+
+    if ev["important"]:
+        st.warning("重要マークあり")
+
+    st.write("**メモ**")
+    st.info(ev["memo"] or "メモはありません。")
+
+    photos = get_event_photos(event_id)
+    if not photos.empty:
+        st.write("**写真メモ**")
+        cols = st.columns(3)
+        for i, (_, p) in enumerate(photos.iterrows()):
+            with cols[i % 3]:
+                img_path = Path(p["file_path"])
+                if img_path.exists():
+                    st.image(str(img_path), caption=p["photo_memo"] or p["file_name"], use_container_width=True)
+                else:
+                    st.warning(f"画像が見つかりません：{p['file_name']}")
+
+    files = get_event_files(event_id)
+    if not files.empty:
+        st.write("**Excel・書類ファイル**")
+        for _, frow in files.iterrows():
+            f_path = Path(frow["file_path"])
+            st.write(f"📎 {frow['file_name']}　{frow['file_memo'] or ''}")
+            if f_path.exists():
+                with open(f_path, "rb") as f:
+                    st.download_button(
+                        "ダウンロード",
+                        data=f,
+                        file_name=frow["file_name"],
+                        key=f"detail_download_{frow['id']}"
+                    )
+            else:
+                st.warning("ファイルが見つかりません。")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("詳細を閉じる", use_container_width=True):
+            st.session_state["selected_calendar_event_id"] = None
+            st.rerun()
+    with col_b:
+        st.caption("編集・削除は「予定検索・更新・削除」メニューで行います。")
+
+
+
 def render_calendar(year, month):
     """
     紙の壁カレンダー風レイアウト。
-    Streamlitでグリッドが崩れないよう、カレンダー全体を1つのHTMLとして出力する。
+    カレンダーはHTMLで表示し、予定詳細は下部の予定ボタンから同じページ内に表示する。
     """
     events_by_day = monthly_events(year, month)
     first_weekday, last_day = calendar.monthrange(year, month)  # Monday=0, Sunday=6
-
-    # Sunday start に変換：Sunday=0, Monday=1...
     start_col = (first_weekday + 1) % 7
 
     cells = [""] * 42
@@ -487,13 +567,7 @@ def render_calendar(year, month):
         for ev in events_by_day.get(key, []):
             mark = get_category_mark(ev["category"])
             time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
-            if ev["user_name"] and ev["user_id"]:
-                user_part = f'／{ev["user_name"]}({ev["user_id"]})'
-            elif ev["user_name"]:
-                user_part = f'／{ev["user_name"]}'
-            else:
-                user_part = ""
-
+            user_part = f'／{ev["user_name"]}' if ev["user_name"] else ""
             imp_cls = " important" if int(ev["important"] or 0) == 1 else ""
             text = html_escape(f'{mark}{time_part}{ev["title"]}{user_part}')
             html.append(f'<div class="event-line{imp_cls}">{text}</div>')
@@ -501,8 +575,30 @@ def render_calendar(year, month):
         html.append('</div>')
 
     html.append('</div>')
-
     st.markdown("".join(html), unsafe_allow_html=True)
+
+    # Streamlitの通常ボタンで詳細表示。HTML内クリックより安定。
+    month_events = []
+    for key in sorted(events_by_day.keys()):
+        for ev in events_by_day[key]:
+            month_events.append(ev)
+
+    if month_events:
+        st.markdown("### 予定詳細を表示")
+        st.caption("カレンダー内のメモと同じ予定を、下のボタンから選ぶと詳細が同じページ内に表示されます。")
+        cols = st.columns(3)
+        for i, ev in enumerate(month_events):
+            mark = get_category_mark(ev["category"])
+            label_date = str(ev["event_date"])[5:]
+            label_time = f" {ev['start_time']}" if ev["start_time"] else ""
+            label_user = f"／{ev['user_name']}" if ev["user_name"] else ""
+            label = f"{label_date}{label_time} {mark}{ev['title']}{label_user}"
+            with cols[i % 3]:
+                if st.button(label, key=f"cal_event_btn_{ev['id']}", use_container_width=True):
+                    set_selected_event(int(ev["id"]))
+                    st.rerun()
+
+    render_event_detail_panel()
 
 
 # -----------------------------
@@ -1173,7 +1269,7 @@ def page_export():
 def page_about():
     st.subheader("このアプリについて")
     st.markdown("""
-    **ひだまり現場カレンダー Ver1.3.3** は、  
+    **ひだまり現場カレンダー Ver1.3.4** は、  
     グループホームなど小規模施設向けの、超軽量な予定共有アプリです。
 
     目的は、高機能なスケジュール管理ではなく、  
@@ -1209,7 +1305,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり現場カレンダー Ver1.3.3")
+    st.title("📅 ひだまり現場カレンダー Ver1.3.4")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
 
     menu = st.sidebar.radio(
