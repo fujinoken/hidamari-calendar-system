@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.1.3
+ひだまり帳 Ver1.2.0
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり帳 Ver1.1.3"
+APP_TITLE = "ひだまり帳 Ver1.2.0"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -426,6 +426,63 @@ def add_css():
         color: #7a6a5b;
         font-size: 0.9rem;
     }
+
+    .today-board-card {
+        border: 2px solid #d8d0c4;
+        border-left: 10px solid #bfae9b;
+        background: #fffdf8;
+        border-radius: 8px;
+        padding: 14px 16px;
+        margin: 10px 0;
+        box-shadow: none;
+    }
+    .today-board-card-important {
+        border-left: 10px solid #d65a31;
+        background: #fff3ee;
+    }
+    .today-board-main {
+        font-size: 1.35rem;
+        font-weight: 800;
+        line-height: 1.35;
+        color: #3f3a35;
+    }
+    .today-board-time {
+        display: inline-block;
+        min-width: 76px;
+        font-size: 1.45rem;
+        font-weight: 900;
+        color: #2f2a25;
+    }
+    .today-board-memo {
+        font-size: 1.05rem;
+        margin-top: 8px;
+        padding-left: 82px;
+        color: #4f463d;
+    }
+    .today-board-sub {
+        font-size: 0.9rem;
+        margin-top: 8px;
+        padding-left: 82px;
+        color: #7a6a5b;
+    }
+    .today-board-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #f2eadf;
+        font-size: 0.82rem;
+        margin-right: 4px;
+    }
+    .today-summary-box {
+        border: 2px solid #d8d0c4;
+        background: #f9f5ee;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin: 8px 0 14px 0;
+        font-size: 1.05rem;
+        font-weight: 700;
+    }
+
     </style>
     """, unsafe_allow_html=True)
 
@@ -483,6 +540,82 @@ def render_event_button_list(df, empty_message="予定はありません。", in
             if st.button(label, key=f"event_btn_{ev['id']}", use_container_width=True):
                 set_selected_event(int(ev["id"]))
                 st.rerun()
+
+
+
+def first_line_text(text, max_len=42):
+    """メモの1行目だけを短く表示する。"""
+    if text is None:
+        return ""
+    value = str(text).strip()
+    if not value:
+        return ""
+    first = value.splitlines()[0].strip()
+    if len(first) > max_len:
+        return first[:max_len] + "…"
+    return first
+
+
+def get_attachment_counts(event_id):
+    """写真・添付ファイル数を取得する。"""
+    photos = fetch_df("SELECT COUNT(*) AS cnt FROM event_photos WHERE event_id=?", (int(event_id),))
+    files = fetch_df("SELECT COUNT(*) AS cnt FROM event_files WHERE event_id=?", (int(event_id),))
+    photo_count = int(photos.iloc[0]["cnt"]) if not photos.empty else 0
+    file_count = int(files.iloc[0]["cnt"]) if not files.empty else 0
+    return photo_count, file_count
+
+
+def render_today_board(df):
+    """
+    今日画面専用のホワイトボード風一覧。
+    クリックしなくても7割分かるように、時刻・カテゴリ・利用者・メモ1行・担当・添付を表示する。
+    """
+    if df is None or df.empty:
+        st.info("今日の予定はありません。")
+        return
+
+    for _, ev in df.iterrows():
+        important = int(ev["important"] or 0) == 1
+        card_class = "today-board-card today-board-card-important" if important else "today-board-card"
+        time_text = ev["start_time"] if ev["start_time"] else "時間未定"
+        mark = get_category_mark(ev["category"])
+        category = html_escape(ev["category"])
+        title = html_escape(ev["title"])
+        user_name = html_escape(ev["user_name"] or "")
+        staff_name = html_escape(ev["staff_name"] or "")
+        memo_line = html_escape(first_line_text(ev["memo"]))
+        warning = "⚠️ " if important else ""
+
+        main_line = f'{warning}<span class="today-board-time">{html_escape(time_text)}</span>{mark} {category}｜{title}'
+        if user_name:
+            main_line += f'｜{user_name}'
+
+        memo_html = f'<div class="today-board-memo">メモ：{memo_line}</div>' if memo_line else ""
+
+        sub_items = []
+        if staff_name:
+            sub_items.append(f'<span class="today-board-badge">担当：{staff_name}</span>')
+
+        photo_count, file_count = get_attachment_counts(ev["id"])
+        if photo_count:
+            sub_items.append(f'<span class="today-board-badge">写真 {photo_count}</span>')
+        if file_count:
+            sub_items.append(f'<span class="today-board-badge">添付 {file_count}</span>')
+
+        sub_html = f'<div class="today-board-sub">{" ".join(sub_items)}</div>' if sub_items else ""
+
+        html = (
+            f'<div class="{card_class}">'
+            f'<div class="today-board-main">{main_line}</div>'
+            f'{memo_html}'
+            f'{sub_html}'
+            f'</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
+
+        if st.button("詳細を見る", key=f"today_detail_{ev['id']}", use_container_width=True):
+            set_selected_event(int(ev["id"]))
+            st.rerun()
 
 
 def html_escape(text):
@@ -659,7 +792,7 @@ def page_calendar():
 
 def page_today():
     st.subheader("今日は何ある")
-    st.caption("今日の通院・面会・行事・注意事項を、朝の確認用にまとめて表示します。")
+    st.caption("朝の申し送り前に、今日の予定をホワイトボード感覚で確認できます。")
 
     target = today_jst()
     target_text = target.strftime("%Y-%m-%d")
@@ -673,14 +806,17 @@ def page_today():
             f"{get_category_mark(r['category'])}{r['category']} {r['件数']}件"
             for _, r in summary.iterrows()
         ])
-        st.success(f"本日の予定：{len(df)}件　{summary_text}")
 
         important_df = df[df["important"].fillna(0).astype(int) == 1]
-        if not important_df.empty:
-            st.warning(f"重要マークあり：{len(important_df)}件")
+        important_text = f"　⚠️重要 {len(important_df)}件" if not important_df.empty else ""
 
-        st.markdown("### 今日の予定一覧")
-        render_event_button_list(df, empty_message="今日の予定はありません。", include_date=True)
+        st.markdown(
+            f'<div class="today-summary-box">本日の予定：{len(df)}件　{summary_text}{important_text}</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown("### 今日のホワイトボード")
+        render_today_board(df)
     else:
         st.info("今日の予定はありません。")
 
@@ -1343,7 +1479,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 ")
+    st.title("📅 ひだまり帳 Ver1.2.0")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
