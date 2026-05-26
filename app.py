@@ -623,7 +623,7 @@ def page_calendar():
     with col2:
         month = st.number_input("月", min_value=1, max_value=12, value=today.month, step=1)
     with col3:
-        st.markdown('<div class="small-note">紙の壁カレンダーのように、月全体の流れを一目で確認する画面です。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-note">紙の壁カレンダー</div>', unsafe_allow_html=True)
 
     render_calendar(int(year), int(month))
 
