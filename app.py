@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.1
+ひだまり帳 Ver1.1.1
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり帳 Ver1.1"
+APP_TITLE = "ひだまり帳 Ver1.1.1"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -447,42 +447,6 @@ def monthly_events(year, month):
     return events_by_day
 
 
-
-def events_by_date(target_date):
-    """指定日の予定一覧を取得する。"""
-    if hasattr(target_date, "strftime"):
-        target_date = target_date.strftime("%Y-%m-%d")
-    return fetch_df("""
-        SELECT *
-        FROM events
-        WHERE event_date = ?
-        ORDER BY
-            CASE WHEN start_time IS NULL OR start_time = '' THEN 1 ELSE 0 END,
-            start_time,
-            category,
-            id
-    """, (str(target_date),))
-
-
-def render_event_button_list(df, empty_message="予定はありません。"):
-    """予定一覧をボタン表示し、押すと同一ページに詳細を出す。"""
-    if df is None or df.empty:
-        st.info(empty_message)
-        return
-
-    cols = st.columns(3)
-    for i, (_, ev) in enumerate(df.iterrows()):
-        mark = get_category_mark(ev["category"])
-        label_time = f"{ev['start_time']} " if ev["start_time"] else ""
-        label_user = f"／{ev['user_name']}" if ev["user_name"] else ""
-        important = "⚠️ " if int(ev["important"] or 0) == 1 else ""
-        label = f"{important}{label_time}{mark}{ev['title']}{label_user}"
-
-        with cols[i % 3]:
-            if st.button(label, key=f"event_btn_{ev['id']}", use_container_width=True):
-                set_selected_event(int(ev["id"]))
-                st.rerun()
-
 def html_escape(text):
     """HTML表示用の簡易エスケープ。"""
     if text is None:
@@ -631,9 +595,19 @@ def render_calendar(year, month):
 
     if month_events:
         st.markdown("### 予定詳細を表示")
-        st.caption("下の予定ボタンから選ぶと、詳細が同じページ内に表示されます。")
-        month_df = pd.DataFrame(month_events)
-        render_event_button_list(month_df, empty_message="この月の予定はありません。")
+        st.caption("カレンダー内のメモと同じ予定を、下のボタンから選ぶと詳細が同じページ内に表示されます。")
+        cols = st.columns(3)
+        for i, ev in enumerate(month_events):
+            mark = get_category_mark(ev["category"])
+            label_date = str(ev["event_date"])[5:]
+            label_time = f" {ev['start_time']}" if ev["start_time"] else ""
+            label_user = f"／{ev['user_name']}" if ev["user_name"] else ""
+            important = "⚠️ " if int(ev["important"] or 0) == 1 else ""
+            label = f"{label_date}{label_time} {important}{mark}{ev['title']}{label_user}"
+            with cols[i % 3]:
+                if st.button(label, key=f"cal_event_btn_{ev['id']}", use_container_width=True):
+                    set_selected_event(int(ev["id"]))
+                    st.rerun()
 
     render_event_detail_panel()
 
@@ -642,7 +616,7 @@ def render_calendar(year, month):
 # Pages
 # -----------------------------
 def page_calendar():
-    today = today_jst()
+    today = date.today()
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         year = st.number_input("", min_value=2020, max_value=2100, value=today.year, step=1)
@@ -652,36 +626,6 @@ def page_calendar():
         st.markdown('<div class="small-note"></div>', unsafe_allow_html=True)
 
     render_calendar(int(year), int(month))
-
-
-
-def page_today():
-    st.subheader("今日は何ある")
-    st.caption("今日の通院・面会・行事・注意事項を、朝の確認用にまとめて表示します。")
-
-    target = today_jst()
-    target_text = target.strftime("%Y-%m-%d")
-    st.markdown(f"## {target_text} の予定")
-
-    df = events_by_date(target)
-
-    if not df.empty:
-        # 件数サマリー
-        summary = df.groupby("category").size().reset_index(name="件数")
-        summary_text = "　".join([f"{get_category_mark(r['category'])}{r['category']} {r['件数']}件" for _, r in summary.iterrows()])
-        st.success(f"本日の予定：{len(df)}件　{summary_text}")
-
-        # 重要予定
-        important_df = df[df["important"].fillna(0).astype(int) == 1]
-        if not important_df.empty:
-            st.warning(f"重要マークあり：{len(important_df)}件")
-
-        st.markdown("### 今日の予定一覧")
-        render_event_button_list(df, empty_message="今日の予定はありません。")
-    else:
-        st.info("今日の予定はありません。")
-
-    render_event_detail_panel()
 
 
 def page_event_register():
@@ -1340,14 +1284,13 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.1")
+    st.title("📅 ひだまり帳 Ver1.1.1")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
         "メニュー",
         [
             "月間カレンダー",
-            "今日は何ある",
             "予定登録",
             "予定検索・更新・削除",
             "写真メモ一覧",
@@ -1361,8 +1304,6 @@ def main():
 
     if menu == "月間カレンダー":
         page_calendar()
-    elif menu == "今日は何ある":
-        page_today()
     elif menu == "予定登録":
         page_event_register()
     elif menu == "予定検索・更新・削除":
