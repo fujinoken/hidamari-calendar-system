@@ -474,7 +474,6 @@ def get_event_by_id(event_id):
 def render_event_detail_panel():
     event_id = st.session_state.get("selected_calendar_event_id")
     if not event_id:
-        st.info("カレンダー内の予定ボタンを押すと、ここに詳細が表示されます。")
         return
 
     ev_df = get_event_by_id(event_id)
