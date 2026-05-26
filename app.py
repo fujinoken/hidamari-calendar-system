@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり現場カレンダー Ver1.3
+ひだまり現場カレンダー Ver1.3.1
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり現場カレンダー Ver1.3"
+APP_TITLE = "ひだまり現場カレンダー Ver1.3.1"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -287,24 +287,41 @@ def add_css():
         color: #4b4035;
     }
     .day-cell {
-        min-height: 125px;
-        border: 1px solid #e3d8ca;
-        border-radius: 12px;
+        min-height: 150px;
+        border: 1px solid #d8d0c4;
+        border-radius: 4px;
         padding: 8px;
         background: #fffdf8;
     }
+    .blank-cell {
+        background: #fffdf8;
+        border: 1px solid #e6ded4;
+    }
     .day-cell-muted {
-        min-height: 125px;
+        min-height: 150px;
         border: 1px solid #eee6dc;
-        border-radius: 12px;
+        border-radius: 4px;
         padding: 8px;
-        background: #f8f6f2;
+        background: #fffdf8;
         color: #aaa;
     }
     .day-num {
-        font-size: 1.1rem;
+        font-size: 2.4rem;
         font-weight: 700;
-        margin-bottom: 6px;
+        line-height: 1;
+        margin-bottom: 8px;
+        letter-spacing: -1px;
+    }
+    .write-lines {
+        height: 34px;
+        margin: 4px 0 6px 0;
+        background-image: repeating-linear-gradient(
+            to bottom,
+            transparent 0px,
+            transparent 13px,
+            #d9d2c8 14px
+        );
+        opacity: 0.75;
     }
     .sunday { color: #c0392b; }
     .saturday { color: #1f4e79; }
@@ -347,41 +364,52 @@ def monthly_events(year, month):
 
 
 def render_calendar(year, month):
+    """
+    紙の壁カレンダー風レイアウト。
+    前月・翌月の日付は表示せず、当月の日付だけを曜日位置に合わせて配置する。
+    """
     events_by_day = monthly_events(year, month)
-    cal = calendar.Calendar(firstweekday=6)  # Sunday start
-    weeks = cal.monthdatescalendar(year, month)
+    first_weekday, last_day = calendar.monthrange(year, month)  # Monday=0, Sunday=6
+
+    # Sunday start に変換：Sunday=0, Monday=1...
+    start_col = (first_weekday + 1) % 7
+
+    # 6週分の固定枠。紙カレンダーに近く、月末31日でも崩れにくい。
+    cells = [""] * 42
+    for day in range(1, last_day + 1):
+        cells[start_col + day - 1] = day
 
     st.markdown(f"## {year}年 {month}月")
     st.markdown('<div class="calendar-grid">', unsafe_allow_html=True)
 
-    for h in ["日", "月", "火", "水", "木", "金", "土"]:
+    for h in ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]:
         st.markdown(f'<div class="day-head">{h}</div>', unsafe_allow_html=True)
 
-    for week in weeks:
-        for d in week:
-            is_current = d.month == month
-            cls = "day-cell" if is_current else "day-cell-muted"
+    for idx, day in enumerate(cells):
+        dow = idx % 7
+        dow_cls = "sunday" if dow == 0 else ("saturday" if dow == 6 else "")
 
-            dow_cls = ""
-            if d.weekday() == 6:
-                dow_cls = "sunday"
-            elif d.weekday() == 5:
-                dow_cls = "saturday"
+        if day == "":
+            # 前月・翌月日は出さない。空白セルとして表示。
+            st.markdown('<div class="day-cell blank-cell"></div>', unsafe_allow_html=True)
+            continue
 
-            day_html = f'<div class="{cls}"><div class="day-num {dow_cls}">{d.day}</div>'
+        key = f"{year}-{month:02d}-{int(day):02d}"
+        day_html = f'<div class="day-cell"><div class="day-num {dow_cls}">{day}</div>'
 
-            if is_current:
-                key = d.strftime("%Y-%m-%d")
-                for ev in events_by_day.get(key, []):
-                    mark = CATEGORY_MARK.get(ev["category"], "・")
-                    time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
-                    user_part = f'／{ev["user_name"]}({ev["user_id"]})' if ev["user_name"] and ev["user_id"] else (f'／{ev["user_name"]}' if ev["user_name"] else "")
-                    imp_cls = " important" if int(ev["important"] or 0) == 1 else ""
-                    text = f'{mark}{time_part}{ev["title"]}{user_part}'
-                    day_html += f'<div class="event-line{imp_cls}">{text}</div>'
+        # 手書きしやすいように薄い罫線スペースを追加
+        day_html += '<div class="write-lines"></div>'
 
-            day_html += "</div>"
-            st.markdown(day_html, unsafe_allow_html=True)
+        for ev in events_by_day.get(key, []):
+            mark = CATEGORY_MARK.get(ev["category"], "・")
+            time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
+            user_part = f'／{ev["user_name"]}({ev["user_id"]})' if ev["user_name"] and ev["user_id"] else (f'／{ev["user_name"]}' if ev["user_name"] else "")
+            imp_cls = " important" if int(ev["important"] or 0) == 1 else ""
+            text = f'{mark}{time_part}{ev["title"]}{user_part}'
+            day_html += f'<div class="event-line{imp_cls}">{text}</div>'
+
+        day_html += "</div>"
+        st.markdown(day_html, unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -938,7 +966,7 @@ def page_export():
 def page_about():
     st.subheader("このアプリについて")
     st.markdown("""
-    **ひだまり現場カレンダー Ver1.3** は、  
+    **ひだまり現場カレンダー Ver1.3.1** は、  
     グループホームなど小規模施設向けの、超軽量な予定共有アプリです。
 
     目的は、高機能なスケジュール管理ではなく、  
@@ -973,7 +1001,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり現場カレンダー Ver1.3")
+    st.title("📅 ひだまり現場カレンダー Ver1.3.1")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
 
     menu = st.sidebar.radio(
