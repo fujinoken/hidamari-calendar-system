@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり現場カレンダー Ver1.3.1
+ひだまり現場カレンダー Ver1.3.2
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり現場カレンダー Ver1.3.1"
+APP_TITLE = "ひだまり現場カレンダー Ver1.3.2"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -272,30 +272,43 @@ def add_css():
         padding-top: 1.2rem;
         max-width: 1200px;
     }
+    .calendar-title {
+        font-size: 1.6rem;
+        font-weight: 700;
+        margin: 12px 0 10px 0;
+        color: #3f3a35;
+    }
     .calendar-grid {
         display: grid;
-        grid-template-columns: repeat(7, 1fr);
-        gap: 6px;
-        margin-top: 8px;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 0;
+        width: 100%;
+        border-top: 1px solid #d8d0c4;
+        border-left: 1px solid #d8d0c4;
+        background: #fffdf8;
     }
     .day-head {
         font-weight: 700;
         text-align: center;
-        padding: 8px;
-        border-radius: 10px;
-        background: #f4efe7;
+        padding: 8px 4px;
+        border-right: 1px solid #d8d0c4;
+        border-bottom: 1px solid #d8d0c4;
+        background: #f3eee6;
         color: #4b4035;
+        font-size: 0.82rem;
+        letter-spacing: 0.08em;
     }
     .day-cell {
-        min-height: 150px;
-        border: 1px solid #d8d0c4;
-        border-radius: 4px;
+        min-height: 135px;
+        border-right: 1px solid #d8d0c4;
+        border-bottom: 1px solid #d8d0c4;
         padding: 8px;
         background: #fffdf8;
+        box-sizing: border-box;
+        overflow: hidden;
     }
     .blank-cell {
         background: #fffdf8;
-        border: 1px solid #e6ded4;
     }
     .day-cell-muted {
         min-height: 150px;
@@ -363,10 +376,24 @@ def monthly_events(year, month):
     return events_by_day
 
 
+def html_escape(text):
+    """HTML表示用の簡易エスケープ。"""
+    if text is None:
+        return ""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+    )
+
+
 def render_calendar(year, month):
     """
     紙の壁カレンダー風レイアウト。
-    前月・翌月の日付は表示せず、当月の日付だけを曜日位置に合わせて配置する。
+    Streamlitでグリッドが崩れないよう、カレンダー全体を1つのHTMLとして出力する。
     """
     events_by_day = monthly_events(year, month)
     first_weekday, last_day = calendar.monthrange(year, month)  # Monday=0, Sunday=6
@@ -374,44 +401,49 @@ def render_calendar(year, month):
     # Sunday start に変換：Sunday=0, Monday=1...
     start_col = (first_weekday + 1) % 7
 
-    # 6週分の固定枠。紙カレンダーに近く、月末31日でも崩れにくい。
     cells = [""] * 42
     for day in range(1, last_day + 1):
         cells[start_col + day - 1] = day
 
-    st.markdown(f"## {year}年 {month}月")
-    st.markdown('<div class="calendar-grid">', unsafe_allow_html=True)
+    html = []
+    html.append(f'<div class="calendar-title">{year}年 {month}月</div>')
+    html.append('<div class="calendar-grid">')
 
     for h in ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]:
-        st.markdown(f'<div class="day-head">{h}</div>', unsafe_allow_html=True)
+        html.append(f'<div class="day-head">{h}</div>')
 
     for idx, day in enumerate(cells):
         dow = idx % 7
         dow_cls = "sunday" if dow == 0 else ("saturday" if dow == 6 else "")
 
         if day == "":
-            # 前月・翌月日は出さない。空白セルとして表示。
-            st.markdown('<div class="day-cell blank-cell"></div>', unsafe_allow_html=True)
+            html.append('<div class="day-cell blank-cell"></div>')
             continue
 
         key = f"{year}-{month:02d}-{int(day):02d}"
-        day_html = f'<div class="day-cell"><div class="day-num {dow_cls}">{day}</div>'
-
-        # 手書きしやすいように薄い罫線スペースを追加
-        day_html += '<div class="write-lines"></div>'
+        html.append('<div class="day-cell">')
+        html.append(f'<div class="day-num {dow_cls}">{day}</div>')
+        html.append('<div class="write-lines"></div>')
 
         for ev in events_by_day.get(key, []):
             mark = CATEGORY_MARK.get(ev["category"], "・")
             time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
-            user_part = f'／{ev["user_name"]}({ev["user_id"]})' if ev["user_name"] and ev["user_id"] else (f'／{ev["user_name"]}' if ev["user_name"] else "")
+            if ev["user_name"] and ev["user_id"]:
+                user_part = f'／{ev["user_name"]}({ev["user_id"]})'
+            elif ev["user_name"]:
+                user_part = f'／{ev["user_name"]}'
+            else:
+                user_part = ""
+
             imp_cls = " important" if int(ev["important"] or 0) == 1 else ""
-            text = f'{mark}{time_part}{ev["title"]}{user_part}'
-            day_html += f'<div class="event-line{imp_cls}">{text}</div>'
+            text = html_escape(f'{mark}{time_part}{ev["title"]}{user_part}')
+            html.append(f'<div class="event-line{imp_cls}">{text}</div>')
 
-        day_html += "</div>"
-        st.markdown(day_html, unsafe_allow_html=True)
+        html.append('</div>')
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    html.append('</div>')
+
+    st.markdown("".join(html), unsafe_allow_html=True)
 
 
 # -----------------------------
@@ -966,7 +998,7 @@ def page_export():
 def page_about():
     st.subheader("このアプリについて")
     st.markdown("""
-    **ひだまり現場カレンダー Ver1.3.1** は、  
+    **ひだまり現場カレンダー Ver1.3.2** は、  
     グループホームなど小規模施設向けの、超軽量な予定共有アプリです。
 
     目的は、高機能なスケジュール管理ではなく、  
@@ -1001,7 +1033,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり現場カレンダー Ver1.3.1")
+    st.title("📅 ひだまり現場カレンダー Ver1.3.2")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
 
     menu = st.sidebar.radio(
