@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり現場カレンダー Ver1.3.2
+ひだまり現場カレンダー Ver1.3.3
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり現場カレンダー Ver1.3.2"
+APP_TITLE = "ひだまり現場カレンダー Ver1.3.3"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -62,6 +62,18 @@ def init_db():
         role TEXT,
         is_active INTEGER DEFAULT 1,
         created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category_name TEXT NOT NULL UNIQUE,
+        mark TEXT,
+        sort_order INTEGER DEFAULT 100,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     )
     """)
 
@@ -135,6 +147,28 @@ def init_db():
         )
         WHERE (user_id IS NULL OR user_id = '') AND user_name IS NOT NULL
     """)
+
+
+    # カテゴリマスタ初期投入
+    cur.execute("SELECT COUNT(*) FROM categories")
+    category_count = cur.fetchone()[0]
+    if category_count == 0:
+        default_marks = {
+            "通院": "🏥",
+            "面会": "👪",
+            "行事": "🎉",
+            "外出": "🚶",
+            "注意": "⚠️",
+            "申し送り": "📝",
+            "夜勤": "🌙",
+            "その他": "・",
+        }
+        for i, name in enumerate(DEFAULT_CATEGORIES, start=1):
+            cur.execute("""
+                INSERT INTO categories
+                (category_name, mark, sort_order, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+            """, (name, default_marks.get(name, "・"), i * 10, now_text(), now_text()))
 
     conn.commit()
     conn.close()
@@ -251,7 +285,7 @@ def get_active_staff():
 # -----------------------------
 # UI helpers
 # -----------------------------
-CATEGORIES = ["通院", "面会", "行事", "外出", "注意", "申し送り", "夜勤", "その他"]
+DEFAULT_CATEGORIES = ["通院", "面会", "行事", "外出", "注意", "申し送り", "夜勤", "その他"]
 
 CATEGORY_MARK = {
     "通院": "🏥",
@@ -263,6 +297,31 @@ CATEGORY_MARK = {
     "夜勤": "🌙",
     "その他": "・",
 }
+
+
+def get_categories(active_only=True):
+    where = "WHERE is_active=1" if active_only else ""
+    df = fetch_df(f"""
+        SELECT category_name, mark, sort_order, is_active
+        FROM categories
+        {where}
+        ORDER BY sort_order, category_name
+    """)
+    if df.empty and active_only:
+        return DEFAULT_CATEGORIES
+    return df["category_name"].tolist()
+
+
+def get_category_mark(category_name):
+    df = fetch_df(
+        "SELECT mark FROM categories WHERE category_name=? LIMIT 1",
+        (category_name,)
+    )
+    if not df.empty:
+        mark = str(df.iloc[0]["mark"] or "").strip()
+        if mark:
+            return mark
+    return CATEGORY_MARK.get(category_name, "・")
 
 
 def add_css():
@@ -426,7 +485,7 @@ def render_calendar(year, month):
         html.append('<div class="write-lines"></div>')
 
         for ev in events_by_day.get(key, []):
-            mark = CATEGORY_MARK.get(ev["category"], "・")
+            mark = get_category_mark(ev["category"])
             time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
             if ev["user_name"] and ev["user_id"]:
                 user_part = f'／{ev["user_name"]}({ev["user_id"]})'
@@ -473,7 +532,7 @@ def page_event_register():
         c1, c2, c3 = st.columns(3)
         with c1:
             event_date = st.date_input("日付", value=date.today())
-            category = st.selectbox("カテゴリ", CATEGORIES)
+            category = st.selectbox("カテゴリ", get_categories())
         with c2:
             start_time = st.text_input("開始時刻", placeholder="例：10:00")
             end_time = st.text_input("終了時刻", placeholder="例：11:00")
@@ -541,7 +600,7 @@ def page_event_manage():
     with c2:
         end = st.date_input("終了日", value=date.today())
     with c3:
-        category_filter = st.selectbox("カテゴリ絞り込み", ["すべて"] + CATEGORIES)
+        category_filter = st.selectbox("カテゴリ絞り込み", ["すべて"] + get_categories())
 
     keyword = st.text_input("キーワード検索", placeholder="タイトル・メモ・利用者名・職員名")
 
@@ -669,7 +728,14 @@ def page_event_manage():
         c1, c2, c3 = st.columns(3)
         with c1:
             new_date = st.date_input("日付", value=datetime.strptime(target["event_date"], "%Y-%m-%d").date())
-            new_category = st.selectbox("カテゴリ", CATEGORIES, index=CATEGORIES.index(target["category"]) if target["category"] in CATEGORIES else 0)
+            category_options = get_categories()
+            if target["category"] and target["category"] not in category_options:
+                category_options = [target["category"]] + category_options
+            new_category = st.selectbox(
+                "カテゴリ",
+                category_options,
+                index=category_options.index(target["category"]) if target["category"] in category_options else 0
+            )
         with c2:
             new_start_time = st.text_input("開始時刻", value=target["start_time"] or "")
             new_end_time = st.text_input("終了時刻", value=target["end_time"] or "")
@@ -746,6 +812,113 @@ def page_event_manage():
         execute("DELETE FROM event_files WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM events WHERE id=?", (int(selected_id),))
         st.warning("予定と紐づく写真メモ・Excelファイルを削除しました。画面を再読み込みしてください。")
+
+
+
+def page_category_master():
+    st.subheader("予定カテゴリ設定")
+    st.caption("予定登録で使うカテゴリを追加・編集・非表示にできます。")
+
+    with st.form("category_add_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            category_name = st.text_input("カテゴリ名", placeholder="例：訪問診療、往診、買い物、家族連絡")
+        with c2:
+            mark = st.text_input("マーク", placeholder="例：🏥", value="・")
+        with c3:
+            sort_order = st.number_input("並び順", min_value=1, max_value=999, value=100, step=10)
+
+        add = st.form_submit_button("カテゴリを追加")
+
+    if add:
+        if not category_name.strip():
+            st.error("カテゴリ名を入力してください。")
+        else:
+            try:
+                execute("""
+                    INSERT INTO categories
+                    (category_name, mark, sort_order, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                """, (
+                    category_name.strip(),
+                    mark.strip() or "・",
+                    int(sort_order),
+                    now_text(),
+                    now_text(),
+                ))
+                st.success("カテゴリを追加しました。")
+            except Exception as e:
+                st.error(f"追加できませんでした。同じカテゴリ名がある可能性があります：{e}")
+
+    st.markdown("---")
+    df = fetch_df("""
+        SELECT id, category_name, mark, sort_order, is_active, created_at, updated_at
+        FROM categories
+        ORDER BY sort_order, category_name
+    """)
+
+    if df.empty:
+        st.info("カテゴリが登録されていません。")
+        return
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    selected_id = st.selectbox("編集するカテゴリID", df["id"].tolist())
+    target = df[df["id"] == selected_id].iloc[0]
+
+    with st.form("category_edit_form"):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        with c1:
+            new_name = st.text_input("カテゴリ名", value=target["category_name"])
+        with c2:
+            new_mark = st.text_input("マーク", value=target["mark"] or "・")
+        with c3:
+            new_sort = st.number_input("並び順", min_value=1, max_value=999, value=int(target["sort_order"] or 100), step=10)
+        with c4:
+            new_active = st.selectbox(
+                "状態",
+                [1, 0],
+                index=0 if int(target["is_active"] or 1) == 1 else 1,
+                format_func=lambda x: "表示" if x == 1 else "非表示"
+            )
+
+        c_update, c_delete = st.columns(2)
+        with c_update:
+            update = st.form_submit_button("更新する")
+        with c_delete:
+            delete = st.form_submit_button("削除する")
+
+    if update:
+        if not new_name.strip():
+            st.error("カテゴリ名を入力してください。")
+        else:
+            try:
+                execute("""
+                    UPDATE categories
+                    SET category_name=?, mark=?, sort_order=?, is_active=?, updated_at=?
+                    WHERE id=?
+                """, (
+                    new_name.strip(),
+                    new_mark.strip() or "・",
+                    int(new_sort),
+                    int(new_active),
+                    now_text(),
+                    int(selected_id),
+                ))
+                st.success("カテゴリを更新しました。画面を再読み込みしてください。")
+            except Exception as e:
+                st.error(f"更新できませんでした：{e}")
+
+    if delete:
+        # 既存予定で使われているカテゴリは削除ではなく非表示推奨
+        used = fetch_df("SELECT COUNT(*) AS cnt FROM events WHERE category=?", (target["category_name"],))
+        count = int(used.iloc[0]["cnt"]) if not used.empty else 0
+        if count > 0:
+            execute("UPDATE categories SET is_active=0, updated_at=? WHERE id=?", (now_text(), int(selected_id)))
+            st.warning(f"このカテゴリは既存予定で {count} 件使われているため、削除せず非表示にしました。")
+        else:
+            execute("DELETE FROM categories WHERE id=?", (int(selected_id),))
+            st.warning("カテゴリを削除しました。画面を再読み込みしてください。")
 
 
 def page_master_users():
@@ -973,6 +1146,7 @@ def page_export():
     events = fetch_df("SELECT * FROM events ORDER BY event_date, start_time, id")
     photos = fetch_df("SELECT * FROM event_photos ORDER BY event_id, id")
     files = fetch_df("SELECT * FROM event_files ORDER BY event_id, id")
+    categories = fetch_df("SELECT * FROM categories ORDER BY sort_order, category_name")
     users = fetch_df("SELECT * FROM users ORDER BY user_name")
     staff = fetch_df("SELECT * FROM staff ORDER BY staff_name")
 
@@ -981,6 +1155,7 @@ def page_export():
         events.to_excel(writer, sheet_name="予定", index=False)
         photos.to_excel(writer, sheet_name="写真メモ", index=False)
         files.to_excel(writer, sheet_name="添付ファイル", index=False)
+        categories.to_excel(writer, sheet_name="カテゴリマスタ", index=False)
         users.to_excel(writer, sheet_name="利用者マスタ", index=False)
         staff.to_excel(writer, sheet_name="職員マスタ", index=False)
 
@@ -998,7 +1173,7 @@ def page_export():
 def page_about():
     st.subheader("このアプリについて")
     st.markdown("""
-    **ひだまり現場カレンダー Ver1.3.2** は、  
+    **ひだまり現場カレンダー Ver1.3.3** は、  
     グループホームなど小規模施設向けの、超軽量な予定共有アプリです。
 
     目的は、高機能なスケジュール管理ではなく、  
@@ -1011,6 +1186,7 @@ def page_about():
     - 写真メモの登録・一覧表示
     - Excel・CSVファイルの添付・一覧表示・ダウンロード
     - 利用者IDによる予定紐づけ
+    - 予定カテゴリ設定
     - 利用者マスタ
     - 職員マスタ
     - Excel出力
@@ -1033,7 +1209,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり現場カレンダー Ver1.3.2")
+    st.title("📅 ひだまり現場カレンダー Ver1.3.3")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
 
     menu = st.sidebar.radio(
@@ -1044,6 +1220,7 @@ def main():
             "予定検索・更新・削除",
             "写真メモ一覧",
             "Excel・書類ファイル一覧",
+            "予定カテゴリ設定",
             "利用者マスタ",
             "職員マスタ",
             "Excel出力",
@@ -1061,6 +1238,8 @@ def main():
         page_photo_notes()
     elif menu == "Excel・書類ファイル一覧":
         page_attached_files()
+    elif menu == "予定カテゴリ設定":
+        page_category_master()
     elif menu == "利用者マスタ":
         page_master_users()
     elif menu == "職員マスタ":
