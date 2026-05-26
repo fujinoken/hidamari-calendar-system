@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり現場カレンダー Ver1.3.4
+ひだまり現場カレンダー Ver1.3.6
 超軽量・単独版
 Python + Streamlit + SQLite
 
@@ -15,13 +15,14 @@ Python + Streamlit + SQLite
 import sqlite3
 import calendar
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "ひだまり現場カレンダー Ver1.3.4"
+APP_TITLE = "ひだまり現場カレンダー Ver1.3.6"
 DB_PATH = Path("hidamari_calendar.db")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -174,8 +175,18 @@ def init_db():
     conn.close()
 
 
+JST = ZoneInfo("Asia/Tokyo")
+
+
 def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """
+    Streamlit Cloud上でも日本時間で保存する。
+    """
+    return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_jst():
+    return datetime.now(JST).date()
 
 
 def fetch_df(query, params=()):
@@ -627,7 +638,7 @@ def page_event_register():
     with st.form("event_register_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            event_date = st.date_input("日付", value=date.today())
+            event_date = st.date_input("日付", value=today_jst())
             category = st.selectbox("カテゴリ", get_categories())
         with c2:
             start_time = st.text_input("開始時刻", placeholder="例：10:00")
@@ -692,9 +703,9 @@ def page_event_manage():
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        start = st.date_input("開始日", value=date.today().replace(day=1))
+        start = st.date_input("開始日", value=today_jst().replace(day=1))
     with c2:
-        end = st.date_input("終了日", value=date.today())
+        end = st.date_input("終了日", value=today_jst())
     with c3:
         category_filter = st.selectbox("カテゴリ絞り込み", ["すべて"] + get_categories())
 
@@ -1266,46 +1277,14 @@ def page_export():
     st.caption("予定・利用者マスタ・職員マスタをまとめて出力します。")
 
 
-def page_about():
-    st.subheader("このアプリについて")
-    st.markdown("""
-    **ひだまり現場カレンダー Ver1.3.4** は、  
-    グループホームなど小規模施設向けの、超軽量な予定共有アプリです。
-
-    目的は、高機能なスケジュール管理ではなく、  
-    **紙の壁カレンダーの見やすさを残したまま、通院・面会・行事・注意事項を共有すること**です。
-
-    ### Ver1.0でできること
-    - 月間カレンダー表示
-    - 予定登録
-    - 予定の検索・更新・削除
-    - 写真メモの登録・一覧表示
-    - Excel・CSVファイルの添付・一覧表示・ダウンロード
-    - 利用者IDによる予定紐づけ
-    - 予定カテゴリ設定
-    - 利用者マスタ
-    - 職員マスタ
-    - Excel出力
-
-    ### 今は入れていないこと
-    - 健康チェックアプリとの自動連携
-    - Googleカレンダー連携
-    - シフト自動作成
-    - AI分析
-
-    まずは単独で安定運用し、必要になったら健康管理アプリと連携する設計です。
-    """)
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="wide")
     init_db()
     add_css()
 
-    st.title("📅 ひだまり現場カレンダー Ver1.3.4")
+    st.title("📅 ひだまり現場カレンダー Ver1.3.6")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で見るための超軽量アプリ")
 
     menu = st.sidebar.radio(
@@ -1320,7 +1299,6 @@ def main():
             "利用者マスタ",
             "職員マスタ",
             "Excel出力",
-            "このアプリについて",
         ],
     )
 
@@ -1342,8 +1320,6 @@ def main():
         page_master_staff()
     elif menu == "Excel出力":
         page_export()
-    elif menu == "このアプリについて":
-        page_about()
 
 
 if __name__ == "__main__":
