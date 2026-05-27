@@ -1442,6 +1442,363 @@ def page_attached_files():
             st.warning("ファイルが見つかりません。")
 
 
+
+# -----------------------------
+# 予定データ取込（健康管理アプリ → ひだまり帳）
+# -----------------------------
+def normalize_import_bool(value, default=True):
+    """Excel/CSV上のチェック値をTrue/Falseへ寄せる。"""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    s = str(value).strip().lower()
+    if s in ["true", "1", "yes", "y", "登録", "登録する", "する", "〇", "○", "✓", "☑"]:
+        return True
+    if s in ["false", "0", "no", "n", "登録しない", "しない", "×", "✕", "☐"]:
+        return False
+    return default
+
+
+def normalize_import_date(value):
+    """日付をYYYY-MM-DD文字列へ正規化。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    if not text:
+        return ""
+    # 2026-05-27 11:00 のような値は日付だけ使う
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.notna(dt):
+        return dt.strftime("%Y-%m-%d")
+    return text[:10]
+
+
+def normalize_import_time(value):
+    """時刻をHH:MMへ正規化。空なら空文字。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M")
+    text = str(value).strip()
+    if not text or text.lower() in ["none", "nan", "nat"]:
+        return ""
+    # Excel由来で 11:00:00 になる場合
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", text):
+        parts = text.split(":")
+        return f"{int(parts[0]):02d}:{parts[1]}"
+    # 0.5 のようなExcel時刻シリアル対策
+    try:
+        f = float(text)
+        if 0 <= f < 1:
+            minutes = int(round(f * 24 * 60))
+            return f"{minutes//60:02d}:{minutes%60:02d}"
+    except Exception:
+        pass
+    return text
+
+
+def pick_import_col(df, candidates):
+    """候補列名のうち、存在する最初の列名を返す。"""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def read_schedule_import_file(uploaded_file):
+    """予定候補Excel/CSVを読み込む。"""
+    name = str(getattr(uploaded_file, "name", "")).lower()
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding="cp932")
+    return pd.read_excel(uploaded_file)
+
+
+def normalize_schedule_import_df(raw_df):
+    """
+    健康管理アプリ側の出力列を、ひだまり帳events登録用に正規化する。
+    日本語列・英語列のどちらでも受け取れるようにする。
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=[
+            "登録する", "event_date", "start_time", "end_time", "category", "title",
+            "user_id", "user_name", "staff_name", "memo", "important", "取込状態"
+        ])
+
+    df = raw_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_register = pick_import_col(df, ["登録する", "取込対象", "登録", "import", "selected"])
+    col_date = pick_import_col(df, ["event_date", "予定日", "日付", "開始日", "日時", "開始日時"])
+    col_start = pick_import_col(df, ["start_time", "開始時刻", "開始時間"])
+    col_end = pick_import_col(df, ["end_time", "終了時刻", "終了時間"])
+    col_category = pick_import_col(df, ["category", "分類", "カテゴリ"])
+    col_title = pick_import_col(df, ["title", "タイトル", "件名", "予定タイトル"])
+    col_user_id = pick_import_col(df, ["user_id", "利用者ID", "利用者id"])
+    col_user_name = pick_import_col(df, ["user_name", "利用者名", "利用者"])
+    col_staff = pick_import_col(df, ["staff_name", "担当", "担当者", "職員", "記入者"])
+    col_memo = pick_import_col(df, ["memo", "詳細", "メモ", "内容", "備考"])
+    col_important = pick_import_col(df, ["important", "重要", "重要マーク"])
+
+    rows = []
+    for _, r in df.iterrows():
+        # 日時列しかない場合、時刻も拾う
+        raw_date_value = r.get(col_date, "") if col_date else ""
+        event_date = normalize_import_date(raw_date_value)
+        start_time = normalize_import_time(r.get(col_start, "")) if col_start else ""
+        end_time = normalize_import_time(r.get(col_end, "")) if col_end else ""
+        if not start_time and col_date and ("時" in str(raw_date_value) or ":" in str(raw_date_value)):
+            dt = pd.to_datetime(raw_date_value, errors="coerce")
+            if pd.notna(dt):
+                start_time = dt.strftime("%H:%M")
+
+        category = str(r.get(col_category, "その他") if col_category else "その他").strip() or "その他"
+        title = str(r.get(col_title, "") if col_title else "").strip()
+        user_id = str(r.get(col_user_id, "") if col_user_id else "").strip()
+        user_name = str(r.get(col_user_name, "") if col_user_name else "").strip()
+        staff_name = str(r.get(col_staff, "") if col_staff else "").strip()
+        memo = str(r.get(col_memo, "") if col_memo else "").strip()
+        important = 1 if normalize_import_bool(r.get(col_important, False), default=False) else 0
+        register = normalize_import_bool(r.get(col_register, True), default=True) if col_register else True
+
+        if not title:
+            title = category if category else "予定"
+
+        status = "OK"
+        if not event_date:
+            status = "日付なし"
+        elif not title:
+            status = "タイトルなし"
+
+        rows.append({
+            "登録する": bool(register),
+            "event_date": event_date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "category": category,
+            "title": title,
+            "user_id": user_id,
+            "user_name": user_name,
+            "staff_name": staff_name,
+            "memo": memo,
+            "important": int(important),
+            "取込状態": status,
+        })
+
+    out = pd.DataFrame(rows)
+    out = out[out[["event_date", "title", "memo", "user_id", "user_name"]].astype(str).agg("".join, axis=1).str.strip() != ""].copy()
+    return out.reset_index(drop=True)
+
+
+def event_exists(row):
+    """同一予定らしいものが既にあるか簡易チェック。"""
+    df = fetch_df("""
+        SELECT id FROM events
+        WHERE event_date=?
+          AND IFNULL(start_time, '')=?
+          AND title=?
+          AND IFNULL(user_id, '')=?
+          AND IFNULL(user_name, '')=?
+        LIMIT 1
+    """, (
+        row.get("event_date", ""),
+        row.get("start_time", "") or "",
+        row.get("title", ""),
+        row.get("user_id", "") or "",
+        row.get("user_name", "") or "",
+    ))
+    return not df.empty
+
+
+def ensure_import_category(category_name):
+    """取込データのカテゴリがマスタになければ追加する。"""
+    category_name = str(category_name or "その他").strip() or "その他"
+    hit = fetch_df("SELECT id FROM categories WHERE category_name=? LIMIT 1", (category_name,))
+    if not hit.empty:
+        return
+    mark = CATEGORY_MARK.get(category_name, "・")
+    try:
+        execute("""
+            INSERT INTO categories
+            (category_name, mark, sort_order, is_active, created_at, updated_at)
+            VALUES (?, ?, 900, 1, ?, ?)
+        """, (category_name, mark, now_text(), now_text()))
+    except Exception:
+        pass
+
+
+def upsert_import_user(user_id, user_name):
+    """user_id付き利用者が未登録なら、ひだまり帳の利用者マスタにも補助登録する。"""
+    user_id = str(user_id or "").strip()
+    user_name = str(user_name or "").strip()
+    if not user_id or not user_name:
+        return
+    hit = fetch_df("SELECT id FROM users WHERE user_id=? OR user_name=? LIMIT 1", (user_id, user_name))
+    if not hit.empty:
+        return
+    try:
+        execute("""
+            INSERT INTO users (user_id, user_name, kana, room_no, note, is_active, created_at)
+            VALUES (?, ?, '', '', '予定データ取込から自動追加', 1, ?)
+        """, (user_id, user_name, now_text()))
+    except Exception:
+        pass
+
+
+def insert_import_event(row):
+    """正規化済み1行をeventsへ登録。"""
+    ensure_import_category(row.get("category", "その他"))
+    upsert_import_user(row.get("user_id", ""), row.get("user_name", ""))
+    return execute("""
+        INSERT INTO events
+        (event_date, category, title, user_id, user_name, staff_name, start_time, end_time, memo, important, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        row.get("event_date", ""),
+        row.get("category", "その他") or "その他",
+        row.get("title", "予定") or "予定",
+        row.get("user_id", "") or None,
+        row.get("user_name", "") or None,
+        row.get("staff_name", "") or None,
+        row.get("start_time", "") or None,
+        row.get("end_time", "") or None,
+        row.get("memo", "") or None,
+        int(row.get("important", 0) or 0),
+        now_text(),
+        now_text(),
+    ))
+
+
+def page_schedule_import():
+    st.subheader("予定データ取込")
+    st.caption("健康管理アプリで出力した予定候補Excel/CSVを読み込み、内容確認後にひだまり帳の予定へ登録します。")
+
+    uploaded = st.file_uploader(
+        "予定候補Excel/CSVを選択",
+        type=["xlsx", "xls", "csv"],
+        help="健康管理アプリの『予定候補一覧をExcelでダウンロード』『CSV出力』で作成したファイルを読み込めます。"
+    )
+
+    if not uploaded:
+        st.info("ファイルを選択すると、予定候補を一覧表示します。")
+        st.markdown("""
+        **推奨列名**  
+        `event_date / start_time / end_time / category / title / user_id / user_name / memo / important`  
+        日本語列名（予定日、開始時刻、終了時刻、分類、タイトル、利用者ID、利用者名、詳細、重要）でも読み込めます。
+        """)
+        return
+
+    try:
+        raw_df = read_schedule_import_file(uploaded)
+    except Exception as e:
+        st.error(f"ファイルを読み込めませんでした：{e}")
+        return
+
+    import_df = normalize_schedule_import_df(raw_df)
+    if import_df.empty:
+        st.warning("取込できる予定候補がありません。")
+        with st.expander("読み込んだ元データを確認"):
+            st.dataframe(raw_df, use_container_width=True, hide_index=True)
+        return
+
+    # 重複チェック列を追加
+    import_df["既存重複"] = import_df.apply(lambda r: "あり" if event_exists(r) else "", axis=1)
+    # 重複ありは初期状態で登録対象から外す
+    import_df.loc[import_df["既存重複"] == "あり", "登録する"] = False
+
+    st.success(f"予定候補を {len(import_df)} 件読み込みました。内容を確認してから登録してください。")
+
+    edited = st.data_editor(
+        import_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "登録する": st.column_config.CheckboxColumn("登録する"),
+            "event_date": st.column_config.TextColumn("予定日", help="YYYY-MM-DD"),
+            "start_time": st.column_config.TextColumn("開始時刻", help="例：10:00"),
+            "end_time": st.column_config.TextColumn("終了時刻", help="例：11:00"),
+            "category": st.column_config.TextColumn("分類"),
+            "title": st.column_config.TextColumn("タイトル"),
+            "user_id": st.column_config.TextColumn("利用者ID"),
+            "user_name": st.column_config.TextColumn("利用者名"),
+            "staff_name": st.column_config.TextColumn("担当"),
+            "memo": st.column_config.TextColumn("詳細"),
+            "important": st.column_config.CheckboxColumn("重要"),
+            "取込状態": st.column_config.TextColumn("状態", disabled=True),
+            "既存重複": st.column_config.TextColumn("既存重複", disabled=True),
+        },
+        key="schedule_import_editor",
+    )
+
+    selected = edited[edited["登録する"].astype(bool)].copy()
+    valid = selected[(selected["event_date"].astype(str).str.strip() != "") & (selected["title"].astype(str).str.strip() != "")].copy()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("登録対象", len(selected))
+    with c2:
+        st.metric("登録可能", len(valid))
+    with c3:
+        st.metric("重複候補", int((edited["既存重複"].astype(str) == "あり").sum()))
+
+    skip_duplicates = st.checkbox("既存重複ありの行は登録しない", value=True)
+    confirm = st.checkbox("内容を確認しました。eventsテーブルへ登録します。")
+
+    if st.button("選択した予定をひだまり帳へ登録", type="primary", use_container_width=True):
+        if not confirm:
+            st.error("確認チェックを入れてください。")
+            return
+        if valid.empty:
+            st.error("登録可能な行がありません。予定日とタイトルを確認してください。")
+            return
+
+        inserted = 0
+        skipped = 0
+        errors = []
+        for idx, row in valid.iterrows():
+            try:
+                if skip_duplicates and event_exists(row):
+                    skipped += 1
+                    continue
+                insert_import_event(row)
+                inserted += 1
+            except Exception as e:
+                errors.append(f"行{idx + 1}: {e}")
+
+        if inserted:
+            st.success(f"ひだまり帳へ {inserted} 件登録しました。")
+        if skipped:
+            st.info(f"重複候補のため {skipped} 件スキップしました。")
+        if errors:
+            st.error("一部登録できませんでした。")
+            for err in errors[:10]:
+                st.write(err)
+
+    with st.expander("読み込んだ元データを確認"):
+        st.dataframe(raw_df, use_container_width=True, hide_index=True)
+
 def page_export():
     st.subheader("Excel出力")
 
@@ -1478,7 +1835,10 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="wide")
     init_db()
     add_css()
- 
+
+    st.title("📅 ひだまり帳 Ver1.2.0")
+    st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
+
     menu = st.sidebar.radio(
         "メニュー",
         [
@@ -1486,6 +1846,7 @@ def main():
             "今日は何ある",
             "予定登録",
             "予定検索・更新・削除",
+            "予定データ取込",
             "写真メモ一覧",
             "Excel・書類ファイル一覧",
             "予定カテゴリ設定",
@@ -1503,6 +1864,8 @@ def main():
         page_event_register()
     elif menu == "予定検索・更新・削除":
         page_event_manage()
+    elif menu == "予定データ取込":
+        page_schedule_import()
     elif menu == "写真メモ一覧":
         page_photo_notes()
     elif menu == "Excel・書類ファイル一覧":
