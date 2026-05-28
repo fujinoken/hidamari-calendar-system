@@ -1575,16 +1575,16 @@ def normalize_schedule_import_df(raw_df):
     df.columns = [str(c).strip() for c in df.columns]
 
     # 健康チェックアプリ側の列名ゆれを広めに吸収
-    col_register = pick_import_col(df, ["登録する", "取込対象", "取込", "登録", "import", "selected"])
-    col_date = pick_import_col(df, ["event_date", "予定日", "日付", "開始日", "日時", "開始日時", "予定日時", "実施日"])
-    col_start = pick_import_col(df, ["start_time", "開始時刻", "開始時間", "時刻", "予定時刻", "時間"])
-    col_end = pick_import_col(df, ["end_time", "終了時刻", "終了時間"])
-    col_category = pick_import_col(df, ["category", "分類", "カテゴリ", "予定分類", "種別", "キーワード"])
-    col_title = pick_import_col(df, ["title", "タイトル", "件名", "予定タイトル", "予定", "候補", "予定候補"])
+    col_register = pick_import_col(df, ["登録する", "取込対象", "取込", "登録", "import", "selected", "All Day Event"])
+    col_date = pick_import_col(df, ["event_date", "予定日", "日付", "開始日", "日時", "開始日時", "予定日時", "実施日", "Start Date", "start date", "DATE", "Date"])
+    col_start = pick_import_col(df, ["start_time", "開始時刻", "開始時間", "時刻", "予定時刻", "時間", "Start Time", "start time", "START TIME"])
+    col_end = pick_import_col(df, ["end_time", "終了時刻", "終了時間", "End Time", "end time", "END TIME"])
+    col_category = pick_import_col(df, ["category", "分類", "カテゴリ", "予定分類", "種別", "キーワード", "Category", "CATEGORIES"])
+    col_title = pick_import_col(df, ["title", "タイトル", "件名", "予定タイトル", "予定", "候補", "予定候補", "Subject", "subject", "SUMMARY", "Summary"])
     col_user_id = pick_import_col(df, ["user_id", "利用者ID", "利用者id", "入居者ID", "入居者id"])
     col_user_name = pick_import_col(df, ["user_name", "利用者名", "利用者", "入居者名", "入居者", "対象者"])
     col_staff = pick_import_col(df, ["staff_name", "担当", "担当者", "職員", "記入者", "作成者"])
-    col_memo = pick_import_col(df, ["memo", "詳細", "メモ", "内容", "備考", "申し送り", "申し送り内容", "本文", "元の申し送り"])
+    col_memo = pick_import_col(df, ["memo", "詳細", "メモ", "内容", "備考", "申し送り", "申し送り内容", "本文", "元の申し送り", "Description", "description", "Location", "location"])
     col_important = pick_import_col(df, ["important", "重要", "重要マーク", "注意", "要注意"])
 
     rows = []
@@ -1814,7 +1814,10 @@ def page_schedule_import():
     )
 
     selected = edited[edited["登録する"].astype(bool)].copy()
-    valid = selected[(selected["event_date"].astype(str).str.strip() != "") & (selected["title"].astype(str).str.strip() != "")].copy()
+    # 空文字だけでなく、nan / NaT / None 文字列も登録不可として扱う
+    date_ok = ~selected["event_date"].astype(str).str.strip().str.lower().isin(["", "nan", "nat", "none"])
+    title_ok = ~selected["title"].astype(str).str.strip().str.lower().isin(["", "nan", "nat", "none"])
+    valid = selected[date_ok & title_ok].copy()
 
     c1, c2, c3 = st.columns(3)
     with c1:
