@@ -14,6 +14,8 @@ Python + Streamlit + SQLite
 
 import sqlite3
 import calendar
+import re
+import hashlib
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -1524,7 +1526,7 @@ def pick_import_col(df, candidates):
 
 
 def read_schedule_import_file(uploaded_file):
-    """予定候補Excel/CSVを読み込む。"""
+    """予定候補Excel/CSVを読み込む。複数シートExcelは先頭シートを読む。"""
     name = str(getattr(uploaded_file, "name", "")).lower()
     if name.endswith(".csv"):
         try:
@@ -1535,55 +1537,88 @@ def read_schedule_import_file(uploaded_file):
     return pd.read_excel(uploaded_file)
 
 
+def clean_import_value(value):
+    """nan / NaT / Noneを空文字に寄せる。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in ["nan", "nat", "none"]:
+        return ""
+    return text
+
+
+def make_upload_key(uploaded_file):
+    """ファイルが変わった時にdata_editorの古い状態が残らないようにする。"""
+    name = str(getattr(uploaded_file, "name", "uploaded"))
+    size = int(getattr(uploaded_file, "size", 0) or 0)
+    return hashlib.md5(f"{name}-{size}".encode("utf-8")).hexdigest()[:10]
+
+
 def normalize_schedule_import_df(raw_df):
     """
     健康管理アプリ側の出力列を、ひだまり帳events登録用に正規化する。
-    日本語列・英語列のどちらでも受け取れるようにする。
+    元データとの対応が分かるように、元行番号を保持する。
     """
+    base_cols = [
+        "元行", "登録する", "event_date", "start_time", "end_time", "category", "title",
+        "user_id", "user_name", "staff_name", "memo", "important", "取込状態"
+    ]
     if raw_df is None or raw_df.empty:
-        return pd.DataFrame(columns=[
-            "登録する", "event_date", "start_time", "end_time", "category", "title",
-            "user_id", "user_name", "staff_name", "memo", "important", "取込状態"
-        ])
+        return pd.DataFrame(columns=base_cols)
 
     df = raw_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    col_register = pick_import_col(df, ["登録する", "取込対象", "登録", "import", "selected"])
-    col_date = pick_import_col(df, ["event_date", "予定日", "日付", "開始日", "日時", "開始日時"])
-    col_start = pick_import_col(df, ["start_time", "開始時刻", "開始時間"])
+    # 健康チェックアプリ側の列名ゆれを広めに吸収
+    col_register = pick_import_col(df, ["登録する", "取込対象", "取込", "登録", "import", "selected"])
+    col_date = pick_import_col(df, ["event_date", "予定日", "日付", "開始日", "日時", "開始日時", "予定日時", "実施日"])
+    col_start = pick_import_col(df, ["start_time", "開始時刻", "開始時間", "時刻", "予定時刻", "時間"])
     col_end = pick_import_col(df, ["end_time", "終了時刻", "終了時間"])
-    col_category = pick_import_col(df, ["category", "分類", "カテゴリ"])
-    col_title = pick_import_col(df, ["title", "タイトル", "件名", "予定タイトル"])
-    col_user_id = pick_import_col(df, ["user_id", "利用者ID", "利用者id"])
-    col_user_name = pick_import_col(df, ["user_name", "利用者名", "利用者"])
-    col_staff = pick_import_col(df, ["staff_name", "担当", "担当者", "職員", "記入者"])
-    col_memo = pick_import_col(df, ["memo", "詳細", "メモ", "内容", "備考"])
-    col_important = pick_import_col(df, ["important", "重要", "重要マーク"])
+    col_category = pick_import_col(df, ["category", "分類", "カテゴリ", "予定分類", "種別", "キーワード"])
+    col_title = pick_import_col(df, ["title", "タイトル", "件名", "予定タイトル", "予定", "候補", "予定候補"])
+    col_user_id = pick_import_col(df, ["user_id", "利用者ID", "利用者id", "入居者ID", "入居者id"])
+    col_user_name = pick_import_col(df, ["user_name", "利用者名", "利用者", "入居者名", "入居者", "対象者"])
+    col_staff = pick_import_col(df, ["staff_name", "担当", "担当者", "職員", "記入者", "作成者"])
+    col_memo = pick_import_col(df, ["memo", "詳細", "メモ", "内容", "備考", "申し送り", "申し送り内容", "本文", "元の申し送り"])
+    col_important = pick_import_col(df, ["important", "重要", "重要マーク", "注意", "要注意"])
 
     rows = []
-    for _, r in df.iterrows():
-        # 日時列しかない場合、時刻も拾う
+    for original_index, r in df.iterrows():
         raw_date_value = r.get(col_date, "") if col_date else ""
         event_date = normalize_import_date(raw_date_value)
+
         start_time = normalize_import_time(r.get(col_start, "")) if col_start else ""
         end_time = normalize_import_time(r.get(col_end, "")) if col_end else ""
-        if not start_time and col_date and ("時" in str(raw_date_value) or ":" in str(raw_date_value)):
+
+        # 日時列に時刻が含まれる場合は、開始時刻にも反映
+        if not start_time and col_date:
             dt = pd.to_datetime(raw_date_value, errors="coerce")
-            if pd.notna(dt):
+            if pd.notna(dt) and (dt.hour != 0 or dt.minute != 0):
                 start_time = dt.strftime("%H:%M")
 
-        category = str(r.get(col_category, "その他") if col_category else "その他").strip() or "その他"
-        title = str(r.get(col_title, "") if col_title else "").strip()
-        user_id = str(r.get(col_user_id, "") if col_user_id else "").strip()
-        user_name = str(r.get(col_user_name, "") if col_user_name else "").strip()
-        staff_name = str(r.get(col_staff, "") if col_staff else "").strip()
-        memo = str(r.get(col_memo, "") if col_memo else "").strip()
+        category = clean_import_value(r.get(col_category, "")) if col_category else ""
+        title = clean_import_value(r.get(col_title, "")) if col_title else ""
+        user_id = clean_import_value(r.get(col_user_id, "")) if col_user_id else ""
+        user_name = clean_import_value(r.get(col_user_name, "")) if col_user_name else ""
+        staff_name = clean_import_value(r.get(col_staff, "")) if col_staff else ""
+        memo = clean_import_value(r.get(col_memo, "")) if col_memo else ""
+
+        # タイトルが空なら、申し送り本文やカテゴリから予定名を補う
+        if not category:
+            category = "その他"
+        if not title:
+            if memo:
+                title = memo.splitlines()[0][:30]
+            else:
+                title = category or "予定"
+
         important = 1 if normalize_import_bool(r.get(col_important, False), default=False) else 0
         register = normalize_import_bool(r.get(col_register, True), default=True) if col_register else True
-
-        if not title:
-            title = category if category else "予定"
 
         status = "OK"
         if not event_date:
@@ -1592,6 +1627,7 @@ def normalize_schedule_import_df(raw_df):
             status = "タイトルなし"
 
         rows.append({
+            "元行": int(original_index) + 2,  # Excel上の見た目に近い行番号。1行目は見出し想定
             "登録する": bool(register),
             "event_date": event_date,
             "start_time": start_time,
@@ -1607,8 +1643,28 @@ def normalize_schedule_import_df(raw_df):
         })
 
     out = pd.DataFrame(rows)
-    out = out[out[["event_date", "title", "memo", "user_id", "user_name"]].astype(str).agg("".join, axis=1).str.strip() != ""].copy()
+    if out.empty:
+        return out
+
+    keep_cols = ["event_date", "title", "memo", "user_id", "user_name"]
+    out = out[out[keep_cols].astype(str).agg("".join, axis=1).str.strip() != ""].copy()
     return out.reset_index(drop=True)
+
+
+def make_import_compare_df(raw_df, import_df):
+    """元データと変換後予定候補を横並びで確認する表を作る。"""
+    if raw_df is None or raw_df.empty or import_df is None or import_df.empty:
+        return pd.DataFrame()
+    raw = raw_df.copy().reset_index(drop=True)
+    raw.insert(0, "元行", raw.index + 2)
+    preview_cols = ["元行"] + [c for c in raw.columns if c != "元行"][:8]
+    converted_cols = [
+        "元行", "event_date", "start_time", "category", "title",
+        "user_id", "user_name", "memo", "取込状態", "既存重複"
+    ]
+    left = raw[preview_cols]
+    right = import_df[[c for c in converted_cols if c in import_df.columns]]
+    return pd.merge(left, right, on="元行", how="outer", suffixes=("_元", "_変換後"))
 
 
 def event_exists(row):
@@ -1728,6 +1784,10 @@ def page_schedule_import():
     import_df.loc[import_df["既存重複"] == "あり", "登録する"] = False
 
     st.success(f"予定候補を {len(import_df)} 件読み込みました。内容を確認してから登録してください。")
+    st.caption("上の件数は、元データを予定登録用に変換した後の件数です。空行や日付なし行は除外されます。")
+
+    upload_key = make_upload_key(uploaded)
+    editor_key = f"schedule_import_editor_{upload_key}"
 
     edited = st.data_editor(
         import_df,
@@ -1735,6 +1795,7 @@ def page_schedule_import():
         hide_index=True,
         num_rows="dynamic",
         column_config={
+            "元行": st.column_config.NumberColumn("元行", disabled=True),
             "登録する": st.column_config.CheckboxColumn("登録する"),
             "event_date": st.column_config.TextColumn("予定日", help="YYYY-MM-DD"),
             "start_time": st.column_config.TextColumn("開始時刻", help="例：10:00"),
@@ -1749,7 +1810,7 @@ def page_schedule_import():
             "取込状態": st.column_config.TextColumn("状態", disabled=True),
             "既存重複": st.column_config.TextColumn("既存重複", disabled=True),
         },
-        key="schedule_import_editor",
+        key=editor_key,
     )
 
     selected = edited[edited["登録する"].astype(bool)].copy()
@@ -1762,6 +1823,17 @@ def page_schedule_import():
         st.metric("登録可能", len(valid))
     with c3:
         st.metric("重複候補", int((edited["既存重複"].astype(str) == "あり").sum()))
+
+    with st.expander("元データと予定候補の対応を確認"):
+        compare_df = make_import_compare_df(raw_df, import_df)
+        if compare_df.empty:
+            st.info("比較できるデータがありません。")
+        else:
+            st.dataframe(compare_df, use_container_width=True, hide_index=True)
+        st.caption("左側が読み込んだ元データ、右側が予定候補へ変換した内容です。元行番号で対応を確認できます。")
+
+    with st.expander("読み込んだ元データだけを確認"):
+        st.dataframe(raw_df, use_container_width=True, hide_index=True)
 
     skip_duplicates = st.checkbox("既存重複ありの行は登録しない", value=True)
     confirm = st.checkbox("内容を確認しました。eventsテーブルへ登録します。")
@@ -1785,7 +1857,8 @@ def page_schedule_import():
                 insert_import_event(row)
                 inserted += 1
             except Exception as e:
-                errors.append(f"行{idx + 1}: {e}")
+                row_no = row.get("元行", idx + 1)
+                errors.append(f"元行{row_no}: {e}")
 
         if inserted:
             st.success(f"ひだまり帳へ {inserted} 件登録しました。")
@@ -1795,9 +1868,6 @@ def page_schedule_import():
             st.error("一部登録できませんでした。")
             for err in errors[:10]:
                 st.write(err)
-
-    with st.expander("読み込んだ元データを確認"):
-        st.dataframe(raw_df, use_container_width=True, hide_index=True)
 
 def page_export():
     st.subheader("Excel出力")
