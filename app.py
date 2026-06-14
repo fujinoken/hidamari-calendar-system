@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.0
+ひだまり帳 Ver1.3.1
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -9,7 +9,7 @@ Python + Streamlit + PostgreSQL
     streamlit run app.py
 
 必要ライブラリ:
-    pip install streamlit pandas openpyxl psycopg2-binary
+    pip install streamlit pandas openpyxl psycopg2-binary reportlab
 """
 
 import os
@@ -19,9 +19,21 @@ import hashlib
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+
+
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 try:
     import psycopg2
@@ -29,7 +41,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.0 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.1 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -1927,9 +1939,353 @@ def page_schedule_import():
             for err in errors[:10]:
                 st.write(err)
 
-def page_export():
-    st.subheader("Excel出力")
+# -----------------------------
+# PDFカレンダー出力
+# -----------------------------
+PDF_FONT_GOTHIC = "HeiseiKakuGo-W5"
+PDF_FONT_MINCHO = "HeiseiMin-W3"
 
+
+def init_pdf_fonts():
+    """ReportLabの日本語CIDフォントを登録する。"""
+    if not REPORTLAB_AVAILABLE:
+        return False
+    try:
+        if PDF_FONT_GOTHIC not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont(PDF_FONT_GOTHIC))
+        if PDF_FONT_MINCHO not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont(PDF_FONT_MINCHO))
+        return True
+    except Exception:
+        return False
+
+
+def pdf_text(value):
+    """PDF描画用にNone/nanを空文字へ寄せる。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def text_width(text, font_name, font_size):
+    try:
+        return pdfmetrics.stringWidth(str(text), font_name, font_size)
+    except Exception:
+        return len(str(text)) * font_size
+
+
+def wrap_pdf_text(text, max_width, font_name, font_size, max_lines=3):
+    """
+    日本語を含む文字列を、文字単位で指定幅に折り返す。
+    長すぎる場合は最終行を…で省略する。
+    """
+    text = pdf_text(text).replace("\r", "\n")
+    if not text:
+        return []
+
+    lines = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        current = ""
+        for ch in raw:
+            candidate = current + ch
+            if text_width(candidate, font_name, font_size) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = ch
+                if len(lines) >= max_lines:
+                    break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+        if len(lines) >= max_lines:
+            break
+
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+
+    if lines:
+        original_joined = "".join([ln for ln in text.splitlines() if ln.strip()])
+        wrapped_joined = "".join(lines)
+        if len(wrapped_joined) < len(original_joined):
+            last = lines[-1]
+            while last and text_width(last + "…", font_name, font_size) > max_width:
+                last = last[:-1]
+            lines[-1] = (last + "…") if last else "…"
+
+    return lines
+
+
+def draw_wrapped_text(c, text, x, y, max_width, font_name, font_size, leading, max_lines=3, color=None):
+    """折り返しテキストを描画し、描画後のy座標を返す。"""
+    if color is not None:
+        c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    lines = wrap_pdf_text(text, max_width, font_name, font_size, max_lines=max_lines)
+    for line in lines:
+        c.drawString(x, y, line)
+        y -= leading
+    c.setFillColor(colors.black)
+    return y
+
+
+def calendar_events_df(year, month):
+    """指定月の予定をDataFrameで取得する。"""
+    start = f"{int(year)}-{int(month):02d}-01"
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
+    return fetch_df("""
+        SELECT *
+        FROM events
+        WHERE event_date BETWEEN ? AND ?
+        ORDER BY event_date,
+            CASE WHEN start_time IS NULL OR start_time = '' THEN 1 ELSE 0 END,
+            start_time,
+            category,
+            id
+    """, (start, end))
+
+
+def make_event_summary_for_pdf(ev, compact=True):
+    """カレンダー枠内に表示する予定の短い説明を作る。"""
+    category_name = pdf_text(ev.get("category", ""))
+    time_part = pdf_text(ev.get("start_time", ""))
+    title = pdf_text(ev.get("title", ""))
+    user_name = pdf_text(ev.get("user_name", ""))
+    staff_name = pdf_text(ev.get("staff_name", ""))
+    important = "重要 " if int(ev.get("important", 0) or 0) == 1 else ""
+
+    parts = []
+    if time_part:
+        parts.append(time_part)
+    parts.append(f"【{category_name}】{important}{title}")
+    if user_name:
+        parts.append(f"利用者:{user_name}")
+    if staff_name and not compact:
+        parts.append(f"担当:{staff_name}")
+    return " ".join([p for p in parts if p])
+
+
+def make_calendar_pdf(year, month, include_detail=True):
+    """
+    A4横の月間カレンダーPDFを作る。
+    1ページ目: 月間カレンダー
+    2ページ目以降: 予定詳細一覧
+    """
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab がインストールされていません。requirements.txt に reportlab を追加してください。")
+
+    init_pdf_fonts()
+
+    year = int(year)
+    month = int(month)
+    df = calendar_events_df(year, month)
+
+    events_by_day = {}
+    if not df.empty:
+        for _, row in df.iterrows():
+            events_by_day.setdefault(pdf_text(row["event_date"]), []).append(row.to_dict())
+
+    buffer = BytesIO()
+    page_size = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page_size)
+    width, height = page_size
+
+    margin_x = 24
+    margin_top = 28
+    title_h = 40
+    header_h = 20
+    grid_x = margin_x
+    grid_y_top = height - margin_top - title_h
+    grid_w = width - margin_x * 2
+    grid_h = height - margin_top - title_h - 24
+    day_header_h = 22
+    cell_w = grid_w / 7
+    cell_h = (grid_h - day_header_h) / 6
+
+    # タイトル
+    c.setFont(PDF_FONT_GOTHIC, 18)
+    c.setFillColor(colors.HexColor("#333333"))
+    c.drawString(margin_x, height - 34, f"ひだまり帳 月間カレンダー　{year}年 {month}月")
+    c.setFont(PDF_FONT_GOTHIC, 9)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawRightString(width - margin_x, height - 32, f"出力日: {today_jst().strftime('%Y-%m-%d')}")
+    c.setFillColor(colors.black)
+
+    # 曜日ヘッダ
+    week_labels = ["日", "月", "火", "水", "木", "金", "土"]
+    header_y = grid_y_top - day_header_h
+    for i, label in enumerate(week_labels):
+        x = grid_x + i * cell_w
+        c.setFillColor(colors.HexColor("#f3eee6"))
+        c.rect(x, header_y, cell_w, day_header_h, fill=1, stroke=1)
+        c.setFillColor(colors.HexColor("#333333"))
+        if i == 0:
+            c.setFillColor(colors.HexColor("#c0392b"))
+        elif i == 6:
+            c.setFillColor(colors.HexColor("#1f4e79"))
+        c.setFont(PDF_FONT_GOTHIC, 10)
+        c.drawCentredString(x + cell_w / 2, header_y + 7, label)
+
+    # 月間グリッド
+    weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
+    while len(weeks) < 6:
+        weeks.append([0, 0, 0, 0, 0, 0, 0])
+
+    for r, week in enumerate(weeks[:6]):
+        for col, day in enumerate(week):
+            x = grid_x + col * cell_w
+            y = header_y - (r + 1) * cell_h
+
+            c.setFillColor(colors.HexColor("#fffdf8") if day else colors.HexColor("#fafafa"))
+            c.rect(x, y, cell_w, cell_h, fill=1, stroke=1)
+
+            if not day:
+                continue
+
+            # 日付
+            date_color = colors.HexColor("#333333")
+            if col == 0:
+                date_color = colors.HexColor("#c0392b")
+            elif col == 6:
+                date_color = colors.HexColor("#1f4e79")
+            c.setFillColor(date_color)
+            c.setFont(PDF_FONT_GOTHIC, 17)
+            c.drawString(x + 6, y + cell_h - 22, str(day))
+
+            key = f"{year}-{month:02d}-{day:02d}"
+            evs = events_by_day.get(key, [])
+            event_y = y + cell_h - 38
+            max_lines_total = 5
+            lines_used = 0
+
+            for ev in evs:
+                if lines_used >= max_lines_total:
+                    break
+
+                summary = make_event_summary_for_pdf(ev, compact=True)
+                important = int(ev.get("important", 0) or 0) == 1
+
+                # 予定の背景帯
+                band_h = 13
+                c.setFillColor(colors.HexColor("#ffe9e0") if important else colors.HexColor("#f6efe6"))
+                c.roundRect(x + 5, event_y - 2, cell_w - 10, band_h, 3, fill=1, stroke=0)
+
+                color = colors.HexColor("#8a2d18") if important else colors.HexColor("#3f3a35")
+                new_y = draw_wrapped_text(
+                    c, summary, x + 8, event_y, cell_w - 16,
+                    PDF_FONT_GOTHIC, 6.6, 8, max_lines=1, color=color
+                )
+                event_y = new_y - 2
+                lines_used += 1
+
+            if len(evs) > max_lines_total:
+                c.setFont(PDF_FONT_GOTHIC, 6.5)
+                c.setFillColor(colors.HexColor("#555555"))
+                c.drawString(x + 8, y + 7, f"ほか {len(evs) - max_lines_total} 件")
+                c.setFillColor(colors.black)
+
+    # 凡例
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawString(margin_x, 12, "※枠内は要約表示です。詳細は次ページ以降の一覧で確認できます。重要予定は薄赤で表示します。")
+    c.showPage()
+
+    # 詳細一覧
+    if include_detail:
+        c.setPageSize(page_size)
+        c.setFont(PDF_FONT_GOTHIC, 16)
+        c.setFillColor(colors.HexColor("#333333"))
+        c.drawString(margin_x, height - 34, f"予定詳細一覧　{year}年 {month}月")
+        c.setFont(PDF_FONT_GOTHIC, 9)
+        c.setFillColor(colors.HexColor("#666666"))
+        c.drawRightString(width - margin_x, height - 32, f"合計 {0 if df.empty else len(df)} 件")
+        c.setFillColor(colors.black)
+
+        y = height - 60
+        line_h = 13
+        detail_x = margin_x
+        detail_w = width - margin_x * 2
+
+        if df.empty:
+            c.setFont(PDF_FONT_GOTHIC, 12)
+            c.drawString(detail_x, y, "この月の予定はありません。")
+        else:
+            current_date = ""
+            for _, row in df.iterrows():
+                event_date = pdf_text(row["event_date"])
+                if y < 45:
+                    c.showPage()
+                    c.setPageSize(page_size)
+                    c.setFont(PDF_FONT_GOTHIC, 16)
+                    c.setFillColor(colors.HexColor("#333333"))
+                    c.drawString(margin_x, height - 34, f"予定詳細一覧　{year}年 {month}月（続き）")
+                    c.setFillColor(colors.black)
+                    y = height - 60
+                    current_date = ""
+
+                if event_date != current_date:
+                    current_date = event_date
+                    try:
+                        d = datetime.strptime(event_date, "%Y-%m-%d").date()
+                        dow = ["月", "火", "水", "木", "金", "土", "日"][d.weekday()]
+                        date_label = f"{d.month}/{d.day}（{dow}）"
+                    except Exception:
+                        date_label = event_date
+                    c.setFillColor(colors.HexColor("#f3eee6"))
+                    c.rect(detail_x, y - 2, detail_w, 17, fill=1, stroke=0)
+                    c.setFillColor(colors.HexColor("#333333"))
+                    c.setFont(PDF_FONT_GOTHIC, 10)
+                    c.drawString(detail_x + 6, y + 2, date_label)
+                    y -= 21
+
+                important = int(row.get("important", 0) or 0) == 1
+                category_name = pdf_text(row.get("category", ""))
+                time_text = pdf_text(row.get("start_time", ""))
+                if row.get("end_time", ""):
+                    time_text = f"{time_text}〜{pdf_text(row.get('end_time', ''))}" if time_text else f"〜{pdf_text(row.get('end_time', ''))}"
+
+                main = f"{'重要 ' if important else ''}{time_text}　【{category_name}】　{pdf_text(row.get('title', ''))}"
+                sub_parts = []
+                if pdf_text(row.get("user_name", "")):
+                    sub_parts.append(f"利用者: {pdf_text(row.get('user_name', ''))}")
+                if pdf_text(row.get("staff_name", "")):
+                    sub_parts.append(f"担当: {pdf_text(row.get('staff_name', ''))}")
+                memo = pdf_text(row.get("memo", ""))
+                sub = "　".join(sub_parts)
+                if memo:
+                    sub = f"{sub}　メモ: {memo}" if sub else f"メモ: {memo}"
+
+                c.setFillColor(colors.HexColor("#8a2d18") if important else colors.HexColor("#222222"))
+                c.setFont(PDF_FONT_GOTHIC, 9)
+                c.drawString(detail_x + 10, y, main[:120])
+                y -= line_h
+
+                if sub:
+                    y = draw_wrapped_text(
+                        c, sub, detail_x + 22, y, detail_w - 34,
+                        PDF_FONT_GOTHIC, 7.5, 10, max_lines=2, color=colors.HexColor("#555555")
+                    )
+                y -= 4
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
+def page_export():
+    st.subheader("Excel・PDF出力")
+
+    st.markdown("### Excel出力")
     events = fetch_df("SELECT * FROM events ORDER BY event_date, start_time, id")
     photos = fetch_df("SELECT * FROM event_photos ORDER BY event_id, id")
     files = fetch_df("SELECT * FROM event_files ORDER BY event_id, id")
@@ -1954,7 +2310,34 @@ def page_export():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    st.caption("予定・利用者マスタ・職員マスタをまとめて出力します。")
+    st.caption("予定・利用者マスタ・職員マスタをまとめてExcel出力します。")
+
+    st.markdown("---")
+    st.markdown("### PDFカレンダー出力")
+    st.caption("A4横の月間カレンダーPDFと、予定詳細一覧を出力します。掲示・申し送り・印刷用に使えます。")
+
+    today = today_jst()
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        pdf_year = st.number_input("PDF出力 年", min_value=2020, max_value=2100, value=today.year, step=1)
+    with c2:
+        pdf_month = st.number_input("PDF出力 月", min_value=1, max_value=12, value=today.month, step=1)
+    with c3:
+        include_detail = st.checkbox("予定詳細一覧も付ける", value=True)
+
+    if not REPORTLAB_AVAILABLE:
+        st.error("PDF出力には reportlab が必要です。requirements.txt に reportlab を追加してください。")
+    else:
+        try:
+            pdf_bytes = make_calendar_pdf(int(pdf_year), int(pdf_month), include_detail=include_detail)
+            st.download_button(
+                label="PDFカレンダーをダウンロード",
+                data=pdf_bytes,
+                file_name=f"hidamari_calendar_{int(pdf_year)}_{int(pdf_month):02d}.pdf",
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.error(f"PDFを作成できませんでした：{e}")
 
 
 
@@ -1964,7 +2347,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.0 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.1 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
@@ -1980,7 +2363,7 @@ def main():
             "予定カテゴリ設定",
             "利用者マスタ",
             "職員マスタ",
-            "Excel出力",
+            "Excel・PDF出力",
         ],
     )
 
@@ -2004,7 +2387,7 @@ def main():
         page_master_users()
     elif menu == "職員マスタ":
         page_master_staff()
-    elif menu == "Excel出力":
+    elif menu == "Excel・PDF出力":
         page_export()
 
 
