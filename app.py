@@ -49,7 +49,7 @@ except ImportError:
 
 
 APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
-AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v4_off_conflict"
+AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v5_ake_off_guard"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -3499,7 +3499,10 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
 
 
 def shift_day_labels_for_staff(df, staff_name, target_date):
-    """指定職員・指定日のラベル一覧。前日夜勤があれば明を補完する。"""
+    """
+    指定職員・指定日のラベル一覧。
+    前日夜勤があれば明を補完するが、当日に希望休・有休・休み・その他がある場合は明を表示しない。
+    """
     labels = []
     if df is not None and not df.empty:
         target_staff = normalize_staff_name(staff_name)
@@ -3507,37 +3510,54 @@ def shift_day_labels_for_staff(df, staff_name, target_date):
         staff_df["_staff_norm"] = staff_df["staff_name"].apply(normalize_staff_name)
         staff_df = staff_df[staff_df["_staff_norm"] == target_staff]
         day_rows = staff_df[staff_df["shift_date"].astype(str) == str(target_date)]
+
+        day_shift_kinds = []
         for _, r in day_rows.iterrows():
-            label = shift_short_label(str(r["shift_kind"]))
+            kind = str(r["shift_kind"])
+            day_shift_kinds.append(kind)
+            label = shift_short_label(kind)
             if label and label not in labels:
                 labels.append(label)
 
-        # 前日夜勤の翌日は「明」を自動表示する。
+        # 当日に休み系がある場合、明け表示は重ねない。
+        has_off_label = any(x in labels for x in ["希", "有", "他"]) or any(k in OFF_OR_BLOCKING_SHIFT_KINDS for k in day_shift_kinds)
+
+        # 前日夜勤の翌日は「明」を自動表示する。ただし希望休・有休・休み・その他がある日は表示しない。
         try:
             prev_date = (pd.to_datetime(str(target_date)).date() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             prev_rows = staff_df[
                 (staff_df["shift_date"].astype(str) == str(prev_date)) &
                 (staff_df["shift_kind"].astype(str) == "夜勤")
             ]
-            if not prev_rows.empty and "明" not in labels:
+            if not prev_rows.empty and "明" not in labels and not has_off_label:
                 labels.insert(0, "明")
         except Exception:
             pass
+
+        # 既存データで明けと希望休等が既に重なっている場合も、表示上は休み系を優先して明を消す。
+        if has_off_label and "明" in labels:
+            labels = [x for x in labels if x != "明"]
     return labels
 
 def labels_to_cell_value(labels):
     labels = [x for x in labels if x]
     if not labels:
         return ""
+
+    # 希望休・有休・その他がある日は、明けや勤務より休み系表示を優先する。
+    for off_label in ["希", "有", "他"]:
+        if off_label in labels:
+            return off_label
+
     # 日/夜の同日入力は禁止。既存データで重なっている場合は日を優先表示し、チェックで警告する。
     if "日" in labels and "夜" in labels:
         return "日"
+
     priority = ["日", "夜", "明", "休", "希", "有", "他"]
     ordered = [x for x in priority if x in labels]
     if len(ordered) == 1:
         return ordered[0]
     return "/".join(ordered[:2])
-
 
 def create_shift_matrix(df, year, month):
     """写真の勤務表イメージに近い、職員×日付の横長表を作る。"""
@@ -4006,8 +4026,25 @@ def can_add_shift_to_working_df(df, staff_name, target_date, new_kind):
     return can_add_shift_without_overlap(existing_kinds, new_kind)
 
 
+
+def has_off_shift_on_day(df, staff_name, target_date):
+    """希望休・有休・休み・その他が同日にあるか。"""
+    kinds = get_staff_day_shift_kinds(df, staff_name, target_date)
+    return any(k in OFF_OR_BLOCKING_SHIFT_KINDS for k in kinds), [k for k in kinds if k in OFF_OR_BLOCKING_SHIFT_KINDS]
+
+
+def has_active_shift_on_day(df, staff_name, target_date):
+    """日勤・夜勤・夜勤明けが同日にあるか。"""
+    kinds = get_staff_day_shift_kinds(df, staff_name, target_date)
+    return any(k in ACTIVE_SHIFT_KINDS for k in kinds), [k for k in kinds if k in ACTIVE_SHIFT_KINDS]
+
+
 def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=None):
-    """AIシフト案用。希望休・有休・その他・休み・夜勤翌日・職員別上限を厳密に見る。"""
+    """
+    AIシフト案用。
+    希望休・有休・その他・休みと、日勤・夜勤・夜勤明けが同日に重ならないよう厳密に見る。
+    特に夜勤は、翌日が明けになるため、翌日に希望休等がある場合は候補外にする。
+    """
     if df is None:
         df = pd.DataFrame()
     date_text = str(target_date)
@@ -4018,13 +4055,6 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
     if not overlap_ok:
         return False, overlap_reason
 
-    if not df.empty:
-        tmp_df = df.copy()
-        tmp_df["_staff_norm"] = tmp_df["staff_name"].apply(normalize_staff_name)
-        staff_df = tmp_df[tmp_df["_staff_norm"] == target_staff]
-    else:
-        staff_df = pd.DataFrame()
-
     try:
         prev_date = (pd.to_datetime(date_text).date() - timedelta(days=1)).strftime("%Y-%m-%d")
         prev_kinds = get_staff_day_shift_kinds(df, target_staff, prev_date)
@@ -4034,6 +4064,20 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
             return False, "前日明けのため翌日は休み"
     except Exception:
         pass
+
+    # 夜勤を入れると翌日は必ず明け扱いになるため、翌日に希望休・有休・休み・その他がある場合は夜勤候補から外す。
+    if shift_kind == "夜勤":
+        try:
+            next_date = (pd.to_datetime(date_text).date() + timedelta(days=1)).strftime("%Y-%m-%d")
+            next_kinds = get_staff_day_shift_kinds(df, target_staff, next_date)
+            next_off = [k for k in next_kinds if k in OFF_OR_BLOCKING_SHIFT_KINDS]
+            next_active = [k for k in next_kinds if k in ACTIVE_SHIFT_KINDS]
+            if next_off:
+                return False, f"翌日に休み系（{', '.join(next_off)}）があるため夜勤不可"
+            if next_active:
+                return False, f"翌日に勤務系（{', '.join(next_active)}）があるため夜勤不可"
+        except Exception:
+            pass
 
     exceed, reason = would_exceed_staff_shift_limit(df, target_staff, date_text, shift_kind, limit_map=limit_map)
     if exceed:
@@ -4138,7 +4182,7 @@ def create_ai_shift_draft(df, staff_names, year, month):
                 candidates.append((score, s))
 
             if not candidates:
-                reason_text = "日勤・夜勤・合計上限、希望休、有休、休み、夜勤翌日明けを考慮した結果、候補なし"
+                reason_text = "日勤・夜勤・合計上限、希望休、有休、休み、その他、夜勤翌日の明け重複を考慮した結果、候補なし"
                 if reject_reasons:
                     reason_text += "（" + " / ".join(reject_reasons[:6]) + (" ほか" if len(reject_reasons) > 6 else "") + "）"
                 rows.append({
