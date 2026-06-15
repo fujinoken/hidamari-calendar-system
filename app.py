@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.5
+ひだまり帳 Ver1.3.6
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.5 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.6 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -527,6 +527,77 @@ def delete_saved_file(file_path):
         except Exception:
             return False
     return False
+
+
+def storage_object_exists(file_path):
+    """
+    DBに保存されたfile_pathが実際に読めるか確認する。
+    Storage保存はHEAD、失敗時はGETで確認。旧ローカル保存はファイル存在で確認。
+    """
+    value = str(file_path or "").strip()
+    if not value:
+        return False, "file_path空欄"
+
+    if is_storage_file(value):
+        try:
+            require_storage_ready()
+            bucket, object_path = parse_storage_db_path(value)
+            if not bucket or not object_path:
+                return False, "Storageパス形式不正"
+
+            url = storage_url_for_object(bucket, object_path, authenticated=True)
+            response = requests.head(url, headers=storage_headers(), timeout=30)
+            if response.status_code < 400:
+                return True, "OK"
+
+            # 環境によってHEADが許可されない場合の保険
+            response = requests.get(url, headers=storage_headers(), timeout=30)
+            if response.status_code < 400:
+                return True, "OK"
+
+            return False, f"Storage取得不可 {response.status_code}: {response.text[:120]}"
+        except Exception as e:
+            return False, f"Storage確認エラー: {e}"
+
+    local_path = Path(value)
+    if local_path.exists():
+        return True, "OK（旧ローカル）"
+    return False, "旧ローカルファイルなし"
+
+
+def check_storage_bucket_access():
+    """Storageバケットにアクセスできるか簡易確認する。"""
+    if requests is None:
+        return False, "requests が未導入です。"
+    if not storage_is_configured():
+        return False, "Storage設定が未完了です。"
+
+    try:
+        bucket = get_supabase_storage_bucket()
+        base_url = get_supabase_url()
+        quoted_bucket = urllib.parse.quote(str(bucket), safe="")
+        url = f"{base_url}/storage/v1/object/list/{quoted_bucket}"
+        response = requests.post(
+            url,
+            headers=storage_headers(content_type="application/json"),
+            json={"prefix": "", "limit": 1, "offset": 0},
+            timeout=30,
+        )
+        if response.status_code < 400:
+            return True, "Storageバケットへ接続できました。"
+        return False, f"Storageバケット確認失敗 {response.status_code}: {response.text[:180]}"
+    except Exception as e:
+        return False, f"Storageバケット確認エラー: {e}"
+
+
+def count_query(sql, params=()):
+    """COUNT系SQLを安全にintで返す。"""
+    df = fetch_df(sql, params)
+    if df.empty:
+        return 0
+    return int(df.iloc[0, 0] or 0)
+
+
 
 
 def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
@@ -2721,6 +2792,203 @@ def make_calendar_pdf(year, month, include_detail=True):
 
 
 
+def page_storage_check():
+    st.subheader("保存状態チェック")
+    st.caption("PostgreSQL・Supabase Storage・DB上のファイル紐づけを確認します。")
+
+    # -----------------------------
+    # 接続・設定状態
+    # -----------------------------
+    st.markdown("### 1. Storage設定の状態")
+
+    storage_ok = storage_is_configured()
+    bucket_ok, bucket_msg = check_storage_bucket_access()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("PostgreSQL", "接続中")
+    with c2:
+        st.metric("Storage設定", "OK" if storage_ok else "未設定")
+    with c3:
+        st.metric("Storageバケット", "OK" if bucket_ok else "要確認")
+    with c4:
+        st.metric("requests", "OK" if requests is not None else "未導入")
+
+    st.write(f"**SUPABASE_URL**：`{get_supabase_url() or '未設定'}`")
+    st.write(f"**SUPABASE_STORAGE_BUCKET**：`{get_supabase_storage_bucket() or '未設定'}`")
+    st.write(f"**SUPABASE_SERVICE_ROLE_KEY**：`{'設定あり' if bool(get_supabase_storage_key()) else '未設定'}`")
+
+    if bucket_ok:
+        st.success(bucket_msg)
+    else:
+        st.warning(bucket_msg)
+
+    # -----------------------------
+    # 件数サマリー
+    # -----------------------------
+    st.markdown("---")
+    st.markdown("### 2. 保存件数")
+
+    event_count = count_query("SELECT COUNT(*) FROM events")
+    photo_count = count_query("SELECT COUNT(*) FROM event_photos")
+    file_count = count_query("SELECT COUNT(*) FROM event_files")
+    storage_photo_count = count_query("SELECT COUNT(*) FROM event_photos WHERE file_path LIKE 'storage://%'")
+    storage_file_count = count_query("SELECT COUNT(*) FROM event_files WHERE file_path LIKE 'storage://%'")
+    local_photo_count = photo_count - storage_photo_count
+    local_file_count = file_count - storage_file_count
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("予定件数", event_count)
+    with c2:
+        st.metric("写真メモ件数", photo_count)
+    with c3:
+        st.metric("添付ファイル件数", file_count)
+    with c4:
+        st.metric("Storage保存パス件数", storage_photo_count + storage_file_count)
+
+    c5, c6 = st.columns(2)
+    with c5:
+        st.info(f"写真メモ：Storage {storage_photo_count}件 / 旧ローカル {local_photo_count}件")
+    with c6:
+        st.info(f"添付ファイル：Storage {storage_file_count}件 / 旧ローカル {local_file_count}件")
+
+    # -----------------------------
+    # 最新登録10件
+    # -----------------------------
+    st.markdown("---")
+    st.markdown("### 3. 最新登録10件")
+
+    latest_df = fetch_df("""
+        SELECT
+            e.id,
+            e.event_date,
+            e.category,
+            e.title,
+            e.user_name,
+            e.staff_name,
+            e.created_at,
+            (SELECT COUNT(*) FROM event_photos p WHERE p.event_id = e.id) AS photo_count,
+            (SELECT COUNT(*) FROM event_files f WHERE f.event_id = e.id) AS file_count
+        FROM events e
+        ORDER BY e.id DESC
+        LIMIT 10
+    """)
+    if latest_df.empty:
+        st.info("予定はまだ登録されていません。")
+    else:
+        st.dataframe(latest_df, use_container_width=True, hide_index=True)
+
+    # -----------------------------
+    # DBにはあるが読めないファイルの確認
+    # -----------------------------
+    st.markdown("---")
+    st.markdown("### 4. DBにはあるがStorage・ローカルから読めないファイル")
+
+    check_limit = st.number_input("確認件数上限", min_value=1, max_value=500, value=100, step=10)
+    st.caption("Storage確認は通信が発生するため、件数が多い場合は少し時間がかかります。")
+
+    if st.button("ファイル紐づけを確認する", use_container_width=True):
+        targets = []
+
+        photos = fetch_df("""
+            SELECT
+                '写真メモ' AS 種別,
+                p.id AS id,
+                p.event_id,
+                p.file_name,
+                p.file_path,
+                p.created_at,
+                e.event_date,
+                e.title
+            FROM event_photos p
+            LEFT JOIN events e ON p.event_id = e.id
+            ORDER BY p.id DESC
+            LIMIT ?
+        """, (int(check_limit),))
+
+        files = fetch_df("""
+            SELECT
+                '添付ファイル' AS 種別,
+                f.id AS id,
+                f.event_id,
+                f.file_name,
+                f.file_path,
+                f.created_at,
+                e.event_date,
+                e.title
+            FROM event_files f
+            LEFT JOIN events e ON f.event_id = e.id
+            ORDER BY f.id DESC
+            LIMIT ?
+        """, (int(check_limit),))
+
+        if not photos.empty:
+            targets.extend(photos.to_dict("records"))
+        if not files.empty:
+            targets.extend(files.to_dict("records"))
+
+        if not targets:
+            st.info("確認対象の写真・添付ファイルはありません。")
+        else:
+            results = []
+            progress = st.progress(0)
+            for i, item in enumerate(targets, start=1):
+                ok, message = storage_object_exists(item.get("file_path"))
+                results.append({
+                    "状態": "OK" if ok else "NG",
+                    "種別": item.get("種別"),
+                    "ID": item.get("id"),
+                    "予定ID": item.get("event_id"),
+                    "予定日": item.get("event_date"),
+                    "予定タイトル": item.get("title"),
+                    "ファイル名": item.get("file_name"),
+                    "file_path": item.get("file_path"),
+                    "確認結果": message,
+                    "登録日時": item.get("created_at"),
+                })
+                progress.progress(i / len(targets))
+
+            result_df = pd.DataFrame(results)
+            ng_df = result_df[result_df["状態"] == "NG"].copy()
+
+            st.metric("確認件数", len(result_df))
+            st.metric("読めないファイル件数", len(ng_df))
+
+            if ng_df.empty:
+                st.success("確認した範囲では、DBに紐づいたファイルはすべて読み取り可能でした。")
+            else:
+                st.warning("DBには登録されていますが、Storage・ローカルから読めないファイルがあります。")
+                st.dataframe(ng_df, use_container_width=True, hide_index=True)
+
+            with st.expander("確認結果の全件を見る"):
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+    # -----------------------------
+    # Storageパス一覧
+    # -----------------------------
+    st.markdown("---")
+    st.markdown("### 5. Storage保存パス一覧")
+
+    path_df = fetch_df("""
+        SELECT '写真メモ' AS 種別, id, event_id, file_name, file_path, created_at
+        FROM event_photos
+        WHERE file_path LIKE 'storage://%'
+        UNION ALL
+        SELECT '添付ファイル' AS 種別, id, event_id, file_name, file_path, created_at
+        FROM event_files
+        WHERE file_path LIKE 'storage://%'
+        ORDER BY created_at DESC
+        LIMIT 50
+    """)
+    if path_df.empty:
+        st.info("Storage保存パスはまだ登録されていません。")
+    else:
+        st.dataframe(path_df, use_container_width=True, hide_index=True)
+
+
+
+
 def page_export():
     st.subheader("Excel・PDF出力")
 
@@ -2786,7 +3054,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.5 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.6 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
@@ -2799,6 +3067,7 @@ def main():
             "予定データ取込",
             "写真メモ一覧",
             "Excel・書類ファイル一覧",
+            "保存状態チェック",
             "予定カテゴリ設定",
             "利用者マスタ",
             "職員マスタ",
@@ -2820,6 +3089,8 @@ def main():
         page_photo_notes()
     elif menu == "Excel・書類ファイル一覧":
         page_attached_files()
+    elif menu == "保存状態チェック":
+        page_storage_check()
     elif menu == "予定カテゴリ設定":
         page_category_master()
     elif menu == "利用者マスタ":
