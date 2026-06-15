@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.1
+ひだまり帳 Ver1.3.2
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -41,7 +41,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.1 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.2 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -1973,10 +1973,39 @@ def pdf_text(value):
 
 
 def text_width(text, font_name, font_size):
+    """ReportLab上の文字幅を取得する。"""
     try:
         return pdfmetrics.stringWidth(str(text), font_name, font_size)
     except Exception:
         return len(str(text)) * font_size
+
+
+def fit_pdf_text(text, max_width, font_name=PDF_FONT_GOTHIC, font_size=8, ellipsis="…"):
+    """
+    指定幅に収まるよう、1行表示用の文字列へ整える。
+    改行・連続空白を1つの空白へ寄せ、長い場合は末尾を…で省略する。
+    """
+    s = re.sub(r"\s+", " ", pdf_text(text)).strip()
+    if not s:
+        return ""
+    if text_width(s, font_name, font_size) <= max_width:
+        return s
+
+    # 省略記号だけでも幅を超える場合
+    if text_width(ellipsis, font_name, font_size) > max_width:
+        return ""
+
+    low, high = 0, len(s)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = s[:mid] + ellipsis
+        if text_width(candidate, font_name, font_size) <= max_width:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best or ellipsis
 
 
 def wrap_pdf_text(text, max_width, font_name, font_size, max_lines=3):
@@ -2037,6 +2066,18 @@ def draw_wrapped_text(c, text, x, y, max_width, font_name, font_size, leading, m
     return y
 
 
+def draw_single_line(c, text, x, y, max_width, font_name=PDF_FONT_GOTHIC, font_size=8, color=None):
+    """
+    PDF上に1行だけ描画する。
+    幅を超える文字列は自動で…省略するため、次の項目と重ならない。
+    """
+    if color is not None:
+        c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    c.drawString(x, y, fit_pdf_text(text, max_width, font_name, font_size))
+    c.setFillColor(colors.black)
+
+
 def calendar_events_df(year, month):
     """指定月の予定をDataFrameで取得する。"""
     start = f"{int(year)}-{int(month):02d}-01"
@@ -2074,11 +2115,43 @@ def make_event_summary_for_pdf(ev, compact=True):
     return " ".join([p for p in parts if p])
 
 
+def draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=False):
+    """予定詳細一覧ページのヘッダーを描画する。"""
+    suffix = "（続き）" if continuation else ""
+    c.setFont(PDF_FONT_GOTHIC, 16)
+    c.setFillColor(colors.HexColor("#333333"))
+    c.drawString(margin_x, height - 34, f"予定詳細一覧　{year}年 {month}月{suffix}")
+    c.setFont(PDF_FONT_GOTHIC, 9)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawRightString(width - margin_x, height - 32, f"合計 {total_count} 件")
+    c.setFillColor(colors.black)
+
+
+def draw_pdf_detail_table_header(c, x, y, widths, row_h):
+    """予定詳細一覧の列見出しを描画する。"""
+    headers = ["時間", "分類", "予定", "利用者", "担当", "詳細・メモ"]
+    c.setFillColor(colors.HexColor("#eee7dc"))
+    c.rect(x, y - 4, sum(widths), row_h, fill=1, stroke=0)
+    c.setFillColor(colors.HexColor("#333333"))
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    cur_x = x
+    for header, w in zip(headers, widths):
+        c.drawString(cur_x + 4, y + 1, header)
+        cur_x += w
+    c.setFillColor(colors.black)
+    return y - row_h
+
+
 def make_calendar_pdf(year, month, include_detail=True):
     """
     A4横の月間カレンダーPDFを作る。
     1ページ目: 月間カレンダー
     2ページ目以降: 予定詳細一覧
+
+    Ver1.3.2相当の修正:
+    ・予定詳細一覧を1予定1行の表形式へ変更
+    ・詳細・メモも1行に収め、長い場合は…で省略
+    ・列幅ごとに文字を収めるため、文字重なりを防止
     """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab がインストールされていません。requirements.txt に reportlab を追加してください。")
@@ -2102,7 +2175,6 @@ def make_calendar_pdf(year, month, include_detail=True):
     margin_x = 24
     margin_top = 28
     title_h = 40
-    header_h = 20
     grid_x = margin_x
     grid_y_top = height - margin_top - title_h
     grid_w = width - margin_x * 2
@@ -2180,11 +2252,11 @@ def make_calendar_pdf(year, month, include_detail=True):
                 c.roundRect(x + 5, event_y - 2, cell_w - 10, band_h, 3, fill=1, stroke=0)
 
                 color = colors.HexColor("#8a2d18") if important else colors.HexColor("#3f3a35")
-                new_y = draw_wrapped_text(
+                draw_single_line(
                     c, summary, x + 8, event_y, cell_w - 16,
-                    PDF_FONT_GOTHIC, 6.6, 8, max_lines=1, color=color
+                    PDF_FONT_GOTHIC, 6.6, color=color
                 )
-                event_y = new_y - 2
+                event_y -= 10
                 lines_used += 1
 
             if len(evs) > max_lines_total:
@@ -2197,39 +2269,48 @@ def make_calendar_pdf(year, month, include_detail=True):
     c.setFont(PDF_FONT_GOTHIC, 8)
     c.setFillColor(colors.HexColor("#666666"))
     c.drawString(margin_x, 12, "※枠内は要約表示です。詳細は次ページ以降の一覧で確認できます。重要予定は薄赤で表示します。")
-    c.showPage()
+    c.setFillColor(colors.black)
 
     # 詳細一覧
     if include_detail:
+        c.showPage()
         c.setPageSize(page_size)
-        c.setFont(PDF_FONT_GOTHIC, 16)
-        c.setFillColor(colors.HexColor("#333333"))
-        c.drawString(margin_x, height - 34, f"予定詳細一覧　{year}年 {month}月")
-        c.setFont(PDF_FONT_GOTHIC, 9)
-        c.setFillColor(colors.HexColor("#666666"))
-        c.drawRightString(width - margin_x, height - 32, f"合計 {0 if df.empty else len(df)} 件")
-        c.setFillColor(colors.black)
 
-        y = height - 60
-        line_h = 13
+        total_count = 0 if df.empty else len(df)
+        draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=False)
+
         detail_x = margin_x
         detail_w = width - margin_x * 2
+        row_h = 17
+        date_h = 18
+        bottom_y = 34
+
+        # 横幅に収まる固定列幅。最後の「詳細・メモ」は残り幅を使う。
+        col_widths = [58, 54, 160, 78, 78]
+        memo_w = detail_w - sum(col_widths)
+        col_widths.append(memo_w)
+
+        y = height - 62
+        y = draw_pdf_detail_table_header(c, detail_x, y, col_widths, row_h)
 
         if df.empty:
             c.setFont(PDF_FONT_GOTHIC, 12)
-            c.drawString(detail_x, y, "この月の予定はありません。")
+            c.setFillColor(colors.HexColor("#333333"))
+            c.drawString(detail_x, y - 8, "この月の予定はありません。")
         else:
             current_date = ""
+            row_index = 0
+
             for _, row in df.iterrows():
                 event_date = pdf_text(row["event_date"])
-                if y < 45:
+
+                # 日付見出し＋1行分が入らなければ改ページ
+                if y < bottom_y + date_h + row_h + 8:
                     c.showPage()
                     c.setPageSize(page_size)
-                    c.setFont(PDF_FONT_GOTHIC, 16)
-                    c.setFillColor(colors.HexColor("#333333"))
-                    c.drawString(margin_x, height - 34, f"予定詳細一覧　{year}年 {month}月（続き）")
-                    c.setFillColor(colors.black)
-                    y = height - 60
+                    draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=True)
+                    y = height - 62
+                    y = draw_pdf_detail_table_header(c, detail_x, y, col_widths, row_h)
                     current_date = ""
 
                 if event_date != current_date:
@@ -2240,45 +2321,74 @@ def make_calendar_pdf(year, month, include_detail=True):
                         date_label = f"{d.month}/{d.day}（{dow}）"
                     except Exception:
                         date_label = event_date
-                    c.setFillColor(colors.HexColor("#f3eee6"))
-                    c.rect(detail_x, y - 2, detail_w, 17, fill=1, stroke=0)
+
+                    c.setFillColor(colors.HexColor("#f7f1e8"))
+                    c.rect(detail_x, y - 3, detail_w, date_h, fill=1, stroke=0)
                     c.setFillColor(colors.HexColor("#333333"))
-                    c.setFont(PDF_FONT_GOTHIC, 10)
+                    c.setFont(PDF_FONT_GOTHIC, 9)
                     c.drawString(detail_x + 6, y + 2, date_label)
-                    y -= 21
+                    c.setFillColor(colors.black)
+                    y -= date_h
+
+                # 1行分が入らなければ改ページ
+                if y < bottom_y + row_h:
+                    c.showPage()
+                    c.setPageSize(page_size)
+                    draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=True)
+                    y = height - 62
+                    y = draw_pdf_detail_table_header(c, detail_x, y, col_widths, row_h)
 
                 important = int(row.get("important", 0) or 0) == 1
                 category_name = pdf_text(row.get("category", ""))
-                time_text = pdf_text(row.get("start_time", ""))
-                if row.get("end_time", ""):
-                    time_text = f"{time_text}〜{pdf_text(row.get('end_time', ''))}" if time_text else f"〜{pdf_text(row.get('end_time', ''))}"
 
-                main = f"{'重要 ' if important else ''}{time_text}　【{category_name}】　{pdf_text(row.get('title', ''))}"
-                sub_parts = []
-                if pdf_text(row.get("user_name", "")):
-                    sub_parts.append(f"利用者: {pdf_text(row.get('user_name', ''))}")
-                if pdf_text(row.get("staff_name", "")):
-                    sub_parts.append(f"担当: {pdf_text(row.get('staff_name', ''))}")
-                memo = pdf_text(row.get("memo", ""))
-                sub = "　".join(sub_parts)
-                if memo:
-                    sub = f"{sub}　メモ: {memo}" if sub else f"メモ: {memo}"
+                start_time = pdf_text(row.get("start_time", ""))
+                end_time = pdf_text(row.get("end_time", ""))
+                if start_time and end_time:
+                    time_text = f"{start_time}〜{end_time}"
+                elif start_time:
+                    time_text = start_time
+                elif end_time:
+                    time_text = f"〜{end_time}"
+                else:
+                    time_text = "時間未定"
 
-                c.setFillColor(colors.HexColor("#8a2d18") if important else colors.HexColor("#222222"))
-                c.setFont(PDF_FONT_GOTHIC, 9)
-                c.drawString(detail_x + 10, y, main[:120])
-                y -= line_h
+                title_text = pdf_text(row.get("title", ""))
+                user_text = pdf_text(row.get("user_name", ""))
+                staff_text = pdf_text(row.get("staff_name", ""))
+                memo_text = pdf_text(row.get("memo", ""))
+                if important:
+                    title_text = "重要 " + title_text
 
-                if sub:
-                    y = draw_wrapped_text(
-                        c, sub, detail_x + 22, y, detail_w - 34,
-                        PDF_FONT_GOTHIC, 7.5, 10, max_lines=2, color=colors.HexColor("#555555")
+                # 行背景
+                bg = "#fffdf8" if row_index % 2 == 0 else "#faf6ef"
+                if important:
+                    bg = "#fff0e8"
+                c.setFillColor(colors.HexColor(bg))
+                c.rect(detail_x, y - 3, detail_w, row_h, fill=1, stroke=0)
+
+                # 下線
+                c.setStrokeColor(colors.HexColor("#e2d8cc"))
+                c.line(detail_x, y - 3, detail_x + detail_w, y - 3)
+                c.setStrokeColor(colors.black)
+
+                # 各列を1行で描画。幅を超えたら…で省略する。
+                values = [time_text, category_name, title_text, user_text, staff_text, memo_text]
+                cur_x = detail_x
+                text_color = colors.HexColor("#8a2d18") if important else colors.HexColor("#222222")
+                for value, w in zip(values, col_widths):
+                    draw_single_line(
+                        c, value, cur_x + 4, y + 1, max(w - 8, 10),
+                        PDF_FONT_GOTHIC, 8, color=text_color
                     )
-                y -= 4
+                    cur_x += w
+
+                y -= row_h
+                row_index += 1
 
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
+
 
 
 
@@ -2347,7 +2457,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.1 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.2 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
