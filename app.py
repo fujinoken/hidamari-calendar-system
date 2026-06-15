@@ -3207,9 +3207,9 @@ def get_staff_shift_limits():
             r = hit.iloc[0]
             rows.append({
                 "職員名": staff_name,
-                "日勤上限": int(r.get("max_day_shifts", 31) or 31),
-                "夜勤上限": int(r.get("max_night_shifts", 31) or 31),
-                "合計上限": int(r.get("max_total_shifts", 31) or 31),
+                "日勤上限": safe_shift_limit_value(r.get("max_day_shifts", 31), 31),
+                "夜勤上限": safe_shift_limit_value(r.get("max_night_shifts", 31), 31),
+                "合計上限": safe_shift_limit_value(r.get("max_total_shifts", 31), 31),
                 "メモ": str(r.get("note") or ""),
             })
     return pd.DataFrame(rows)
@@ -3227,9 +3227,9 @@ def save_staff_shift_limits_from_editor(limits_df):
             continue
         params.append((
             staff_name,
-            int(r.get("日勤上限", 31) or 31),
-            int(r.get("夜勤上限", 31) or 31),
-            int(r.get("合計上限", 31) or 31),
+            safe_shift_limit_value(r.get("日勤上限", 31), 31),
+            safe_shift_limit_value(r.get("夜勤上限", 31), 31),
+            safe_shift_limit_value(r.get("合計上限", 31), 31),
             str(r.get("メモ", "") or "").strip() or None,
             now_text(),
             now_text(),
@@ -3243,6 +3243,79 @@ def save_staff_shift_limits_from_editor(limits_df):
     """, params)
 
 
+
+def safe_shift_limit_value(value, default=31):
+    """
+    職員別勤務回数上限を安全に数値化する。
+    重要：0回指定は「勤務不可」として有効な設定なので、0を31へ戻さない。
+    空欄・NaN・不正値だけを初期値31として扱う。
+    """
+    try:
+        if value is None:
+            return int(default)
+        if isinstance(value, str) and value.strip() == "":
+            return int(default)
+        if pd.isna(value):
+            return int(default)
+        v = int(float(value))
+        return max(0, min(31, v))
+    except Exception:
+        return int(default)
+
+
+def normalize_shift_limits_for_staff(limit_map, staff_name):
+    """limit_mapから職員の上限を取り出し、day/night/totalを必ず安全なintにそろえる。"""
+    limit_map = limit_map or {}
+    raw = limit_map.get(str(staff_name), {"day": 31, "night": 31, "total": 31})
+    day_limit = safe_shift_limit_value(raw.get("day", 31), 31)
+    night_limit = safe_shift_limit_value(raw.get("night", 31), 31)
+    total_limit = safe_shift_limit_value(raw.get("total", 31), 31)
+    return {"day": day_limit, "night": night_limit, "total": total_limit}
+
+
+def staff_month_work_counts(df, staff_name, year, month):
+    """
+    指定職員の指定月内の日勤・夜勤・合計勤務数を数える。
+    include_prev_day=Trueで前月末が混ざっていても、月間上限判定には当月分だけを使う。
+    """
+    if df is None or df.empty:
+        return 0, 0, 0
+    work = df[df["staff_name"].astype(str) == str(staff_name)].copy()
+    if work.empty:
+        return 0, 0, 0
+    ym = f"{int(year)}-{int(month):02d}-"
+    work = work[work["shift_date"].astype(str).str.startswith(ym)]
+    if work.empty:
+        return 0, 0, 0
+    day_count = int(len(work[work["shift_kind"].astype(str) == "日勤"]))
+    night_count = int(len(work[work["shift_kind"].astype(str) == "夜勤"]))
+    total_count = int(len(work[work["shift_kind"].astype(str).isin(["日勤", "夜勤"])]))
+    return day_count, night_count, total_count
+
+
+def would_exceed_staff_shift_limit(df, staff_name, target_date, shift_kind, limit_map=None):
+    """
+    その勤務を1件追加した場合に、職員別の日勤・夜勤・合計上限を超えるか判定する。
+    AIシフト案作成時の最終ガードとして使う。
+    """
+    if shift_kind not in ["日勤", "夜勤"]:
+        return False, ""
+    target = pd.to_datetime(str(target_date)).date()
+    limits = normalize_shift_limits_for_staff(limit_map or get_staff_shift_limit_map(), staff_name)
+    day_count, night_count, total_count = staff_month_work_counts(df, staff_name, target.year, target.month)
+
+    add_day = 1 if shift_kind == "日勤" else 0
+    add_night = 1 if shift_kind == "夜勤" else 0
+
+    if day_count + add_day > limits["day"]:
+        return True, f"日勤上限{limits['day']}回を超えるため候補外"
+    if night_count + add_night > limits["night"]:
+        return True, f"夜勤上限{limits['night']}回を超えるため候補外"
+    if total_count + 1 > limits["total"]:
+        return True, f"合計上限{limits['total']}回を超えるため候補外"
+    return False, ""
+
+
 def get_staff_shift_limit_map():
     limits_df = get_staff_shift_limits()
     mapping = {}
@@ -3250,9 +3323,9 @@ def get_staff_shift_limit_map():
         for _, r in limits_df.iterrows():
             staff_name = str(r["職員名"])
             mapping[staff_name] = {
-                "day": int(r.get("日勤上限", 31) or 31),
-                "night": int(r.get("夜勤上限", 31) or 31),
-                "total": int(r.get("合計上限", 31) or 31),
+                "day": safe_shift_limit_value(r.get("日勤上限", 31), 31),
+                "night": safe_shift_limit_value(r.get("夜勤上限", 31), 31),
+                "total": safe_shift_limit_value(r.get("合計上限", 31), 31),
             }
     return mapping
 
@@ -3265,7 +3338,7 @@ def create_shift_limit_check_table(matrix, limit_map=None):
     rows = []
     for _, r in matrix.iterrows():
         staff_name = str(r.get("職員名", ""))
-        limits = limit_map.get(staff_name, {"day": 31, "night": 31, "total": 31})
+        limits = normalize_shift_limits_for_staff(limit_map, staff_name)
         day_count = int(r.get("日勤", 0) or 0)
         night_count = int(r.get("夜勤", 0) or 0)
         total_count = int(r.get("合計", 0) or 0)
@@ -3822,7 +3895,7 @@ def build_event_assignment_preview(events_df, shift_df, only_unassigned=True):
 
 
 def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=None):
-    """AIシフト案用。希望休・有休・休み・夜勤翌日を避け、職員別上限も見る。"""
+    """AIシフト案用。希望休・有休・休み・夜勤翌日・職員別上限を厳密に見る。"""
     if df is None:
         df = pd.DataFrame()
     date_text = str(target_date)
@@ -3848,25 +3921,11 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
     except Exception:
         pass
 
-    # 職員別上限チェック
-    limit_map = limit_map or get_staff_shift_limit_map()
-    limits = limit_map.get(str(staff_name), {"day": 31, "night": 31, "total": 31})
-    if staff_df is None or staff_df.empty:
-        day_count = night_count = total_count = 0
-    else:
-        day_count = int(len(staff_df[staff_df["shift_kind"] == "日勤"]))
-        night_count = int(len(staff_df[staff_df["shift_kind"] == "夜勤"]))
-        total_count = int(len(staff_df[staff_df["shift_kind"].isin(["日勤", "夜勤"])]))
-
-    if shift_kind == "日勤" and day_count >= int(limits.get("day", 31)):
-        return False, f"日勤上限{limits.get('day', 31)}回に達しています"
-    if shift_kind == "夜勤" and night_count >= int(limits.get("night", 31)):
-        return False, f"夜勤上限{limits.get('night', 31)}回に達しています"
-    if total_count >= int(limits.get("total", 31)):
-        return False, f"合計上限{limits.get('total', 31)}回に達しています"
+    exceed, reason = would_exceed_staff_shift_limit(df, staff_name, date_text, shift_kind, limit_map=limit_map)
+    if exceed:
+        return False, reason
 
     return True, "候補"
-
 
 def create_ai_shift_draft(df, staff_names, year, month):
     """
@@ -3884,10 +3943,10 @@ def create_ai_shift_draft(df, staff_names, year, month):
     day_counts = {s: 0 for s in staff_names}
     if df is not None and not df.empty:
         for s in staff_names:
-            s_df = df[df["staff_name"].astype(str) == str(s)]
-            day_counts[s] = int(len(s_df[s_df["shift_kind"] == "日勤"]))
-            night_counts[s] = int(len(s_df[s_df["shift_kind"] == "夜勤"]))
-            work_counts[s] = int(len(s_df[s_df["shift_kind"].isin(["日勤", "夜勤"])]))
+            d_count, n_count, t_count = staff_month_work_counts(df, s, int(year), int(month))
+            day_counts[s] = d_count
+            night_counts[s] = n_count
+            work_counts[s] = t_count
 
     rows = []
     working_df = df.copy() if df is not None else pd.DataFrame()
@@ -3937,6 +3996,21 @@ def create_ai_shift_draft(df, staff_names, year, month):
 
             candidates.sort(reverse=True)
             selected = candidates[0][1]
+
+            # 最終ガード：候補選定直前のworking_dfでも上限を再確認する
+            exceed, limit_reason = would_exceed_staff_shift_limit(
+                working_df, selected, target_date, need_kind, limit_map=limit_map
+            )
+            if exceed:
+                rows.append({
+                    "日付": target_date,
+                    "勤務": need_kind,
+                    "候補職員": "",
+                    "理由": limit_reason,
+                    "保存対象": False,
+                })
+                continue
+
             rows.append({
                 "日付": target_date,
                 "勤務": need_kind,
@@ -4102,19 +4176,64 @@ def apply_ai_shift_draft_to_df(base_df, draft_df):
 
 
 def save_ai_shift_draft_rows(draft_df):
+    """
+    AIシフト案を保存する直前にも再検査する。
+    画面表示後に上限やシフトが変更されても、DB保存時に日勤・夜勤・合計上限を超えないようにする。
+    """
     if draft_df is None or draft_df.empty:
         return 0
+
+    save_targets = draft_df[draft_df.get("保存対象", False).astype(bool)].copy()
+    if save_targets.empty:
+        return 0
+
+    # 複数月が混在する可能性は低いが、安全のため日付順に処理する
+    save_targets["_sort_date"] = save_targets["日付"].astype(str)
+    save_targets = save_targets.sort_values(["_sort_date", "勤務", "候補職員"])
+
+    first_date = pd.to_datetime(str(save_targets.iloc[0]["日付"])).date()
+    working_df = get_staff_shifts_month(first_date.year, first_date.month, include_prev_day=True)
+    limit_map = get_staff_shift_limit_map()
+
     params = []
-    for _, r in draft_df.iterrows():
-        if not bool(r.get("保存対象", False)):
-            continue
+    for _, r in save_targets.iterrows():
         staff_name = str(r.get("候補職員", "")).strip()
         shift_kind = str(r.get("勤務", "")).strip()
         shift_date = str(r.get("日付", "")).strip()
         if not staff_name or not shift_kind or not shift_date:
             continue
+
+        # 日勤・夜勤は上限、同日重複、希望休等を再確認
+        if shift_kind in ["日勤", "夜勤"]:
+            ok, why = staff_available_for_kind(working_df, staff_name, shift_date, shift_kind, limit_map=limit_map)
+            if not ok:
+                continue
+        else:
+            # 明け・休み等も、同じ区分が既にある場合は重複保存しない
+            day_df = working_df[
+                (working_df["staff_name"].astype(str) == staff_name) &
+                (working_df["shift_date"].astype(str) == shift_date)
+            ] if not working_df.empty else pd.DataFrame()
+            kinds = day_df["shift_kind"].astype(str).tolist() if not day_df.empty else []
+            if shift_kind in kinds:
+                continue
+
         stime, etime, nd = default_shift_times(shift_kind)
         params.append((shift_date, staff_name, shift_kind, stime or None, etime or None, int(nd or 0), "AIシフト案から保存", now_text(), now_text()))
+
+        add_row = pd.DataFrame([{
+            "shift_date": shift_date,
+            "staff_name": staff_name,
+            "shift_kind": shift_kind,
+            "start_time": stime,
+            "end_time": etime,
+            "next_day": nd,
+            "memo": "AIシフト案から保存",
+            "created_at": now_text(),
+            "updated_at": now_text(),
+        }])
+        working_df = pd.concat([working_df, add_row], ignore_index=True)
+
     if not params:
         return 0
     return execute_many("""
@@ -4122,7 +4241,6 @@ def save_ai_shift_draft_rows(draft_df):
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
-
 
 def make_staff_shift_pdf(year, month):
     """掲示・印刷しやすい横長のシフトPDFを作成する。"""
@@ -4395,7 +4513,7 @@ def page_shift_manager():
                 st.rerun()
 
     st.markdown("### 3. 職員別勤務回数上限")
-    st.caption("職員ごとに、この月に入れる日勤・夜勤・合計勤務の上限を設定できます。AIシフト案はこの上限を見て候補を出します。")
+    st.caption("職員ごとに、この月に入れる日勤・夜勤・合計勤務の上限を設定できます。AIシフト案はこの上限を超えない範囲で候補を出します。0回指定も有効です。")
     limits_df = get_staff_shift_limits()
     if limits_df.empty:
         st.info("職員マスタに職員が登録されていません。")
@@ -4420,7 +4538,7 @@ def page_shift_manager():
             st.rerun()
 
     st.markdown("### 4. AIシフト案作成")
-    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日の明け・明け翌日休み・職員別上限を見て下書きを作ります。保存前に仮シフト表で確認できます。")
+    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日の明け・明け翌日休み・職員別上限を超えない範囲で下書きを作ります。保存前に仮シフト表で確認できます。")
     if st.button("不足分のAIシフト案を作成", use_container_width=True):
         st.session_state["ai_shift_draft"] = create_ai_shift_draft(
             shift_df,
