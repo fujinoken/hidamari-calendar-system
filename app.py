@@ -49,7 +49,7 @@ except ImportError:
 
 
 APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
-AI_SHIFT_RULE_VERSION = "shift_limit_strict_v3_zero_limit"
+AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v4_off_conflict"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -3720,13 +3720,13 @@ def create_shift_quality_check_table(df, year, month):
             kinds = day_df["shift_kind"].astype(str).tolist() if not day_df.empty else []
 
             # 希望休・有休に勤務が重なっている
-            if ("希望休" in kinds or "有休" in kinds or "休み" in kinds) and ("日勤" in kinds or "夜勤" in kinds):
+            if any(k in kinds for k in OFF_OR_BLOCKING_SHIFT_KINDS) and any(k in kinds for k in ACTIVE_SHIFT_KINDS):
                 rows.append({
                     "重要度": "高",
                     "種類": "休み希望と勤務の重複",
                     "日付": target_date,
                     "職員名": staff_name,
-                    "内容": "休み・希望休・有休と勤務が同日に入っています。",
+                    "内容": "休み・希望休・有休・その他と、日勤・夜勤・明けが同日に入っています。",
                 })
 
             # 同じ日に日勤と夜勤が重なっている
@@ -3947,12 +3947,76 @@ def build_event_assignment_preview(events_df, shift_df, only_unassigned=True):
     return pd.DataFrame(rows)
 
 
+
+OFF_OR_BLOCKING_SHIFT_KINDS = ["休み", "希望休", "有休", "その他"]
+ACTIVE_SHIFT_KINDS = ["日勤", "夜勤", "夜勤明け"]
+
+
+def get_staff_day_shift_kinds(df, staff_name, target_date):
+    """指定職員・指定日の勤務区分一覧を、職員名正規化込みで取得する。"""
+    if df is None or df.empty:
+        return []
+    target_staff = normalize_staff_name(staff_name)
+    tmp = df.copy()
+    tmp["_staff_norm"] = tmp["staff_name"].apply(normalize_staff_name)
+    day_df = tmp[
+        (tmp["_staff_norm"] == target_staff) &
+        (tmp["shift_date"].astype(str) == str(target_date))
+    ]
+    if day_df.empty:
+        return []
+    return [str(x) for x in day_df["shift_kind"].dropna().astype(str).tolist()]
+
+
+def can_add_shift_without_overlap(existing_kinds, new_kind):
+    """
+    同じ日に入れてよい勤務かを判定する。
+    希望休・有休・休み・その他がある日は、日勤・夜勤・明けを入れない。
+    日勤・夜勤・明けがある日は、希望休・有休・休み・その他を重ねない。
+    """
+    existing_kinds = [str(k) for k in (existing_kinds or []) if str(k)]
+    new_kind = str(new_kind or "").strip()
+    if not new_kind:
+        return False, "勤務区分が空です"
+
+    if new_kind in existing_kinds:
+        return False, f"{new_kind}が既に登録済み"
+
+    existing_off = [k for k in existing_kinds if k in OFF_OR_BLOCKING_SHIFT_KINDS]
+    existing_active = [k for k in existing_kinds if k in ACTIVE_SHIFT_KINDS]
+
+    if new_kind in ACTIVE_SHIFT_KINDS and existing_off:
+        return False, f"休み系（{', '.join(existing_off)}）が既にあるため{new_kind}は入れません"
+    if new_kind in OFF_OR_BLOCKING_SHIFT_KINDS and existing_active:
+        return False, f"勤務系（{', '.join(existing_active)}）が既にあるため{new_kind}は入れません"
+
+    # 日勤・夜勤・明けは同日で重ねない
+    if new_kind in ACTIVE_SHIFT_KINDS and existing_active:
+        return False, f"勤務系（{', '.join(existing_active)}）が既にあるため{new_kind}は入れません"
+
+    # 休み系同士も重ねない。希望休や有休が入っていれば休み扱いとして十分。
+    if new_kind in OFF_OR_BLOCKING_SHIFT_KINDS and existing_off:
+        return False, f"休み系（{', '.join(existing_off)}）が既にあるため重ねません"
+
+    return True, "追加可能"
+
+
+def can_add_shift_to_working_df(df, staff_name, target_date, new_kind):
+    existing_kinds = get_staff_day_shift_kinds(df, staff_name, target_date)
+    return can_add_shift_without_overlap(existing_kinds, new_kind)
+
+
 def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=None):
-    """AIシフト案用。希望休・有休・休み・夜勤翌日・職員別上限を厳密に見る。"""
+    """AIシフト案用。希望休・有休・その他・休み・夜勤翌日・職員別上限を厳密に見る。"""
     if df is None:
         df = pd.DataFrame()
     date_text = str(target_date)
     target_staff = normalize_staff_name(staff_name)
+
+    existing_kinds = get_staff_day_shift_kinds(df, target_staff, date_text)
+    overlap_ok, overlap_reason = can_add_shift_without_overlap(existing_kinds, shift_kind)
+    if not overlap_ok:
+        return False, overlap_reason
 
     if not df.empty:
         tmp_df = df.copy()
@@ -3961,20 +4025,9 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
     else:
         staff_df = pd.DataFrame()
 
-    day_df = staff_df[staff_df["shift_date"].astype(str) == date_text] if not staff_df.empty else pd.DataFrame()
-    kinds = day_df["shift_kind"].astype(str).tolist() if not day_df.empty else []
-
-    if any(k in kinds for k in ["希望休", "有休", "休み"]):
-        return False, "休み・希望休・有休あり"
-    if shift_kind in kinds:
-        return False, "同じ勤務が登録済み"
-    if "日勤" in kinds or "夜勤" in kinds:
-        return False, "同日に別勤務あり"
-
     try:
         prev_date = (pd.to_datetime(date_text).date() - timedelta(days=1)).strftime("%Y-%m-%d")
-        prev_df = staff_df[staff_df["shift_date"].astype(str) == prev_date] if not staff_df.empty else pd.DataFrame()
-        prev_kinds = prev_df["shift_kind"].astype(str).tolist() if not prev_df.empty else []
+        prev_kinds = get_staff_day_shift_kinds(df, target_staff, prev_date)
         if "夜勤" in prev_kinds:
             return False, "前日夜勤のため翌日は明け"
         if "夜勤明け" in prev_kinds:
@@ -4144,20 +4197,18 @@ def create_ai_shift_draft(df, staff_names, year, month):
 
                     if next_date_obj.month == int(month):
                         next_date = next_date_obj.strftime("%Y-%m-%d")
-                        next_df = working_df[
-                            (working_df["staff_name"].apply(normalize_staff_name) == selected) &
-                            (working_df["shift_date"].astype(str) == next_date)
-                        ] if not working_df.empty else pd.DataFrame()
-                        next_kinds = next_df["shift_kind"].astype(str).tolist() if not next_df.empty else []
-                        if any(k in next_kinds for k in ["日勤", "夜勤", "休み", "有休", "希望休"]):
+                        next_kinds = get_staff_day_shift_kinds(working_df, selected, next_date)
+                        can_add_ake, ake_reason = can_add_shift_without_overlap(next_kinds, "夜勤明け")
+                        if not can_add_ake:
+                            # 既に夜勤明けがある場合も重複追加しない。休み・希望休・有休・その他がある場合は明けを重ねない。
                             rows.append({
                                 "日付": next_date,
                                 "勤務": "注意",
                                 "候補職員": selected,
-                                "理由": f"夜勤翌日は明けにしたいですが、既に {', '.join(next_kinds)} が入っています。要確認です。",
+                                "理由": f"夜勤翌日の明けは追加しません：{ake_reason}",
                                 "保存対象": False,
                             })
-                        elif "夜勤明け" not in next_kinds:
+                        else:
                             rows.append({
                                 "日付": next_date,
                                 "勤務": "夜勤明け",
@@ -4188,20 +4239,18 @@ def create_ai_shift_draft(df, staff_names, year, month):
 
                     if rest_date_obj.month == int(month):
                         rest_date = rest_date_obj.strftime("%Y-%m-%d")
-                        rest_df = working_df[
-                            (working_df["staff_name"].apply(normalize_staff_name) == selected) &
-                            (working_df["shift_date"].astype(str) == rest_date)
-                        ] if not working_df.empty else pd.DataFrame()
-                        rest_kinds = rest_df["shift_kind"].astype(str).tolist() if not rest_df.empty else []
-                        if any(k in rest_kinds for k in ["日勤", "夜勤"]):
+                        rest_kinds = get_staff_day_shift_kinds(working_df, selected, rest_date)
+                        can_add_rest, rest_reason = can_add_shift_without_overlap(rest_kinds, "休み")
+                        if not can_add_rest:
+                            # 希望休・有休・その他が既にある日は、それを休み扱いとして休みを重ねない。
                             rows.append({
                                 "日付": rest_date,
                                 "勤務": "注意",
                                 "候補職員": selected,
-                                "理由": f"明け翌日は休みにしたいですが、既に {', '.join(rest_kinds)} が入っています。要確認です。",
+                                "理由": f"明け翌日の休みは追加しません：{rest_reason}",
                                 "保存対象": False,
                             })
-                        elif not any(k in rest_kinds for k in ["休み", "有休", "希望休"]):
+                        else:
                             rows.append({
                                 "日付": rest_date,
                                 "勤務": "休み",
@@ -4241,13 +4290,16 @@ def create_ai_shift_draft(df, staff_names, year, month):
     return pd.DataFrame(rows)
 
 def apply_ai_shift_draft_to_df(base_df, draft_df):
-    """AIシフト案をDB保存前に画面上で仮反映したDataFrameを作る。"""
+    """AIシフト案をDB保存前に画面上で仮反映したDataFrameを作る。重複する案は仮反映しない。"""
     work = base_df.copy() if base_df is not None else pd.DataFrame()
     if work is not None and not work.empty and "staff_name" in work.columns:
         work["staff_name"] = work["staff_name"].apply(normalize_staff_name)
-    rows = []
     if draft_df is None or draft_df.empty:
         return work
+    if work is None or work.empty:
+        work = pd.DataFrame(columns=["id", "shift_date", "staff_name", "shift_kind", "start_time", "end_time", "next_day", "memo", "created_at", "updated_at"])
+
+    rows = []
     for _, r in draft_df.iterrows():
         if not bool(r.get("保存対象", False)):
             continue
@@ -4256,8 +4308,11 @@ def apply_ai_shift_draft_to_df(base_df, draft_df):
         shift_date = str(r.get("日付", "")).strip()
         if not staff_name or not shift_kind or not shift_date:
             continue
+        ok, _ = can_add_shift_to_working_df(work, staff_name, shift_date, shift_kind)
+        if not ok:
+            continue
         stime, etime, nd = default_shift_times(shift_kind)
-        rows.append({
+        new_row = {
             "id": -1,
             "shift_date": shift_date,
             "staff_name": staff_name,
@@ -4268,17 +4323,17 @@ def apply_ai_shift_draft_to_df(base_df, draft_df):
             "memo": "AIシフト案（未保存）",
             "created_at": now_text(),
             "updated_at": now_text(),
-        })
-    if rows:
-        work = pd.concat([work, pd.DataFrame(rows)], ignore_index=True)
+        }
+        rows.append(new_row)
+        work = pd.concat([work, pd.DataFrame([new_row])], ignore_index=True)
     return work
 
 
 
 def sanitize_ai_shift_draft_by_limits(draft_df, base_df, year, month):
     """
-    session_stateに残った古いAI案も、現在の上限条件で再検査する。
-    上限0回の職員に日勤・夜勤が残っている場合は保存対象から外し、注意行へ変換する。
+    session_stateに残った古いAI案も、現在の上限・重複条件で再検査する。
+    希望休・有休・休み・その他がある日は、日勤・夜勤・明けを重ねない。
     """
     if draft_df is None or draft_df.empty:
         return draft_df
@@ -4298,24 +4353,37 @@ def sanitize_ai_shift_draft_by_limits(draft_df, base_df, year, month):
         staff_name = normalize_staff_name(r.get("候補職員", ""))
         save_target = bool(r.get("保存対象", False))
 
-        # 日勤・夜勤は現在の上限で必ず再判定
-        if save_target and shift_kind in ["日勤", "夜勤"] and staff_name:
-            ok, why = staff_available_for_kind(working_df, staff_name, shift_date, shift_kind, limit_map=limit_map)
-            if not ok:
+        if save_target and staff_name and shift_kind:
+            # 全勤務区分について同日重複・休み系との重なりを再判定
+            overlap_ok, overlap_reason = can_add_shift_to_working_df(working_df, staff_name, shift_date, shift_kind)
+            if not overlap_ok:
                 cleaned_rows.append({
                     "日付": shift_date,
                     "勤務": "注意",
                     "候補職員": staff_name,
-                    "理由": f"現在の上限条件で除外しました：{shift_kind} / {why}",
+                    "理由": f"現在の重複条件で除外しました：{shift_kind} / {overlap_reason}",
                     "保存対象": False,
                 })
                 continue
+
+            # 日勤・夜勤は上限も再判定
+            if shift_kind in ["日勤", "夜勤"]:
+                ok, why = staff_available_for_kind(working_df, staff_name, shift_date, shift_kind, limit_map=limit_map)
+                if not ok:
+                    cleaned_rows.append({
+                        "日付": shift_date,
+                        "勤務": "注意",
+                        "候補職員": staff_name,
+                        "理由": f"現在の上限条件で除外しました：{shift_kind} / {why}",
+                        "保存対象": False,
+                    })
+                    continue
 
             cleaned_rows.append({
                 "日付": shift_date,
                 "勤務": shift_kind,
                 "候補職員": staff_name,
-                "理由": str(r.get("理由", "日勤・夜勤・合計上限内で候補化")),
+                "理由": str(r.get("理由", "現在条件で確認済み")),
                 "保存対象": True,
             })
             stime, etime, nd = default_shift_times(shift_kind)
@@ -4333,13 +4401,13 @@ def sanitize_ai_shift_draft_by_limits(draft_df, base_df, year, month):
             working_df = pd.concat([working_df, add_row], ignore_index=True)
             continue
 
-        # 明け・休みは勤務回数に入れないが、職員名だけ正規化する
         row_dict = dict(r)
         if "候補職員" in row_dict:
             row_dict["候補職員"] = staff_name
         cleaned_rows.append(row_dict)
 
     return pd.DataFrame(cleaned_rows, columns=["日付", "勤務", "候補職員", "理由", "保存対象"])
+
 
 
 def save_ai_shift_draft_rows(draft_df):
@@ -4372,19 +4440,15 @@ def save_ai_shift_draft_rows(draft_df):
         if not staff_name or not shift_kind or not shift_date:
             continue
 
-        # 日勤・夜勤は上限、同日重複、希望休等を再確認
+        # すべての勤務区分で、同日重複・休み系との重なりを再確認
+        overlap_ok, overlap_reason = can_add_shift_to_working_df(working_df, staff_name, shift_date, shift_kind)
+        if not overlap_ok:
+            continue
+
+        # 日勤・夜勤は上限、夜勤翌日等も再確認
         if shift_kind in ["日勤", "夜勤"]:
             ok, why = staff_available_for_kind(working_df, staff_name, shift_date, shift_kind, limit_map=limit_map)
             if not ok:
-                continue
-        else:
-            # 明け・休み等も、同じ区分が既にある場合は重複保存しない
-            day_df = working_df[
-                (working_df["staff_name"].apply(normalize_staff_name) == staff_name) &
-                (working_df["shift_date"].astype(str) == shift_date)
-            ] if not working_df.empty else pd.DataFrame()
-            kinds = day_df["shift_kind"].astype(str).tolist() if not day_df.empty else []
-            if shift_kind in kinds:
                 continue
 
         stime, etime, nd = default_shift_times(shift_kind)
