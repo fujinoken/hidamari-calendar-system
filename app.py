@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.6
+ひだまり帳 Ver1.3.7
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.6 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.7 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -592,10 +592,17 @@ def check_storage_bucket_access():
 
 def count_query(sql, params=()):
     """COUNT系SQLを安全にintで返す。"""
-    df = fetch_df(sql, params)
-    if df.empty:
+    try:
+        df = fetch_df(sql, params)
+        if df is None or df.shape[0] == 0 or df.shape[1] == 0:
+            return 0
+        value = df.iat[0, 0]
+        if pd.isna(value):
+            return 0
+        return int(value or 0)
+    except Exception as e:
+        st.warning(f"件数取得に失敗しました：{e}")
         return 0
-    return int(df.iloc[0, 0] or 0)
 
 
 
@@ -2832,8 +2839,8 @@ def page_storage_check():
     event_count = count_query("SELECT COUNT(*) FROM events")
     photo_count = count_query("SELECT COUNT(*) FROM event_photos")
     file_count = count_query("SELECT COUNT(*) FROM event_files")
-    storage_photo_count = count_query("SELECT COUNT(*) FROM event_photos WHERE file_path LIKE 'storage://%'")
-    storage_file_count = count_query("SELECT COUNT(*) FROM event_files WHERE file_path LIKE 'storage://%'")
+    storage_photo_count = count_query("SELECT COUNT(*) FROM event_photos WHERE file_path LIKE ?", ("storage://%",))
+    storage_file_count = count_query("SELECT COUNT(*) FROM event_files WHERE file_path LIKE ?", ("storage://%",))
     local_photo_count = photo_count - storage_photo_count
     local_file_count = file_count - storage_file_count
 
@@ -2973,14 +2980,14 @@ def page_storage_check():
     path_df = fetch_df("""
         SELECT '写真メモ' AS 種別, id, event_id, file_name, file_path, created_at
         FROM event_photos
-        WHERE file_path LIKE 'storage://%'
+        WHERE file_path LIKE ?
         UNION ALL
         SELECT '添付ファイル' AS 種別, id, event_id, file_name, file_path, created_at
         FROM event_files
-        WHERE file_path LIKE 'storage://%'
+        WHERE file_path LIKE ?
         ORDER BY created_at DESC
         LIMIT 50
-    """)
+    """, ("storage://%", "storage://%"))
     if path_df.empty:
         st.info("Storage保存パスはまだ登録されていません。")
     else:
@@ -3054,7 +3061,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.6 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.7 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
