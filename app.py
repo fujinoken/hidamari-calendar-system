@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.2
+ひだまり帳 Ver1.3.3
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -41,7 +41,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.2 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.3 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -2097,22 +2097,48 @@ def calendar_events_df(year, month):
 
 def make_event_summary_for_pdf(ev, compact=True):
     """カレンダー枠内に表示する予定の短い説明を作る。"""
-    category_name = pdf_text(ev.get("category", ""))
-    time_part = pdf_text(ev.get("start_time", ""))
-    title = pdf_text(ev.get("title", ""))
-    user_name = pdf_text(ev.get("user_name", ""))
-    staff_name = pdf_text(ev.get("staff_name", ""))
-    important = "重要 " if int(ev.get("important", 0) or 0) == 1 else ""
+    category_name = re.sub(r"\s+", " ", pdf_text(ev.get("category", ""))).strip()
+    time_part = re.sub(r"\s+", " ", pdf_text(ev.get("start_time", ""))).strip()
+    title = re.sub(r"\s+", " ", pdf_text(ev.get("title", ""))).strip()
+    user_name = re.sub(r"\s+", " ", pdf_text(ev.get("user_name", ""))).strip()
+    staff_name = re.sub(r"\s+", " ", pdf_text(ev.get("staff_name", ""))).strip()
+    important = "★" if int(ev.get("important", 0) or 0) == 1 else ""
+
+    if compact:
+        # 月間カレンダー枠内は重なり防止を最優先し、情報量を絞る。
+        # 利用者・担当・長い詳細は次ページの予定詳細一覧で確認する。
+        parts = []
+        if time_part:
+            parts.append(time_part)
+
+        label_core = f"【{category_name}】" if category_name else ""
+        if title:
+            label_core += title
+        elif user_name:
+            label_core += user_name
+
+        if important:
+            label_core = f"{important}{label_core}"
+
+        if label_core:
+            parts.append(label_core)
+
+        return " ".join([p for p in parts if p]).strip()
 
     parts = []
     if time_part:
         parts.append(time_part)
-    parts.append(f"【{category_name}】{important}{title}")
+    label_core = f"【{category_name}】"
+    if important:
+        label_core += important
+    if title:
+        label_core += title
+    parts.append(label_core)
     if user_name:
         parts.append(f"利用者:{user_name}")
-    if staff_name and not compact:
+    if staff_name:
         parts.append(f"担当:{staff_name}")
-    return " ".join([p for p in parts if p])
+    return " ".join([p for p in parts if p]).strip()
 
 
 def draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=False):
@@ -2148,10 +2174,11 @@ def make_calendar_pdf(year, month, include_detail=True):
     1ページ目: 月間カレンダー
     2ページ目以降: 予定詳細一覧
 
-    Ver1.3.2相当の修正:
+    Ver1.3.3相当の修正:
     ・予定詳細一覧を1予定1行の表形式へ変更
     ・詳細・メモも1行に収め、長い場合は…で省略
-    ・列幅ごとに文字を収めるため、文字重なりを防止
+    ・カレンダー枠内の予定文字が重ならないよう、表示行数・文字量・余白を再調整
+    ・月間カレンダー枠内は要約表示に絞り、あふれる予定は「ほか◯件」で表示
     """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab がインストールされていません。requirements.txt に reportlab を追加してください。")
@@ -2223,46 +2250,64 @@ def make_calendar_pdf(year, month, include_detail=True):
             if not day:
                 continue
 
-            # 日付
+            # 日付を少し小さくし、予定表示エリアを広げる
             date_color = colors.HexColor("#333333")
             if col == 0:
                 date_color = colors.HexColor("#c0392b")
             elif col == 6:
                 date_color = colors.HexColor("#1f4e79")
             c.setFillColor(date_color)
-            c.setFont(PDF_FONT_GOTHIC, 17)
-            c.drawString(x + 6, y + cell_h - 22, str(day))
+            c.setFont(PDF_FONT_GOTHIC, 15)
+            c.drawString(x + 6, y + cell_h - 18, str(day))
 
             key = f"{year}-{month:02d}-{day:02d}"
             evs = events_by_day.get(key, [])
-            event_y = y + cell_h - 38
-            max_lines_total = 5
-            lines_used = 0
+            if not evs:
+                continue
 
-            for ev in evs:
-                if lines_used >= max_lines_total:
-                    break
+            # 枠内で文字が重ならないよう、予定表示エリアを固定管理する
+            left_pad = 5
+            right_pad = 5
+            top_after_date = 28
+            bottom_reserved = 10
+            band_h = 10
+            row_gap = 2
+            row_pitch = band_h + row_gap
+            event_area_top = y + cell_h - top_after_date
+            event_area_bottom = y + bottom_reserved
+            usable_h = max(0, event_area_top - event_area_bottom)
+            max_lines_total = max(1, int(usable_h // row_pitch))
+            max_lines_total = min(max_lines_total, 4)
 
+            visible_events = evs[:max_lines_total]
+            for idx, ev in enumerate(visible_events):
                 summary = make_event_summary_for_pdf(ev, compact=True)
                 important = int(ev.get("important", 0) or 0) == 1
 
-                # 予定の背景帯
-                band_h = 13
+                band_top = event_area_top - idx * row_pitch
+                band_y = band_top - band_h
+                band_w = cell_w - left_pad - right_pad
+
                 c.setFillColor(colors.HexColor("#ffe9e0") if important else colors.HexColor("#f6efe6"))
-                c.roundRect(x + 5, event_y - 2, cell_w - 10, band_h, 3, fill=1, stroke=0)
+                c.roundRect(x + left_pad, band_y, band_w, band_h, 2.5, fill=1, stroke=0)
 
-                color = colors.HexColor("#8a2d18") if important else colors.HexColor("#3f3a35")
+                text_color = colors.HexColor("#8a2d18") if important else colors.HexColor("#3f3a35")
                 draw_single_line(
-                    c, summary, x + 8, event_y, cell_w - 16,
-                    PDF_FONT_GOTHIC, 6.6, color=color
+                    c,
+                    summary,
+                    x + left_pad + 2,
+                    band_y + 2.1,
+                    band_w - 4,
+                    PDF_FONT_GOTHIC,
+                    6.0,
+                    color=text_color,
                 )
-                event_y -= 10
-                lines_used += 1
 
-            if len(evs) > max_lines_total:
-                c.setFont(PDF_FONT_GOTHIC, 6.5)
+            remaining = len(evs) - len(visible_events)
+            if remaining > 0:
+                c.setFont(PDF_FONT_GOTHIC, 6.3)
                 c.setFillColor(colors.HexColor("#555555"))
-                c.drawString(x + 8, y + 7, f"ほか {len(evs) - max_lines_total} 件")
+                c.drawString(x + 7, y + 5, f"ほか {remaining} 件")
                 c.setFillColor(colors.black)
 
     # 凡例
@@ -2457,7 +2502,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.2 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.3 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
