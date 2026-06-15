@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.4.0
+ひだまり帳 Ver1.4.1
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.4.0 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.4.1 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -3187,6 +3187,121 @@ def create_shift_matrix(df, year, month):
     return pd.DataFrame(rows, columns=columns)
 
 
+def shift_kind_from_editor_label(label):
+    """月間シフト直接入力用の短縮ラベルを勤務区分へ変換する。"""
+    value = str(label or "").strip()
+    mapping = {
+        "日": ["日勤"],
+        "夜": ["夜勤"],
+        "休": ["休み"],
+        "他": ["その他"],
+        "日/夜": ["日勤", "夜勤"],
+        "夜/日": ["日勤", "夜勤"],
+    }
+    return mapping.get(value, [])
+
+
+def create_editable_shift_matrix(staff_names, df, year, month):
+    """
+    st.data_editorで直接入力しやすい月間シフト表を作る。
+    各セルは「」「日」「夜」「休」「日/夜」からプルダウン入力する。
+    """
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    staff_names = [s for s in staff_names if str(s).strip()]
+    if df is not None and not df.empty:
+        for s in sorted(df["staff_name"].dropna().astype(str).unique().tolist()):
+            if s and s not in staff_names:
+                staff_names.append(s)
+
+    columns = ["職員名"] + [str(d) for d in range(1, last_day + 1)]
+    rows = []
+
+    for staff_name in staff_names:
+        row = {"職員名": staff_name}
+        staff_df = df[df["staff_name"].astype(str) == staff_name] if df is not None and not df.empty else pd.DataFrame()
+        for d in range(1, last_day + 1):
+            target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
+            if staff_df.empty:
+                row[str(d)] = ""
+                continue
+            day_rows = staff_df[staff_df["shift_date"].astype(str) == target_date]
+            if day_rows.empty:
+                row[str(d)] = ""
+                continue
+            labels = []
+            for _, r in day_rows.iterrows():
+                label = shift_short_label(str(r["shift_kind"]))
+                if label and label not in labels:
+                    labels.append(label)
+            # 日と夜が同日にある場合は日/夜として表示
+            if "日" in labels and "夜" in labels:
+                row[str(d)] = "日/夜"
+            elif labels:
+                row[str(d)] = labels[0]
+            else:
+                row[str(d)] = ""
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def save_shift_matrix_from_editor(year, month, edited_df):
+    """
+    月間シフト表の直接編集内容をDBへ反映する。
+    既存の該当月・該当職員分はいったん削除し、セルの内容から再作成する。
+    """
+    if edited_df is None or edited_df.empty:
+        return 0
+
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    staff_names = [str(v).strip() for v in edited_df["職員名"].tolist() if str(v).strip()]
+    if not staff_names:
+        return 0
+
+    # 対象月・表示職員分だけを入れ替える
+    start = f"{int(year)}-{int(month):02d}-01"
+    end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
+    for staff_name in staff_names:
+        execute(
+            "DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ? AND staff_name=?",
+            (start, end, staff_name),
+        )
+
+    params = []
+    for _, row in edited_df.iterrows():
+        staff_name = str(row.get("職員名", "")).strip()
+        if not staff_name:
+            continue
+        for d in range(1, last_day + 1):
+            label = str(row.get(str(d), "") or "").strip()
+            kinds = shift_kind_from_editor_label(label)
+            if not kinds:
+                continue
+            shift_date = f"{int(year)}-{int(month):02d}-{d:02d}"
+            for kind in kinds:
+                stime, etime, next_day = default_shift_times(kind)
+                params.append((
+                    shift_date,
+                    staff_name,
+                    kind,
+                    stime or None,
+                    etime or None,
+                    int(next_day or 0),
+                    "月間表から直接入力",
+                    now_text(),
+                    now_text(),
+                ))
+
+    if not params:
+        return 0
+
+    return execute_many("""
+        INSERT INTO staff_shifts
+        (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, params)
+
+
 def create_shift_shortage_table(df, year, month):
     """日勤2名・夜勤1名を基準に、不足日を確認する。"""
     last_day = calendar.monthrange(int(year), int(month))[1]
@@ -3472,16 +3587,56 @@ def page_shift_manager():
                 st.rerun()
 
     st.markdown("---")
-    st.markdown("### 2. 月間シフト表示")
+    st.markdown("### 2. 月間シフト直接入力・表示")
 
     shift_df = get_staff_shifts_month(int(shift_year), int(shift_month))
     matrix = create_shift_matrix(shift_df, int(shift_year), int(shift_month))
     shortage = create_shift_shortage_table(shift_df, int(shift_year), int(shift_month))
 
-    if matrix.empty:
-        st.info("この月のシフトはまだ登録されていません。")
+    staff_names_for_editor = get_active_staff()
+    editable_matrix = create_editable_shift_matrix(
+        staff_names_for_editor,
+        shift_df,
+        int(shift_year),
+        int(shift_month),
+    )
+
+    if editable_matrix.empty:
+        st.info("職員マスタに職員が登録されていません。先に職員マスタで職員を登録してください。")
     else:
-        st.dataframe(matrix, use_container_width=True, hide_index=True)
+        st.caption("各セルをクリックして、プルダウンから「日」「夜」「休」「日/夜」を直接入力できます。空欄にすると削除扱いになります。")
+
+        last_day_for_editor = calendar.monthrange(int(shift_year), int(shift_month))[1]
+        column_config = {
+            "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium")
+        }
+        for d in range(1, last_day_for_editor + 1):
+            column_config[str(d)] = st.column_config.SelectboxColumn(
+                str(d),
+                options=["", "日", "夜", "休", "日/夜"],
+                required=False,
+                width="small",
+            )
+
+        edited_matrix = st.data_editor(
+            editable_matrix,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config=column_config,
+            key=f"shift_matrix_editor_{int(shift_year)}_{int(shift_month)}",
+        )
+
+        if st.button("月間シフト表の直接入力内容を保存", use_container_width=True):
+            saved = save_shift_matrix_from_editor(int(shift_year), int(shift_month), edited_matrix)
+            st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
+            st.rerun()
+
+    with st.expander("集計表を見る"):
+        if matrix.empty:
+            st.info("この月のシフトはまだ登録されていません。")
+        else:
+            st.dataframe(matrix, use_container_width=True, hide_index=True)
 
     ng = shortage[shortage["状態"] != "OK"]
     if ng.empty:
@@ -3881,7 +4036,7 @@ def main():
     init_db_once()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.4.0 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.4.1 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
