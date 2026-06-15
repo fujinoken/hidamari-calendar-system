@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.4.2
+ひだまり帳 Ver1.4.3
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.4.2 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.4.3 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -251,6 +251,19 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS staff_shift_limits (
+        id SERIAL PRIMARY KEY,
+        staff_name TEXT NOT NULL UNIQUE,
+        max_day_shifts INTEGER DEFAULT 31,
+        max_night_shifts INTEGER DEFAULT 31,
+        max_total_shifts INTEGER DEFAULT 31,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
     # よく使う検索用インデックス。既存DBにも安全に追加できる。
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event_date ON events(event_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date, start_time)")
@@ -264,6 +277,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_staff ON staff_shifts(staff_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_date_kind ON staff_shifts(shift_date, shift_kind)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_shift_month_status_ym ON shift_month_status(shift_year, shift_month)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shift_limits_staff ON staff_shift_limits(staff_name)")
 
     conn.commit()
     cur.close()
@@ -3079,7 +3093,7 @@ def make_calendar_pdf(year, month, include_detail=True):
 # シフト管理・AI担当割当
 # -----------------------------
 SHIFT_KINDS = ["日勤", "夜勤", "夜勤明け", "休み", "希望休", "有休", "その他"]
-SHIFT_EDITOR_OPTIONS = ["", "日", "夜", "明", "休", "希", "有", "他", "日/夜"]
+SHIFT_EDITOR_OPTIONS = ["", "日", "夜", "明", "休", "希", "有", "他"]
 
 
 def default_shift_times(shift_kind):
@@ -3116,8 +3130,6 @@ def shift_kind_from_editor_label(label):
         "希": ["希望休"],
         "有": ["有休"],
         "他": ["その他"],
-        "日/夜": ["日勤", "夜勤"],
-        "夜/日": ["日勤", "夜勤"],
     }
     return mapping.get(value, [])
 
@@ -3165,6 +3177,107 @@ def set_shift_month_status(year, month, is_confirmed, confirmed_by=""):
         ))
     except Exception as e:
         st.warning(f"シフト確定状態の保存に失敗しました：{e}")
+
+def get_staff_shift_limits():
+    """
+    職員別の月間勤務回数上限を取得する。
+    未設定職員は、日勤31回・夜勤31回・合計31回として扱う。
+    """
+    staff_names = get_active_staff()
+    try:
+        df = fetch_df("""
+            SELECT staff_name, max_day_shifts, max_night_shifts, max_total_shifts, note
+            FROM staff_shift_limits
+            ORDER BY staff_name
+        """)
+    except Exception:
+        df = pd.DataFrame(columns=["staff_name", "max_day_shifts", "max_night_shifts", "max_total_shifts", "note"])
+
+    rows = []
+    for staff_name in staff_names:
+        hit = df[df["staff_name"].astype(str) == str(staff_name)] if not df.empty else pd.DataFrame()
+        if hit.empty:
+            rows.append({
+                "職員名": staff_name,
+                "日勤上限": 31,
+                "夜勤上限": 31,
+                "合計上限": 31,
+                "メモ": "",
+            })
+        else:
+            r = hit.iloc[0]
+            rows.append({
+                "職員名": staff_name,
+                "日勤上限": int(r.get("max_day_shifts", 31) or 31),
+                "夜勤上限": int(r.get("max_night_shifts", 31) or 31),
+                "合計上限": int(r.get("max_total_shifts", 31) or 31),
+                "メモ": str(r.get("note") or ""),
+            })
+    return pd.DataFrame(rows)
+
+
+def save_staff_shift_limits_from_editor(limits_df):
+    """職員別勤務上限を保存する。"""
+    if limits_df is None or limits_df.empty:
+        return 0
+    execute("DELETE FROM staff_shift_limits")
+    params = []
+    for _, r in limits_df.iterrows():
+        staff_name = str(r.get("職員名", "")).strip()
+        if not staff_name:
+            continue
+        params.append((
+            staff_name,
+            int(r.get("日勤上限", 31) or 31),
+            int(r.get("夜勤上限", 31) or 31),
+            int(r.get("合計上限", 31) or 31),
+            str(r.get("メモ", "") or "").strip() or None,
+            now_text(),
+            now_text(),
+        ))
+    if not params:
+        return 0
+    return execute_many("""
+        INSERT INTO staff_shift_limits
+        (staff_name, max_day_shifts, max_night_shifts, max_total_shifts, note, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, params)
+
+
+def get_staff_shift_limit_map():
+    limits_df = get_staff_shift_limits()
+    mapping = {}
+    if limits_df is not None and not limits_df.empty:
+        for _, r in limits_df.iterrows():
+            staff_name = str(r["職員名"])
+            mapping[staff_name] = {
+                "day": int(r.get("日勤上限", 31) or 31),
+                "night": int(r.get("夜勤上限", 31) or 31),
+                "total": int(r.get("合計上限", 31) or 31),
+            }
+    return mapping
+
+
+def create_shift_limit_check_table(matrix, limit_map=None):
+    """月間勤務回数が職員別上限を超えていないか確認する。"""
+    if matrix is None or matrix.empty:
+        return pd.DataFrame(columns=["重要度", "種類", "職員名", "内容"])
+    limit_map = limit_map or get_staff_shift_limit_map()
+    rows = []
+    for _, r in matrix.iterrows():
+        staff_name = str(r.get("職員名", ""))
+        limits = limit_map.get(staff_name, {"day": 31, "night": 31, "total": 31})
+        day_count = int(r.get("日勤", 0) or 0)
+        night_count = int(r.get("夜勤", 0) or 0)
+        total_count = int(r.get("合計", 0) or 0)
+        if day_count > limits["day"]:
+            rows.append({"重要度": "高", "種類": "日勤上限超過", "職員名": staff_name, "内容": f"日勤 {day_count}回 / 上限 {limits['day']}回"})
+        if night_count > limits["night"]:
+            rows.append({"重要度": "高", "種類": "夜勤上限超過", "職員名": staff_name, "内容": f"夜勤 {night_count}回 / 上限 {limits['night']}回"})
+        if total_count > limits["total"]:
+            rows.append({"重要度": "中", "種類": "合計上限超過", "職員名": staff_name, "内容": f"合計 {total_count}回 / 上限 {limits['total']}回"})
+    return pd.DataFrame(rows, columns=["重要度", "種類", "職員名", "内容"])
+
 
 
 def shift_month_is_confirmed(year, month):
@@ -3272,8 +3385,9 @@ def labels_to_cell_value(labels):
     labels = [x for x in labels if x]
     if not labels:
         return ""
+    # 日/夜の同日入力は禁止。既存データで重なっている場合は日を優先表示し、チェックで警告する。
     if "日" in labels and "夜" in labels:
-        return "日/夜"
+        return "日"
     priority = ["日", "夜", "明", "休", "希", "有", "他"]
     ordered = [x for x in priority if x in labels]
     if len(ordered) == 1:
@@ -3471,18 +3585,37 @@ def create_shift_quality_check_table(df, year, month):
                     "内容": "休み・希望休・有休と勤務が同日に入っています。",
                 })
 
-            # 前日夜勤なのに当日日勤
+            # 同じ日に日勤と夜勤が重なっている
+            if "日勤" in kinds and "夜勤" in kinds:
+                rows.append({
+                    "重要度": "高",
+                    "種類": "日勤夜勤重複",
+                    "日付": target_date,
+                    "職員名": staff_name,
+                    "内容": "同じ日に日勤と夜勤が入っています。日/夜入力は禁止です。",
+                })
+
+            # 前日夜勤の翌日は休みにする
             try:
                 prev_date = (date(int(year), int(month), d) - timedelta(days=1)).strftime("%Y-%m-%d")
                 prev_df = df[(df["staff_name"].astype(str) == staff_name) & (df["shift_date"].astype(str) == prev_date)]
-                if "夜勤" in prev_df["shift_kind"].astype(str).tolist() and "日勤" in kinds:
-                    rows.append({
-                        "重要度": "高",
-                        "種類": "夜勤明け日勤",
-                        "日付": target_date,
-                        "職員名": staff_name,
-                        "内容": "前日夜勤の翌日に日勤が入っています。",
-                    })
+                if "夜勤" in prev_df["shift_kind"].astype(str).tolist():
+                    if "日勤" in kinds or "夜勤" in kinds:
+                        rows.append({
+                            "重要度": "高",
+                            "種類": "夜勤翌日勤務",
+                            "日付": target_date,
+                            "職員名": staff_name,
+                            "内容": "夜勤の翌日に勤務が入っています。翌日は休みにしてください。",
+                        })
+                    if not any(k in kinds for k in ["休み", "有休", "希望休", "夜勤明け"]):
+                        rows.append({
+                            "重要度": "中",
+                            "種類": "夜勤翌日休み未登録",
+                            "日付": target_date,
+                            "職員名": staff_name,
+                            "内容": "夜勤の翌日に休みが登録されていません。",
+                        })
             except Exception:
                 pass
 
@@ -3650,8 +3783,8 @@ def build_event_assignment_preview(events_df, shift_df, only_unassigned=True):
     return pd.DataFrame(rows)
 
 
-def staff_available_for_kind(df, staff_name, target_date, shift_kind):
-    """AIシフト案用。希望休・有休・休み・夜勤明けを避け、簡易的に勤務可能か判定する。"""
+def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=None):
+    """AIシフト案用。希望休・有休・休み・夜勤翌日を避け、職員別上限も見る。"""
     if df is None:
         df = pd.DataFrame()
     date_text = str(target_date)
@@ -3663,16 +3796,33 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind):
         return False, "休み・希望休・有休あり"
     if shift_kind in kinds:
         return False, "同じ勤務が登録済み"
-    if shift_kind == "日勤" and "夜勤" in kinds:
-        return False, "同日に夜勤あり"
+    if "日勤" in kinds or "夜勤" in kinds:
+        return False, "同日に別勤務あり"
 
     try:
         prev_date = (pd.to_datetime(date_text).date() - timedelta(days=1)).strftime("%Y-%m-%d")
         prev_df = staff_df[staff_df["shift_date"].astype(str) == prev_date] if not staff_df.empty else pd.DataFrame()
-        if shift_kind == "日勤" and not prev_df.empty and "夜勤" in prev_df["shift_kind"].astype(str).tolist():
-            return False, "前日夜勤明け"
+        if not prev_df.empty and "夜勤" in prev_df["shift_kind"].astype(str).tolist():
+            return False, "前日夜勤のため翌日は休み"
     except Exception:
         pass
+
+    # 職員別上限チェック
+    limit_map = limit_map or get_staff_shift_limit_map()
+    limits = limit_map.get(str(staff_name), {"day": 31, "night": 31, "total": 31})
+    if staff_df is None or staff_df.empty:
+        day_count = night_count = total_count = 0
+    else:
+        day_count = int(len(staff_df[staff_df["shift_kind"] == "日勤"]))
+        night_count = int(len(staff_df[staff_df["shift_kind"] == "夜勤"]))
+        total_count = int(len(staff_df[staff_df["shift_kind"].isin(["日勤", "夜勤"])]))
+
+    if shift_kind == "日勤" and day_count >= int(limits.get("day", 31)):
+        return False, f"日勤上限{limits.get('day', 31)}回に達しています"
+    if shift_kind == "夜勤" and night_count >= int(limits.get("night", 31)):
+        return False, f"夜勤上限{limits.get('night', 31)}回に達しています"
+    if total_count >= int(limits.get("total", 31)):
+        return False, f"合計上限{limits.get('total', 31)}回に達しています"
 
     return True, "候補"
 
@@ -3680,20 +3830,23 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind):
 def create_ai_shift_draft(df, staff_names, year, month):
     """
     ルール型AIで不足分のシフト案を作る。
-    希望休・有休・休み・夜勤明けを避け、月間勤務回数が少ない職員を優先する。
+    希望休・有休・休み・夜勤翌日休み・職員別勤務回数上限を見て下書きを作る。
     """
     last_day = calendar.monthrange(int(year), int(month))[1]
     staff_names = [s for s in staff_names if str(s).strip()]
     if not staff_names:
         return pd.DataFrame()
 
+    limit_map = get_staff_shift_limit_map()
     work_counts = {s: 0 for s in staff_names}
     night_counts = {s: 0 for s in staff_names}
+    day_counts = {s: 0 for s in staff_names}
     if df is not None and not df.empty:
         for s in staff_names:
             s_df = df[df["staff_name"].astype(str) == str(s)]
-            work_counts[s] = int(len(s_df[s_df["shift_kind"].isin(["日勤", "夜勤"])]))
+            day_counts[s] = int(len(s_df[s_df["shift_kind"] == "日勤"]))
             night_counts[s] = int(len(s_df[s_df["shift_kind"] == "夜勤"]))
+            work_counts[s] = int(len(s_df[s_df["shift_kind"].isin(["日勤", "夜勤"])]))
 
     rows = []
     working_df = df.copy() if df is not None else pd.DataFrame()
@@ -3707,45 +3860,47 @@ def create_ai_shift_draft(df, staff_names, year, month):
         for need_kind in need_list:
             candidates = []
             for s in staff_names:
-                ok, why = staff_available_for_kind(working_df, s, target_date, need_kind)
+                ok, why = staff_available_for_kind(working_df, s, target_date, need_kind, limit_map=limit_map)
                 if not ok:
                     continue
-                # 連勤が伸びすぎる人は下げる
-                pseudo = working_df.copy()
                 score = 100 - work_counts.get(s, 0) * 3
+                if need_kind == "日勤":
+                    score -= day_counts.get(s, 0) * 2
                 if need_kind == "夜勤":
-                    score -= night_counts.get(s, 0) * 4
+                    score -= night_counts.get(s, 0) * 5
+
                 try:
-                    # 前後の連勤を簡易確認
                     consecutive_before = 0
                     for back in range(1, 6):
                         prev_date = (pd.to_datetime(target_date).date() - timedelta(days=back)).strftime("%Y-%m-%d")
-                        p_df = pseudo[(pseudo["staff_name"].astype(str) == s) & (pseudo["shift_date"].astype(str) == prev_date)] if not pseudo.empty else pd.DataFrame()
+                        p_df = working_df[(working_df["staff_name"].astype(str) == s) & (working_df["shift_date"].astype(str) == prev_date)] if not working_df.empty else pd.DataFrame()
                         if not p_df.empty and any(k in p_df["shift_kind"].astype(str).tolist() for k in ["日勤", "夜勤"]):
                             consecutive_before += 1
                         else:
                             break
                     if consecutive_before >= 4:
-                        score -= 50
+                        score -= 60
                 except Exception:
                     pass
+
                 candidates.append((score, s))
             if not candidates:
                 rows.append({
                     "日付": target_date,
                     "勤務": need_kind,
                     "候補職員": "",
-                    "理由": "条件に合う候補なし",
+                    "理由": "希望休・夜勤翌日休み・上限回数を考慮した結果、候補なし",
                     "保存対象": False,
                 })
                 continue
+
             candidates.sort(reverse=True)
             selected = candidates[0][1]
             rows.append({
                 "日付": target_date,
                 "勤務": need_kind,
                 "候補職員": selected,
-                "理由": "希望休・夜勤明け・勤務偏りを避けて候補化",
+                "理由": "希望休・夜勤翌日休み・勤務上限・勤務偏りを見て候補化",
                 "保存対象": True,
             })
             stime, etime, nd = default_shift_times(need_kind)
@@ -3762,10 +3917,77 @@ def create_ai_shift_draft(df, staff_names, year, month):
             }])
             working_df = pd.concat([working_df, add_row], ignore_index=True)
             work_counts[selected] = work_counts.get(selected, 0) + 1
+            if need_kind == "日勤":
+                day_counts[selected] = day_counts.get(selected, 0) + 1
             if need_kind == "夜勤":
                 night_counts[selected] = night_counts.get(selected, 0) + 1
 
+                # 夜勤の翌日は休みを自動で入れる
+                try:
+                    next_date_obj = pd.to_datetime(target_date).date() + timedelta(days=1)
+                    if next_date_obj.month == int(month):
+                        next_date = next_date_obj.strftime("%Y-%m-%d")
+                        next_df = working_df[
+                            (working_df["staff_name"].astype(str) == selected) &
+                            (working_df["shift_date"].astype(str) == next_date)
+                        ] if not working_df.empty else pd.DataFrame()
+                        next_kinds = next_df["shift_kind"].astype(str).tolist() if not next_df.empty else []
+                        if not any(k in next_kinds for k in ["休み", "有休", "希望休", "日勤", "夜勤"]):
+                            rows.append({
+                                "日付": next_date,
+                                "勤務": "休み",
+                                "候補職員": selected,
+                                "理由": "夜勤翌日の休みを自動付与",
+                                "保存対象": True,
+                            })
+                            rest_row = pd.DataFrame([{
+                                "shift_date": next_date,
+                                "staff_name": selected,
+                                "shift_kind": "休み",
+                                "start_time": "",
+                                "end_time": "",
+                                "next_day": 0,
+                                "memo": "夜勤翌日の休み自動付与",
+                                "created_at": now_text(),
+                                "updated_at": now_text(),
+                            }])
+                            working_df = pd.concat([working_df, rest_row], ignore_index=True)
+                except Exception:
+                    pass
+
     return pd.DataFrame(rows)
+
+
+def apply_ai_shift_draft_to_df(base_df, draft_df):
+    """AIシフト案をDB保存前に画面上で仮反映したDataFrameを作る。"""
+    work = base_df.copy() if base_df is not None else pd.DataFrame()
+    rows = []
+    if draft_df is None or draft_df.empty:
+        return work
+    for _, r in draft_df.iterrows():
+        if not bool(r.get("保存対象", False)):
+            continue
+        staff_name = str(r.get("候補職員", "")).strip()
+        shift_kind = str(r.get("勤務", "")).strip()
+        shift_date = str(r.get("日付", "")).strip()
+        if not staff_name or not shift_kind or not shift_date:
+            continue
+        stime, etime, nd = default_shift_times(shift_kind)
+        rows.append({
+            "id": -1,
+            "shift_date": shift_date,
+            "staff_name": staff_name,
+            "shift_kind": shift_kind,
+            "start_time": stime,
+            "end_time": etime,
+            "next_day": nd,
+            "memo": "AIシフト案（未保存）",
+            "created_at": now_text(),
+            "updated_at": now_text(),
+        })
+    if rows:
+        work = pd.concat([work, pd.DataFrame(rows)], ignore_index=True)
+    return work
 
 
 def save_ai_shift_draft_rows(draft_df):
@@ -3802,6 +4024,7 @@ def make_staff_shift_pdf(year, month):
     matrix = create_shift_matrix(df, int(year), int(month))
     shortage = create_shift_shortage_table(df, int(year), int(month))
     checks = create_shift_quality_check_table(df, int(year), int(month))
+    limit_checks = create_shift_limit_check_table(matrix)
     status = get_shift_month_status(int(year), int(month))
 
     buffer = BytesIO()
@@ -3879,6 +4102,10 @@ def make_staff_shift_pdf(year, month):
     if checks is not None and not checks.empty:
         c.setFillColor(colors.HexColor("#8a2d18"))
         c.drawString(margin, y, "確認事項: " + " / ".join([f"{r['日付']} {r['職員名']} {r['種類']}" for _, r in checks.head(6).iterrows()]))
+        y -= 10
+    if limit_checks is not None and not limit_checks.empty:
+        c.setFillColor(colors.HexColor("#8a2d18"))
+        c.drawString(margin, y, "上限確認: " + " / ".join([f"{r['職員名']} {r['種類']}" for _, r in limit_checks.head(6).iterrows()]))
     c.setFillColor(colors.black)
 
     c.save()
@@ -4018,8 +4245,33 @@ def page_shift_manager():
                 st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
                 st.rerun()
 
-    st.markdown("### 3. AIシフト案作成")
-    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤明け・勤務回数の偏りを避けて下書きを作ります。")
+    st.markdown("### 3. 職員別勤務回数上限")
+    st.caption("職員ごとに、この月に入れる日勤・夜勤・合計勤務の上限を設定できます。AIシフト案はこの上限を見て候補を出します。")
+    limits_df = get_staff_shift_limits()
+    if limits_df.empty:
+        st.info("職員マスタに職員が登録されていません。")
+    else:
+        edited_limits = st.data_editor(
+            limits_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium"),
+                "日勤上限": st.column_config.NumberColumn("日勤上限", min_value=0, max_value=31, step=1),
+                "夜勤上限": st.column_config.NumberColumn("夜勤上限", min_value=0, max_value=31, step=1),
+                "合計上限": st.column_config.NumberColumn("合計上限", min_value=0, max_value=31, step=1),
+                "メモ": st.column_config.TextColumn("メモ", width="medium"),
+            },
+            key=f"shift_limit_editor_{int(shift_year)}_{int(shift_month)}",
+        )
+        if st.button("職員別勤務回数上限を保存", use_container_width=True):
+            saved = save_staff_shift_limits_from_editor(edited_limits)
+            st.success(f"職員別勤務回数上限を保存しました。登録件数：{saved}件")
+            st.rerun()
+
+    st.markdown("### 4. AIシフト案作成")
+    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日休み・職員別上限を見て下書きを作ります。保存前に仮シフト表で確認できます。")
     if st.button("不足分のAIシフト案を作成", use_container_width=True):
         st.session_state["ai_shift_draft"] = create_ai_shift_draft(
             shift_df,
@@ -4030,16 +4282,54 @@ def page_shift_manager():
 
     draft = st.session_state.get("ai_shift_draft")
     if isinstance(draft, pd.DataFrame) and not draft.empty:
+        st.markdown("#### AIシフト案一覧（まだ保存されていません）")
         st.dataframe(draft, use_container_width=True, hide_index=True)
-        if st.button("AIシフト案を保存する", use_container_width=True):
-            saved = save_ai_shift_draft_rows(draft)
-            st.success(f"AIシフト案を {saved} 件保存しました。")
-            st.session_state.pop("ai_shift_draft", None)
-            st.rerun()
+
+        preview_shift_df = apply_ai_shift_draft_to_df(shift_df, draft)
+        st.markdown("#### AI案を反映した仮シフト表")
+        st.caption("ここで内容を確認してから、下の保存ボタンでDBに反映します。")
+        preview_matrix = create_shift_matrix(preview_shift_df, int(shift_year), int(shift_month))
+        st.dataframe(preview_matrix, use_container_width=True, hide_index=True)
+
+        preview_shortage = create_shift_shortage_table(preview_shift_df, int(shift_year), int(shift_month))
+        preview_checks = create_shift_quality_check_table(preview_shift_df, int(shift_year), int(shift_month))
+        preview_limit_checks = create_shift_limit_check_table(preview_matrix)
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            st.metric("仮不足日", len(preview_shortage[preview_shortage["状態"] != "OK"]))
+        with p2:
+            st.metric("仮確認事項", 0 if preview_checks.empty else len(preview_checks))
+        with p3:
+            st.metric("仮上限超過", 0 if preview_limit_checks.empty else len(preview_limit_checks))
+
+        if not preview_shortage[preview_shortage["状態"] != "OK"].empty:
+            st.warning("AI案反映後も人員不足の日があります。")
+            st.dataframe(preview_shortage[preview_shortage["状態"] != "OK"], use_container_width=True, hide_index=True)
+        if not preview_checks.empty:
+            st.warning("AI案反映後の確認事項があります。")
+            st.dataframe(preview_checks, use_container_width=True, hide_index=True)
+        if not preview_limit_checks.empty:
+            st.warning("AI案反映後、職員別上限を超えている箇所があります。")
+            st.dataframe(preview_limit_checks, use_container_width=True, hide_index=True)
+
+        c_save, c_clear = st.columns(2)
+        with c_save:
+            if st.button("確認したAIシフト案を保存する", use_container_width=True):
+                saved = save_ai_shift_draft_rows(draft)
+                st.success(f"AIシフト案を {saved} 件保存しました。")
+                st.session_state.pop("ai_shift_draft", None)
+                st.rerun()
+        with c_clear:
+            if st.button("AIシフト案を破棄する", use_container_width=True):
+                st.session_state.pop("ai_shift_draft", None)
+                st.warning("AIシフト案を破棄しました。")
+                st.rerun()
 
     st.markdown("---")
-    st.markdown("### 4. シフトチェック・集計")
+    st.markdown("### 5. シフトチェック・集計")
 
+    limit_checks = create_shift_limit_check_table(matrix)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         ng = shortage[shortage["状態"] != "OK"]
@@ -4048,7 +4338,7 @@ def page_shift_manager():
         high_checks = checks[checks["重要度"] == "高"] if checks is not None and not checks.empty else pd.DataFrame()
         st.metric("高重要度確認", len(high_checks))
     with c3:
-        st.metric("登録職員数", len(get_active_staff()))
+        st.metric("上限超過", 0 if limit_checks.empty else len(limit_checks))
     with c4:
         st.metric("状態", "確定" if month_status.get("is_confirmed") else "作成中")
 
@@ -4065,12 +4355,18 @@ def page_shift_manager():
         st.dataframe(ng, use_container_width=True, hide_index=True)
 
     if checks is None or checks.empty:
-        st.success("夜勤明け日勤・5連勤以上・希望休重複などの大きな確認事項はありません。")
+        st.success("夜勤翌日勤務・5連勤以上・希望休重複などの大きな確認事項はありません。")
     else:
         st.warning("シフト確認事項があります。赤・黄色相当のチェックとして確認してください。")
         st.dataframe(checks, use_container_width=True, hide_index=True)
 
-    st.markdown("### 5. 確定・PDF出力")
+    if limit_checks.empty:
+        st.success("職員別の日勤・夜勤・合計勤務回数の上限内です。")
+    else:
+        st.warning("職員別の勤務回数上限を超えている箇所があります。")
+        st.dataframe(limit_checks, use_container_width=True, hide_index=True)
+
+    st.markdown("### 6. 確定・PDF出力")
     c1, c2, c3 = st.columns(3)
     with c1:
         if not month_status.get("is_confirmed"):
@@ -4103,7 +4399,7 @@ def page_shift_manager():
         st.caption("確定前は作成中、確定後は掲示・印刷用としてPDF保存する運用を想定しています。")
 
     st.markdown("---")
-    st.markdown("### 6. 過去シフト検索・更新・削除")
+    st.markdown("### 7. 過去シフト検索・更新・削除")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -4158,7 +4454,7 @@ def page_shift_manager():
             st.rerun()
 
     st.markdown("---")
-    st.markdown("### 7. カレンダー予定へのAI担当割当")
+    st.markdown("### 8. カレンダー予定へのAI担当割当")
 
     month_start = f"{int(shift_year)}-{int(shift_month):02d}-01"
     month_end = f"{int(shift_year)}-{int(shift_month):02d}-{calendar.monthrange(int(shift_year), int(shift_month))[1]:02d}"
@@ -4490,7 +4786,7 @@ def main():
     init_db_once()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.4.2 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.4.3 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
