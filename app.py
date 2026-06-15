@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.4.3
+ひだまり帳 Ver1.4.4
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.4.3 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.4.4 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -3280,6 +3280,25 @@ def create_shift_limit_check_table(matrix, limit_map=None):
 
 
 
+
+def clear_month_staff_shifts(year, month):
+    """
+    指定月のシフトを全削除する。
+    職員別勤務回数上限は残し、月間シフト表だけを空にして再入力できるようにする。
+    """
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    start = f"{int(year)}-{int(month):02d}-01"
+    end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
+    execute("DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ?", (start, end))
+    set_shift_month_status(int(year), int(month), False, current_login_user_for_shift())
+    try:
+        st.session_state.pop("ai_shift_draft", None)
+        st.session_state["shift_editor_reset_counter"] = int(st.session_state.get("shift_editor_reset_counter", 0) or 0) + 1
+    except Exception:
+        pass
+    return True
+
+
 def shift_month_is_confirmed(year, month):
     return bool(get_shift_month_status(year, month).get("is_confirmed"))
 
@@ -4216,6 +4235,17 @@ def page_shift_manager():
     else:
         st.caption("各セルをクリックして、プルダウンから「日」「夜」「明」「休」「希」「有」を直接入力できます。空欄にすると削除扱いになります。")
 
+        with st.expander("月間シフトを全部クリアして再入力する"):
+            st.warning("この操作を行うと、表示中の月のシフト入力内容（日勤・夜勤・休み・希望休・有休など）をすべて削除します。職員別勤務回数上限は残ります。")
+            clear_confirm = st.checkbox(
+                f"{int(shift_year)}年{int(shift_month)}月のシフトを全クリアすることを確認しました",
+                key=f"clear_month_shift_confirm_{int(shift_year)}_{int(shift_month)}",
+            )
+            if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm):
+                clear_month_staff_shifts(int(shift_year), int(shift_month))
+                st.success("この月のシフトを全クリアしました。空の月間表から再入力できます。")
+                st.rerun()
+
         last_day_for_editor = calendar.monthrange(int(shift_year), int(shift_month))[1]
         column_config = {
             "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium")
@@ -4234,7 +4264,7 @@ def page_shift_manager():
             hide_index=True,
             num_rows="fixed",
             column_config=column_config,
-            key=f"shift_matrix_editor_{int(shift_year)}_{int(shift_month)}",
+            key=f"shift_matrix_editor_{int(shift_year)}_{int(shift_month)}_{st.session_state.get('shift_editor_reset_counter', 0)}",
         )
 
         if month_status.get("is_confirmed"):
@@ -4786,7 +4816,7 @@ def main():
     init_db_once()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.4.3 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.4.4 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
