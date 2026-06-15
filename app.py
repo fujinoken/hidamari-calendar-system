@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.4.6
+ひだまり帳 Ver1.4.7
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.4.6 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -4159,6 +4159,31 @@ def make_staff_shift_pdf(year, month):
     day_w = (width - margin * 2 - staff_w - summary_w * 7) / last_day
     row_h = 15
 
+    def draw_shift_table_vertical_lines(y0, y1):
+        """日付ごとの縦罫線を細く引く。"""
+        old_stroke = getattr(c, "_strokeColorObj", colors.black)
+        old_width = getattr(c, "_lineWidth", 1)
+        c.setStrokeColor(colors.HexColor("#b8b8b8"))
+        c.setLineWidth(0.25)
+
+        # 氏名欄と日付欄の境界
+        x_line = table_x + staff_w
+        c.line(x_line, y0, x_line, y1)
+
+        # 日付欄の縦罫線
+        for d in range(1, last_day + 1):
+            x_line = table_x + staff_w + day_w * d
+            c.line(x_line, y0, x_line, y1)
+
+        # 集計欄の縦罫線
+        summary_start = table_x + staff_w + day_w * last_day
+        for i in range(1, 7):
+            x_line = summary_start + summary_w * i
+            c.line(x_line, y0, x_line, y1)
+
+        c.setStrokeColor(old_stroke)
+        c.setLineWidth(old_width)
+
     # 凡例
     c.setFont(PDF_FONT_GOTHIC, 7)
     c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　※休みは日別セルには表示しません")
@@ -4166,6 +4191,7 @@ def make_staff_shift_pdf(year, month):
     # ヘッダ
     c.setFillColor(colors.HexColor("#f3eee6"))
     c.rect(table_x, table_y_top - row_h, width - margin * 2, row_h, fill=1, stroke=1)
+    draw_shift_table_vertical_lines(table_y_top - row_h, table_y_top)
     c.setFillColor(colors.black)
     c.setFont(PDF_FONT_GOTHIC, 6.2)
     c.drawString(table_x + 3, table_y_top - 10, "氏名")
@@ -4191,6 +4217,7 @@ def make_staff_shift_pdf(year, month):
             y -= row_h
             c.setFillColor(colors.white)
             c.rect(table_x, y, width - margin * 2, row_h, fill=1, stroke=1)
+            draw_shift_table_vertical_lines(y, y + row_h)
             c.setFillColor(colors.black)
             c.drawString(table_x + 3, y + 4, str(row["職員名"])[:8])
             x = table_x + staff_w
@@ -4914,7 +4941,7 @@ def main():
     init_db_once()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.4.6 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.4.7 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
