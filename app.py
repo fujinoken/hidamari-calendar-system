@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.8
+ひだまり帳 Ver1.3.9
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.8 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.9 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -223,6 +223,16 @@ def init_db():
                 ON CONFLICT (category_name) DO NOTHING
             """, (name, default_marks.get(name, "・"), i * 10, now_text(), now_text()))
 
+    # よく使う検索用インデックス。既存DBにも安全に追加できる。
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event_date ON events(event_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date, start_time)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_user_name ON events(user_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_event_photos_event_id ON event_photos(event_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_event_files_event_id ON event_files(event_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_categories_active_sort ON categories(is_active, sort_order)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_active_name ON users(is_active, user_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_active_name ON staff(is_active, staff_name)")
+
     conn.commit()
     cur.close()
     conn.close()
@@ -242,13 +252,41 @@ def today_jst():
     return datetime.now(JST).date()
 
 
-def fetch_df(query, params=()):
+def normalize_query_params(params=()):
+    """cache用にSQLパラメータをtupleへ正規化する。"""
+    if params is None:
+        return ()
+    if isinstance(params, tuple):
+        return params
+    if isinstance(params, list):
+        return tuple(params)
+    return (params,)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _fetch_df_cached(query, params_tuple=()):
+    """
+    読み取りSQLを短時間キャッシュする。
+    予定表示・マスタ取得・件数確認の体感速度を上げる。
+    """
     conn = get_conn()
     try:
-        df = pd.read_sql_query(to_pg_query(query), conn, params=params)
+        df = pd.read_sql_query(to_pg_query(query), conn, params=params_tuple)
     finally:
         conn.close()
     return df
+
+
+def fetch_df(query, params=()):
+    return _fetch_df_cached(str(query), normalize_query_params(params))
+
+
+def clear_read_cache():
+    """DB更新後に読み取りキャッシュをクリアする。"""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 
 def execute(query, params=()):
@@ -267,12 +305,13 @@ def execute(query, params=()):
         q_exec = q_no_semicolon
 
     try:
-        cur.execute(q_exec, params)
+        cur.execute(q_exec, normalize_query_params(params))
         last_id = None
         if is_insert:
             row = cur.fetchone()
             last_id = row[0] if row else None
         conn.commit()
+        clear_read_cache()
         return last_id
     except Exception:
         conn.rollback()
@@ -280,6 +319,17 @@ def execute(query, params=()):
     finally:
         cur.close()
         conn.close()
+
+
+def init_db_once():
+    """
+    init_dbはALTER TABLEや初期投入を含むため、毎回実行せずセッション内で1回だけ実行する。
+    これだけで画面切替・再描画が1テンポ軽くなる。
+    """
+    if not st.session_state.get("_hidamari_db_initialized", False):
+        init_db()
+        st.session_state["_hidamari_db_initialized"] = True
+        clear_read_cache()
 
 
 
@@ -464,10 +514,11 @@ def delete_storage_object(file_path):
         return False
 
 
-def read_saved_file_bytes(file_path):
+@st.cache_data(ttl=300, show_spinner=False)
+def _read_saved_file_bytes_cached(file_path):
     """
     Storage保存・旧ローカル保存の両方に対応してファイル本体を読む。
-    第1段階では、新規ファイルはStorage、過去ファイルは旧ローカル互換。
+    画像や添付の再表示を速くするため、短時間キャッシュする。
     """
     if is_storage_file(file_path):
         return download_bytes_from_storage(file_path)
@@ -477,6 +528,10 @@ def read_saved_file_bytes(file_path):
         with open(local_path, "rb") as f:
             return f.read()
     return None
+
+
+def read_saved_file_bytes(file_path):
+    return _read_saved_file_bytes_cached(str(file_path or ""))
 
 
 def render_saved_image(file_path, caption=None, use_container_width=True):
@@ -652,6 +707,7 @@ def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
     return saved_count, failed_count
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_event_photos(event_id):
     return fetch_df(
         "SELECT * FROM event_photos WHERE event_id=? ORDER BY id",
@@ -706,6 +762,7 @@ def save_uploaded_files(event_id, uploaded_files, file_memo=""):
     return saved_count, failed_count
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_event_files(event_id):
     return fetch_df(
         "SELECT * FROM event_files WHERE event_id=? ORDER BY id",
@@ -713,6 +770,7 @@ def get_event_files(event_id):
     )
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_active_users():
     return fetch_df("SELECT user_id, user_name FROM users WHERE is_active=1 ORDER BY user_name")
 
@@ -727,6 +785,7 @@ def user_display_map():
     return mapping
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_active_staff():
     df = fetch_df("SELECT staff_name FROM staff WHERE is_active=1 ORDER BY staff_name")
     return df["staff_name"].tolist() if not df.empty else []
@@ -749,6 +808,7 @@ CATEGORY_MARK = {
 }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_categories(active_only=True):
     where = "WHERE is_active=1" if active_only else ""
     df = fetch_df(f"""
@@ -762,16 +822,27 @@ def get_categories(active_only=True):
     return df["category_name"].tolist()
 
 
-def get_category_mark(category_name):
-    df = fetch_df(
-        "SELECT mark FROM categories WHERE category_name=? LIMIT 1",
-        (category_name,)
-    )
+@st.cache_data(ttl=60, show_spinner=False)
+def get_category_mark_map():
+    df = fetch_df("""
+        SELECT category_name, mark
+        FROM categories
+        WHERE is_active=1
+    """)
+    mapping = {}
     if not df.empty:
-        mark = str(df.iloc[0]["mark"] or "").strip()
-        if mark:
-            return mark
-    return CATEGORY_MARK.get(category_name, "・")
+        for _, r in df.iterrows():
+            name = str(r["category_name"] or "").strip()
+            mark = str(r["mark"] or "").strip()
+            if name and mark:
+                mapping[name] = mark
+    return mapping
+
+
+def get_category_mark(category_name):
+    mark_map = get_category_mark_map()
+    category_name = str(category_name or "").strip()
+    return mark_map.get(category_name, CATEGORY_MARK.get(category_name, "・"))
 
 
 def add_css():
@@ -926,6 +997,7 @@ def add_css():
     """, unsafe_allow_html=True)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def monthly_events(year, month):
     start = f"{year}-{month:02d}-01"
     last_day = calendar.monthrange(year, month)[1]
@@ -944,6 +1016,7 @@ def monthly_events(year, month):
 
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def events_by_date(target_date):
     """指定日の予定一覧を取得する。"""
     if hasattr(target_date, "strftime"):
@@ -995,6 +1068,7 @@ def first_line_text(text, max_len=42):
     return first
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_attachment_counts(event_id):
     """写真・添付ファイル数を取得する。"""
     photos = fetch_df("SELECT COUNT(*) AS cnt FROM event_photos WHERE event_id=?", (int(event_id),))
@@ -1075,6 +1149,7 @@ def set_selected_event(event_id):
     st.session_state["selected_calendar_event_id"] = int(event_id)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_event_by_id(event_id):
     if not event_id:
         return pd.DataFrame()
@@ -3206,10 +3281,10 @@ def page_export():
 
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="wide")
-    init_db()
+    init_db_once()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.8 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.9 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
