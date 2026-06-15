@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.4
+ひだまり帳 Ver1.3.5
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.4 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.5 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -307,9 +307,18 @@ def get_secret_or_env(*keys, default=None):
 
 
 def get_supabase_url():
-    """Supabase Project URLを取得する。"""
+    """
+    Supabase Project URLを取得する。
+    /rest/v1 や /storage/v1 まで入れてしまった場合も、プロジェクトURLへ補正する。
+    """
     url = get_secret_or_env("SUPABASE_URL", "SUPABASE_PROJECT_URL", default="")
-    return url.rstrip("/") if url else ""
+    if not url:
+        return ""
+    url = str(url).strip().rstrip("/")
+    for suffix in ["/rest/v1", "/storage/v1", "/storage/v1/object"]:
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url.rstrip("/")
 
 
 def get_supabase_storage_key():
@@ -382,11 +391,16 @@ def is_storage_file(file_path):
     return str(file_path or "").strip().startswith(STORAGE_PATH_PREFIX)
 
 
-def storage_url_for_object(bucket, object_path):
+def storage_url_for_object(bucket, object_path, authenticated=False):
+    """
+    Supabase Storage REST URLを作る。
+    upload/delete は /object、非公開ファイルの取得は /object/authenticated を使う。
+    """
     base_url = get_supabase_url()
     quoted_bucket = urllib.parse.quote(str(bucket), safe="")
     quoted_path = urllib.parse.quote(str(object_path), safe="/")
-    return f"{base_url}/storage/v1/object/{quoted_bucket}/{quoted_path}"
+    prefix = "object/authenticated" if authenticated else "object"
+    return f"{base_url}/storage/v1/{prefix}/{quoted_bucket}/{quoted_path}"
 
 
 def storage_headers(content_type=None, upsert=False):
@@ -424,7 +438,7 @@ def download_bytes_from_storage(file_path):
     bucket, object_path = parse_storage_db_path(file_path)
     if not bucket or not object_path:
         raise RuntimeError("Storageパスの形式が不正です。")
-    url = storage_url_for_object(bucket, object_path)
+    url = storage_url_for_object(bucket, object_path, authenticated=True)
     response = requests.get(url, headers=storage_headers(), timeout=90)
     if response.status_code >= 400:
         raise RuntimeError(f"Supabase Storageからの取得に失敗しました: {response.status_code} {response.text[:300]}")
@@ -516,9 +530,19 @@ def delete_saved_file(file_path):
 
 
 def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
-    """アップロード写真をSupabase Storageへ保存し、DBへ紐づける。"""
+    """
+    アップロード写真をSupabase Storageへ保存し、DBへ紐づける。
+    戻り値: (保存成功数, 失敗数)
+    """
     if not uploaded_files:
-        return
+        return 0, 0
+
+    saved_count = 0
+    failed_count = 0
+
+    if not storage_is_configured():
+        st.error("Supabase Storage設定が未完了のため、写真メモは保存されませんでした。")
+        return 0, len(uploaded_files)
 
     for uploaded in uploaded_files:
         try:
@@ -530,7 +554,7 @@ def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
                 guess_content_type(uploaded.name),
             )
 
-            execute("""
+            photo_id = execute("""
                 INSERT INTO event_photos
                 (event_id, file_name, file_path, photo_memo, created_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -541,8 +565,13 @@ def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
                 photo_memo.strip() or None,
                 now_text(),
             ))
+            if photo_id:
+                saved_count += 1
         except Exception as e:
+            failed_count += 1
             st.error(f"写真メモのStorage保存に失敗しました：{uploaded.name}｜{e}")
+
+    return saved_count, failed_count
 
 
 def get_event_photos(event_id):
@@ -553,9 +582,19 @@ def get_event_photos(event_id):
 
 
 def save_uploaded_files(event_id, uploaded_files, file_memo=""):
-    """Excel等の添付ファイルをSupabase Storageへ保存し、DBへ紐づける。"""
+    """
+    Excel等の添付ファイルをSupabase Storageへ保存し、DBへ紐づける。
+    戻り値: (保存成功数, 失敗数)
+    """
     if not uploaded_files:
-        return
+        return 0, 0
+
+    saved_count = 0
+    failed_count = 0
+
+    if not storage_is_configured():
+        st.error("Supabase Storage設定が未完了のため、Excel・書類ファイルは保存されませんでした。")
+        return 0, len(uploaded_files)
 
     for uploaded in uploaded_files:
         try:
@@ -568,7 +607,7 @@ def save_uploaded_files(event_id, uploaded_files, file_memo=""):
                 guess_content_type(uploaded.name),
             )
 
-            execute("""
+            file_id = execute("""
                 INSERT INTO event_files
                 (event_id, file_name, file_path, file_type, file_memo, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -580,8 +619,13 @@ def save_uploaded_files(event_id, uploaded_files, file_memo=""):
                 file_memo.strip() or None,
                 now_text(),
             ))
+            if file_id:
+                saved_count += 1
         except Exception as e:
+            failed_count += 1
             st.error(f"Excel・書類ファイルのStorage保存に失敗しました：{uploaded.name}｜{e}")
+
+    return saved_count, failed_count
 
 
 def get_event_files(event_id):
@@ -1138,7 +1182,7 @@ def page_today():
 def page_event_register():
     st.subheader("予定登録")
     if storage_is_configured():
-        st.caption("写真・添付ファイルは新規登録分からSupabase Storageへ保存されます。")
+        st.caption(f"写真・添付ファイルは新規登録分からSupabase Storageへ保存されます。Storage: {get_supabase_storage_bucket()} / URL: {get_supabase_url()}")
     else:
         st.warning("Supabase Storage設定が未完了です。写真・添付ファイルを保存するには SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / SUPABASE_STORAGE_BUCKET を設定してください。")
 
@@ -1204,9 +1248,25 @@ def page_event_register():
             now_text(),
             now_text(),
         ))
-        save_uploaded_photos(event_id, uploaded_photos, photo_memo)
-        save_uploaded_files(event_id, uploaded_files, file_memo)
-        st.success("予定を保存しました。写真メモ・Excelファイルも紐づけました。")
+        photo_saved, photo_failed = save_uploaded_photos(event_id, uploaded_photos, photo_memo)
+        file_saved, file_failed = save_uploaded_files(event_id, uploaded_files, file_memo)
+
+        st.session_state["selected_calendar_event_id"] = int(event_id)
+
+        messages = [f"予定を保存しました（予定ID: {event_id}）。"]
+        if uploaded_photos:
+            messages.append(f"写真メモ：{photo_saved}件保存")
+            if photo_failed:
+                messages.append(f"写真メモ：{photo_failed}件失敗")
+        if uploaded_files:
+            messages.append(f"Excel・書類：{file_saved}件保存")
+            if file_failed:
+                messages.append(f"Excel・書類：{file_failed}件失敗")
+
+        if photo_failed or file_failed:
+            st.warning(" / ".join(messages))
+        else:
+            st.success(" / ".join(messages))
 
 
 def page_event_manage():
@@ -1282,8 +1342,11 @@ def page_event_manage():
         )
         add_photo_memo = st.text_input("追加写真メモ", key=f"add_photo_memo_{selected_id}")
         if st.button("写真メモを追加", key=f"add_photo_btn_{selected_id}"):
-            save_uploaded_photos(selected_id, add_photos, add_photo_memo)
-            st.success("写真メモを追加しました。画面を再読み込みしてください。")
+            saved, failed = save_uploaded_photos(selected_id, add_photos, add_photo_memo)
+            if failed:
+                st.warning(f"写真メモ：{saved}件保存、{failed}件失敗しました。")
+            else:
+                st.success(f"写真メモを{saved}件追加しました。画面を再読み込みしてください。")
 
     st.markdown("---")
     st.write("選択中の予定のExcel・書類ファイル")
@@ -1319,8 +1382,11 @@ def page_event_manage():
         )
         add_file_memo = st.text_input("追加ファイルメモ", key=f"add_file_memo_{selected_id}")
         if st.button("Excel・書類ファイルを追加", key=f"add_file_btn_{selected_id}"):
-            save_uploaded_files(selected_id, add_files, add_file_memo)
-            st.success("Excel・書類ファイルを追加しました。画面を再読み込みしてください。")
+            saved, failed = save_uploaded_files(selected_id, add_files, add_file_memo)
+            if failed:
+                st.warning(f"Excel・書類ファイル：{saved}件保存、{failed}件失敗しました。")
+            else:
+                st.success(f"Excel・書類ファイルを{saved}件追加しました。画面を再読み込みしてください。")
 
     st.markdown("---")
     st.write("選択中の予定を編集")
@@ -1623,7 +1689,7 @@ def page_photo_notes():
     """)
 
     if df.empty:
-        st.info("写真メモはまだ登録されていません。")
+        st.info("写真メモはまだ登録されていません。写真アップロード時にStorage保存が失敗している場合、予定本体だけが保存され、写真メモは登録されません。")
         return
 
     keyword = st.text_input("写真メモ検索", placeholder="予定タイトル・利用者名・写真メモなど")
@@ -2720,7 +2786,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.4 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.5 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
