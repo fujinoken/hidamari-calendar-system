@@ -49,6 +49,7 @@ except ImportError:
 
 
 APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
+AI_SHIFT_RULE_VERSION = "shift_limit_strict_v3_zero_limit"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -3222,7 +3223,7 @@ def save_staff_shift_limits_from_editor(limits_df):
     execute("DELETE FROM staff_shift_limits")
     params = []
     for _, r in limits_df.iterrows():
-        staff_name = str(r.get("職員名", "")).strip()
+        staff_name = normalize_staff_name(r.get("職員名", ""))
         if not staff_name:
             continue
         params.append((
@@ -3332,18 +3333,53 @@ def would_exceed_staff_shift_limit(df, staff_name, target_date, shift_kind, limi
 
 
 def get_staff_shift_limit_map():
-    limits_df = get_staff_shift_limits()
+    """
+    職員別勤務回数上限をDBから直接取得し、職員名を正規化して辞書化する。
+    画面表示用の結合結果ではなく保存値そのものを見ることで、
+    日勤上限0・夜勤上限0がAI判定で31扱いになる事故を防ぐ。
+    """
     mapping = {}
-    if limits_df is not None and not limits_df.empty:
-        for _, r in limits_df.iterrows():
-            staff_name = normalize_staff_name(r["職員名"])
+    try:
+        df = fetch_df("""
+            SELECT staff_name, max_day_shifts, max_night_shifts, max_total_shifts
+            FROM staff_shift_limits
+        """)
+    except Exception:
+        df = pd.DataFrame(columns=["staff_name", "max_day_shifts", "max_night_shifts", "max_total_shifts"])
+
+    if df is not None and not df.empty:
+        for _, r in df.iterrows():
+            staff_name = normalize_staff_name(r.get("staff_name", ""))
+            if not staff_name:
+                continue
             mapping[staff_name] = {
-                "day": safe_shift_limit_value(r.get("日勤上限", 31), 31),
-                "night": safe_shift_limit_value(r.get("夜勤上限", 31), 31),
-                "total": safe_shift_limit_value(r.get("合計上限", 31), 31),
+                "day": safe_shift_limit_value(r.get("max_day_shifts", 31), 31),
+                "night": safe_shift_limit_value(r.get("max_night_shifts", 31), 31),
+                "total": safe_shift_limit_value(r.get("max_total_shifts", 31), 31),
             }
+
+    # 未設定職員だけ31回にする。設定済みの0回は絶対に上書きしない。
+    for staff_name in get_active_staff():
+        s = normalize_staff_name(staff_name)
+        if s and s not in mapping:
+            mapping[s] = {"day": 31, "night": 31, "total": 31}
+
     return mapping
 
+
+def debug_shift_limit_summary_for_ai(limit_map=None):
+    """AIが実際に参照している上限表を確認するための表示用データ。"""
+    limit_map = limit_map or get_staff_shift_limit_map()
+    rows = []
+    for staff_name in sorted(limit_map.keys()):
+        limits = normalize_shift_limits_for_staff(limit_map, staff_name)
+        rows.append({
+            "職員名": staff_name,
+            "AI参照_日勤上限": limits["day"],
+            "AI参照_夜勤上限": limits["night"],
+            "AI参照_合計上限": limits["total"],
+        })
+    return pd.DataFrame(rows)
 
 def create_shift_limit_check_table(matrix, limit_map=None):
     """月間勤務回数が職員別上限を超えていないか確認する。"""
@@ -4238,6 +4274,74 @@ def apply_ai_shift_draft_to_df(base_df, draft_df):
     return work
 
 
+
+def sanitize_ai_shift_draft_by_limits(draft_df, base_df, year, month):
+    """
+    session_stateに残った古いAI案も、現在の上限条件で再検査する。
+    上限0回の職員に日勤・夜勤が残っている場合は保存対象から外し、注意行へ変換する。
+    """
+    if draft_df is None or draft_df.empty:
+        return draft_df
+
+    working_df = base_df.copy() if base_df is not None else pd.DataFrame()
+    if working_df is None or working_df.empty:
+        working_df = pd.DataFrame(columns=["shift_date", "staff_name", "shift_kind", "start_time", "end_time", "next_day", "memo", "created_at", "updated_at"])
+    else:
+        working_df["staff_name"] = working_df["staff_name"].apply(normalize_staff_name)
+
+    limit_map = get_staff_shift_limit_map()
+    cleaned_rows = []
+
+    for _, r in draft_df.iterrows():
+        shift_date = str(r.get("日付", "")).strip()
+        shift_kind = str(r.get("勤務", "")).strip()
+        staff_name = normalize_staff_name(r.get("候補職員", ""))
+        save_target = bool(r.get("保存対象", False))
+
+        # 日勤・夜勤は現在の上限で必ず再判定
+        if save_target and shift_kind in ["日勤", "夜勤"] and staff_name:
+            ok, why = staff_available_for_kind(working_df, staff_name, shift_date, shift_kind, limit_map=limit_map)
+            if not ok:
+                cleaned_rows.append({
+                    "日付": shift_date,
+                    "勤務": "注意",
+                    "候補職員": staff_name,
+                    "理由": f"現在の上限条件で除外しました：{shift_kind} / {why}",
+                    "保存対象": False,
+                })
+                continue
+
+            cleaned_rows.append({
+                "日付": shift_date,
+                "勤務": shift_kind,
+                "候補職員": staff_name,
+                "理由": str(r.get("理由", "日勤・夜勤・合計上限内で候補化")),
+                "保存対象": True,
+            })
+            stime, etime, nd = default_shift_times(shift_kind)
+            add_row = pd.DataFrame([{
+                "shift_date": shift_date,
+                "staff_name": staff_name,
+                "shift_kind": shift_kind,
+                "start_time": stime,
+                "end_time": etime,
+                "next_day": nd,
+                "memo": "AIシフト案",
+                "created_at": now_text(),
+                "updated_at": now_text(),
+            }])
+            working_df = pd.concat([working_df, add_row], ignore_index=True)
+            continue
+
+        # 明け・休みは勤務回数に入れないが、職員名だけ正規化する
+        row_dict = dict(r)
+        if "候補職員" in row_dict:
+            row_dict["候補職員"] = staff_name
+        cleaned_rows.append(row_dict)
+
+    return pd.DataFrame(cleaned_rows, columns=["日付", "勤務", "候補職員", "理由", "保存対象"])
+
+
 def save_ai_shift_draft_rows(draft_df):
     """
     AIシフト案を保存する直前にも再検査する。
@@ -4604,7 +4708,19 @@ def page_shift_manager():
 
     st.markdown("### 4. AIシフト案作成")
     st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日の明け・明け翌日休み・職員別上限を超えない範囲で下書きを作ります。保存前に仮シフト表で確認できます。")
+
+    # AIが実際に参照している上限を表示する。0回指定が反映されているか確認できます。
+    with st.expander("AIが参照する職員別上限を確認"):
+        st.dataframe(debug_shift_limit_summary_for_ai(), use_container_width=True, hide_index=True)
+
+    # 古いAI案がブラウザ側に残っている場合は破棄する。
+    if st.session_state.get("ai_shift_rule_version") != AI_SHIFT_RULE_VERSION:
+        st.session_state.pop("ai_shift_draft", None)
+        st.session_state["ai_shift_rule_version"] = AI_SHIFT_RULE_VERSION
+
     if st.button("不足分のAIシフト案を作成", use_container_width=True):
+        st.session_state.pop("ai_shift_draft", None)
+        st.session_state["ai_shift_rule_version"] = AI_SHIFT_RULE_VERSION
         st.session_state["ai_shift_draft"] = create_ai_shift_draft(
             shift_df,
             get_active_staff(),
@@ -4614,6 +4730,8 @@ def page_shift_manager():
 
     draft = st.session_state.get("ai_shift_draft")
     if isinstance(draft, pd.DataFrame) and not draft.empty:
+        draft = sanitize_ai_shift_draft_by_limits(draft, shift_df, int(shift_year), int(shift_month))
+        st.session_state["ai_shift_draft"] = draft
         st.markdown("#### AIシフト案一覧（まだ保存されていません）")
         st.dataframe(draft, use_container_width=True, hide_index=True)
 
