@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.3
+ひだまり帳 Ver1.3.4
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -9,13 +9,15 @@ Python + Streamlit + PostgreSQL
     streamlit run app.py
 
 必要ライブラリ:
-    pip install streamlit pandas openpyxl psycopg2-binary reportlab
+    pip install streamlit pandas openpyxl psycopg2-binary reportlab requests
 """
 
 import os
 import calendar
 import re
 import hashlib
+import mimetypes
+import urllib.parse
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -23,6 +25,11 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 
 try:
@@ -41,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.3 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.4 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -277,30 +284,265 @@ def execute(query, params=()):
 
 
 
+# -----------------------------
+# Supabase Storage（第1段階：新規ファイル保存）
+# -----------------------------
+STORAGE_PATH_PREFIX = "storage://"
+
+
+def get_secret_or_env(*keys, default=None):
+    """Streamlit secrets または環境変数から設定値を取得する。"""
+    for key in keys:
+        try:
+            if key in st.secrets:
+                value = st.secrets[key]
+                if value:
+                    return str(value).strip()
+        except Exception:
+            pass
+        value = os.getenv(key)
+        if value:
+            return str(value).strip()
+    return default
+
+
+def get_supabase_url():
+    """Supabase Project URLを取得する。"""
+    url = get_secret_or_env("SUPABASE_URL", "SUPABASE_PROJECT_URL", default="")
+    return url.rstrip("/") if url else ""
+
+
+def get_supabase_storage_key():
+    """
+    Supabase Storage操作用キーを取得する。
+    非公開バケットをサーバー側から扱うため、Streamlit secretsには SERVICE_ROLE_KEY を入れる。
+    """
+    return get_secret_or_env("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_STORAGE_KEY", default="")
+
+
+def get_supabase_storage_bucket():
+    """Storageバケット名。未指定時は hidamari-calendar-files を使う。"""
+    return get_secret_or_env("SUPABASE_STORAGE_BUCKET", default="hidamari-calendar-files")
+
+
+def storage_is_configured():
+    """Supabase Storage保存に必要な設定が揃っているか確認する。"""
+    return bool(get_supabase_url() and get_supabase_storage_key() and get_supabase_storage_bucket())
+
+
+def require_storage_ready():
+    """Storage未設定やrequests未導入の場合に分かりやすいエラーを出す。"""
+    if requests is None:
+        raise RuntimeError("requests がインストールされていません。requirements.txt に requests を追加してください。")
+    if not get_supabase_url():
+        raise RuntimeError("SUPABASE_URL が未設定です。Streamlit secrets に設定してください。")
+    if not get_supabase_storage_key():
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY が未設定です。Streamlit secrets に設定してください。")
+    if not get_supabase_storage_bucket():
+        raise RuntimeError("SUPABASE_STORAGE_BUCKET が未設定です。")
+
+
+def guess_content_type(file_name):
+    content_type, _ = mimetypes.guess_type(str(file_name or ""))
+    return content_type or "application/octet-stream"
+
+
+def make_storage_object_path(event_id, original_name, kind):
+    """
+    Storage内の保存パスを作る。
+    元ファイル名はDBのfile_nameに保存し、Storage側は衝突しにくい安全な名前にする。
+    """
+    suffix = Path(str(original_name or "")).suffix.lower()
+    if not suffix:
+        suffix = ".bin"
+    timestamp = datetime.now(JST).strftime("%Y%m%d%H%M%S%f")
+    digest = hashlib.md5(f"{event_id}-{original_name}-{timestamp}".encode("utf-8")).hexdigest()[:12]
+    safe_kind = "photos" if kind == "photos" else "files"
+    return f"events/{int(event_id)}/{safe_kind}/{timestamp}_{digest}{suffix}"
+
+
+def make_storage_db_path(bucket, object_path):
+    """DBには storage://bucket/path の形式で保存する。"""
+    return f"{STORAGE_PATH_PREFIX}{bucket}/{object_path}"
+
+
+def parse_storage_db_path(file_path):
+    """storage://bucket/path を (bucket, path) に分解する。"""
+    value = str(file_path or "").strip()
+    if not value.startswith(STORAGE_PATH_PREFIX):
+        return None, None
+    rest = value[len(STORAGE_PATH_PREFIX):]
+    if "/" not in rest:
+        return None, None
+    bucket, object_path = rest.split("/", 1)
+    return bucket, object_path
+
+
+def is_storage_file(file_path):
+    return str(file_path or "").strip().startswith(STORAGE_PATH_PREFIX)
+
+
+def storage_url_for_object(bucket, object_path):
+    base_url = get_supabase_url()
+    quoted_bucket = urllib.parse.quote(str(bucket), safe="")
+    quoted_path = urllib.parse.quote(str(object_path), safe="/")
+    return f"{base_url}/storage/v1/object/{quoted_bucket}/{quoted_path}"
+
+
+def storage_headers(content_type=None, upsert=False):
+    key = get_supabase_storage_key()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if upsert:
+        headers["x-upsert"] = "true"
+    return headers
+
+
+def upload_bytes_to_storage(file_bytes, object_path, content_type):
+    """Supabase Storageへファイル本体をアップロードする。"""
+    require_storage_ready()
+    bucket = get_supabase_storage_bucket()
+    url = storage_url_for_object(bucket, object_path)
+    response = requests.post(
+        url,
+        headers=storage_headers(content_type=content_type, upsert=True),
+        data=file_bytes,
+        timeout=90,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase Storageへのアップロードに失敗しました: {response.status_code} {response.text[:300]}")
+    return make_storage_db_path(bucket, object_path)
+
+
+def download_bytes_from_storage(file_path):
+    """storage:// のDBパスからStorage上のファイル本体を取得する。"""
+    require_storage_ready()
+    bucket, object_path = parse_storage_db_path(file_path)
+    if not bucket or not object_path:
+        raise RuntimeError("Storageパスの形式が不正です。")
+    url = storage_url_for_object(bucket, object_path)
+    response = requests.get(url, headers=storage_headers(), timeout=90)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase Storageからの取得に失敗しました: {response.status_code} {response.text[:300]}")
+    return response.content
+
+
+def delete_storage_object(file_path):
+    """
+    Storage上のファイル削除。
+    環境やAPI仕様差に備え、失敗しても画面操作を止めないためFalseを返す。
+    """
+    if not is_storage_file(file_path):
+        return False
+    try:
+        require_storage_ready()
+        bucket, object_path = parse_storage_db_path(file_path)
+        if not bucket or not object_path:
+            return False
+        url = storage_url_for_object(bucket, object_path)
+        response = requests.delete(url, headers=storage_headers(), timeout=60)
+        return response.status_code < 400
+    except Exception:
+        return False
+
+
+def read_saved_file_bytes(file_path):
+    """
+    Storage保存・旧ローカル保存の両方に対応してファイル本体を読む。
+    第1段階では、新規ファイルはStorage、過去ファイルは旧ローカル互換。
+    """
+    if is_storage_file(file_path):
+        return download_bytes_from_storage(file_path)
+
+    local_path = Path(str(file_path or ""))
+    if local_path.exists():
+        with open(local_path, "rb") as f:
+            return f.read()
+    return None
+
+
+def render_saved_image(file_path, caption=None, use_container_width=True):
+    """Storage保存・旧ローカル保存の両方に対応して画像を表示する。"""
+    try:
+        data = read_saved_file_bytes(file_path)
+        if data:
+            st.image(data, caption=caption, use_container_width=use_container_width)
+            return True
+    except Exception as e:
+        st.warning(f"画像を取得できません：{e}")
+        return False
+
+    st.warning("画像ファイルが見つかりません。")
+    return False
+
+
+def render_saved_download_button(label, file_path, file_name, key):
+    """Storage保存・旧ローカル保存の両方に対応してダウンロードボタンを表示する。"""
+    try:
+        data = read_saved_file_bytes(file_path)
+        if data:
+            st.download_button(
+                label,
+                data=data,
+                file_name=file_name,
+                key=key,
+            )
+            return True
+    except Exception as e:
+        st.warning(f"ファイルを取得できません：{e}")
+        return False
+
+    st.warning("ファイルが見つかりません。")
+    return False
+
+
+def delete_saved_file(file_path):
+    """Storage保存・旧ローカル保存の両方に対応してファイル本体を削除する。"""
+    if is_storage_file(file_path):
+        return delete_storage_object(file_path)
+
+    local_path = Path(str(file_path or ""))
+    if local_path.exists():
+        try:
+            local_path.unlink()
+            return True
+        except Exception:
+            return False
+    return False
+
+
 def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
-    """アップロード写真をuploadsフォルダに保存し、DBへ紐づける。"""
+    """アップロード写真をSupabase Storageへ保存し、DBへ紐づける。"""
     if not uploaded_files:
         return
 
     for uploaded in uploaded_files:
-        suffix = Path(uploaded.name).suffix.lower()
-        safe_name = f"event_{event_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{suffix}"
-        save_path = UPLOAD_DIR / safe_name
+        try:
+            object_path = make_storage_object_path(event_id, uploaded.name, kind="photos")
+            file_bytes = bytes(uploaded.getbuffer())
+            storage_path = upload_bytes_to_storage(
+                file_bytes,
+                object_path,
+                guess_content_type(uploaded.name),
+            )
 
-        with open(save_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        execute("""
-            INSERT INTO event_photos
-            (event_id, file_name, file_path, photo_memo, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            int(event_id),
-            uploaded.name,
-            str(save_path),
-            photo_memo.strip() or None,
-            now_text(),
-        ))
+            execute("""
+                INSERT INTO event_photos
+                (event_id, file_name, file_path, photo_memo, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                int(event_id),
+                uploaded.name,
+                storage_path,
+                photo_memo.strip() or None,
+                now_text(),
+            ))
+        except Exception as e:
+            st.error(f"写真メモのStorage保存に失敗しました：{uploaded.name}｜{e}")
 
 
 def get_event_photos(event_id):
@@ -311,30 +553,35 @@ def get_event_photos(event_id):
 
 
 def save_uploaded_files(event_id, uploaded_files, file_memo=""):
-    """Excel等の添付ファイルをattached_filesフォルダに保存し、DBへ紐づける。"""
+    """Excel等の添付ファイルをSupabase Storageへ保存し、DBへ紐づける。"""
     if not uploaded_files:
         return
 
     for uploaded in uploaded_files:
-        suffix = Path(uploaded.name).suffix.lower()
-        safe_name = f"event_{event_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{suffix}"
-        save_path = FILE_DIR / safe_name
+        try:
+            suffix = Path(uploaded.name).suffix.lower()
+            object_path = make_storage_object_path(event_id, uploaded.name, kind="files")
+            file_bytes = bytes(uploaded.getbuffer())
+            storage_path = upload_bytes_to_storage(
+                file_bytes,
+                object_path,
+                guess_content_type(uploaded.name),
+            )
 
-        with open(save_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        execute("""
-            INSERT INTO event_files
-            (event_id, file_name, file_path, file_type, file_memo, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            int(event_id),
-            uploaded.name,
-            str(save_path),
-            suffix.replace(".", ""),
-            file_memo.strip() or None,
-            now_text(),
-        ))
+            execute("""
+                INSERT INTO event_files
+                (event_id, file_name, file_path, file_type, file_memo, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                int(event_id),
+                uploaded.name,
+                storage_path,
+                suffix.replace(".", ""),
+                file_memo.strip() or None,
+                now_text(),
+            ))
+        except Exception as e:
+            st.error(f"Excel・書類ファイルのStorage保存に失敗しました：{uploaded.name}｜{e}")
 
 
 def get_event_files(event_id):
@@ -342,6 +589,7 @@ def get_event_files(event_id):
         "SELECT * FROM event_files WHERE event_id=? ORDER BY id",
         (int(event_id),)
     )
+
 
 def get_active_users():
     return fetch_df("SELECT user_id, user_name FROM users WHERE is_active=1 ORDER BY user_name")
@@ -748,28 +996,23 @@ def render_event_detail_panel():
         cols = st.columns(3)
         for i, (_, p) in enumerate(photos.iterrows()):
             with cols[i % 3]:
-                img_path = Path(p["file_path"])
-                if img_path.exists():
-                    st.image(str(img_path), caption=p["photo_memo"] or p["file_name"], use_container_width=True)
-                else:
-                    st.warning(f"画像が見つかりません：{p['file_name']}")
+                render_saved_image(
+                    p["file_path"],
+                    caption=p["photo_memo"] or p["file_name"],
+                    use_container_width=True,
+                )
 
     files = get_event_files(event_id)
     if not files.empty:
         st.write("**Excel・書類ファイル**")
         for _, frow in files.iterrows():
-            f_path = Path(frow["file_path"])
             st.write(f"📎 {frow['file_name']}　{frow['file_memo'] or ''}")
-            if f_path.exists():
-                with open(f_path, "rb") as f:
-                    st.download_button(
-                        "ダウンロード",
-                        data=f,
-                        file_name=frow["file_name"],
-                        key=f"detail_download_{frow['id']}"
-                    )
-            else:
-                st.warning("ファイルが見つかりません。")
+            render_saved_download_button(
+                "ダウンロード",
+                frow["file_path"],
+                frow["file_name"],
+                key=f"detail_download_{frow['id']}",
+            )
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -894,6 +1137,10 @@ def page_today():
 
 def page_event_register():
     st.subheader("予定登録")
+    if storage_is_configured():
+        st.caption("写真・添付ファイルは新規登録分からSupabase Storageへ保存されます。")
+    else:
+        st.warning("Supabase Storage設定が未完了です。写真・添付ファイルを保存するには SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / SUPABASE_STORAGE_BUCKET を設定してください。")
 
     user_map = user_display_map()
     users = list(user_map.keys())
@@ -1011,22 +1258,18 @@ def page_event_manage():
         st.info("この予定に紐づく写真メモはありません。")
     else:
         for _, p in photos.iterrows():
-            img_path = Path(p["file_path"])
             c_img, c_info = st.columns([1, 2])
             with c_img:
-                if img_path.exists():
-                    st.image(str(img_path), caption=p["file_name"], use_container_width=True)
-                else:
-                    st.warning("画像ファイルが見つかりません。")
+                render_saved_image(
+                    p["file_path"],
+                    caption=p["file_name"],
+                    use_container_width=True,
+                )
             with c_info:
                 st.write(f"メモ：{p['photo_memo'] or ''}")
                 st.caption(f"登録日時：{p['created_at']}")
                 if st.button(f"この写真を削除 ID:{p['id']}", key=f"delete_photo_{p['id']}"):
-                    if img_path.exists():
-                        try:
-                            img_path.unlink()
-                        except Exception:
-                            pass
+                    delete_saved_file(p["file_path"])
                     execute("DELETE FROM event_photos WHERE id=?", (int(p["id"]),))
                     st.success("写真メモを削除しました。画面を再読み込みしてください。")
 
@@ -1050,29 +1293,20 @@ def page_event_manage():
         st.info("この予定に紐づくExcel・書類ファイルはありません。")
     else:
         for _, frow in files.iterrows():
-            f_path = Path(frow["file_path"])
             c_file, c_action = st.columns([3, 1])
             with c_file:
                 st.write(f"📎 **{frow['file_name']}**")
                 st.write(f"メモ：{frow['file_memo'] or ''}")
                 st.caption(f"登録日時：{frow['created_at']}")
-                if f_path.exists():
-                    with open(f_path, "rb") as f:
-                        st.download_button(
-                            "ダウンロード",
-                            data=f,
-                            file_name=frow["file_name"],
-                            key=f"download_file_{frow['id']}"
-                        )
-                else:
-                    st.warning("ファイルが見つかりません。")
+                render_saved_download_button(
+                    "ダウンロード",
+                    frow["file_path"],
+                    frow["file_name"],
+                    key=f"download_file_{frow['id']}",
+                )
             with c_action:
                 if st.button(f"削除 ID:{frow['id']}", key=f"delete_file_{frow['id']}"):
-                    if f_path.exists():
-                        try:
-                            f_path.unlink()
-                        except Exception:
-                            pass
+                    delete_saved_file(frow["file_path"])
                     execute("DELETE FROM event_files WHERE id=?", (int(frow["id"]),))
                     st.success("ファイルを削除しました。画面を再読み込みしてください。")
 
@@ -1165,20 +1399,10 @@ def page_event_manage():
     if delete_btn:
         photos = get_event_photos(selected_id)
         for _, p in photos.iterrows():
-            img_path = Path(p["file_path"])
-            if img_path.exists():
-                try:
-                    img_path.unlink()
-                except Exception:
-                    pass
+            delete_saved_file(p["file_path"])
         files = get_event_files(selected_id)
         for _, frow in files.iterrows():
-            f_path = Path(frow["file_path"])
-            if f_path.exists():
-                try:
-                    f_path.unlink()
-                except Exception:
-                    pass
+            delete_saved_file(frow["file_path"])
         execute("DELETE FROM event_photos WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM event_files WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM events WHERE id=?", (int(selected_id),))
@@ -1423,11 +1647,10 @@ def page_photo_notes():
         st.markdown("---")
         c1, c2 = st.columns([1, 2])
         with c1:
-            img_path = Path(row["file_path"])
-            if img_path.exists():
-                st.image(str(img_path), use_container_width=True)
-            else:
-                st.warning("画像ファイルが見つかりません。")
+            render_saved_image(
+                row["file_path"],
+                use_container_width=True,
+            )
         with c2:
             st.write(f"**{row['event_date']}｜{row['category']}｜{row['title']}**")
             if row["user_name"]:
@@ -1498,17 +1721,12 @@ def page_attached_files():
         st.write(f"ファイルメモ：{row['file_memo'] or ''}")
         st.caption(f"登録：{row['file_created_at']}")
 
-        f_path = Path(row["file_path"])
-        if f_path.exists():
-            with open(f_path, "rb") as f:
-                st.download_button(
-                    "ダウンロード",
-                    data=f,
-                    file_name=row["file_name"],
-                    key=f"file_list_download_{row['file_id']}"
-                )
-        else:
-            st.warning("ファイルが見つかりません。")
+        render_saved_download_button(
+            "ダウンロード",
+            row["file_path"],
+            row["file_name"],
+            key=f"file_list_download_{row['file_id']}",
+        )
 
 
 
@@ -2502,7 +2720,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.3 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.4 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
