@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.4.4
+ひだまり帳 Ver1.4.5
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -18,7 +18,7 @@ import re
 import hashlib
 import mimetypes
 import urllib.parse
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from io import BytesIO
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.4.4 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.4.5 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -3614,26 +3614,46 @@ def create_shift_quality_check_table(df, year, month):
                     "内容": "同じ日に日勤と夜勤が入っています。日/夜入力は禁止です。",
                 })
 
-            # 前日夜勤の翌日は休みにする
+            # 夜勤翌日は「明」、明け翌日は「休み」を基本にする
             try:
                 prev_date = (date(int(year), int(month), d) - timedelta(days=1)).strftime("%Y-%m-%d")
                 prev_df = df[(df["staff_name"].astype(str) == staff_name) & (df["shift_date"].astype(str) == prev_date)]
-                if "夜勤" in prev_df["shift_kind"].astype(str).tolist():
+                prev_kinds = prev_df["shift_kind"].astype(str).tolist() if not prev_df.empty else []
+
+                if "夜勤" in prev_kinds:
                     if "日勤" in kinds or "夜勤" in kinds:
                         rows.append({
                             "重要度": "高",
                             "種類": "夜勤翌日勤務",
                             "日付": target_date,
                             "職員名": staff_name,
-                            "内容": "夜勤の翌日に勤務が入っています。翌日は休みにしてください。",
+                            "内容": "夜勤の翌日に勤務が入っています。翌日は明け扱いにしてください。",
                         })
-                    if not any(k in kinds for k in ["休み", "有休", "希望休", "夜勤明け"]):
+                    if "夜勤明け" not in kinds:
                         rows.append({
                             "重要度": "中",
-                            "種類": "夜勤翌日休み未登録",
+                            "種類": "夜勤翌日明け未登録",
                             "日付": target_date,
                             "職員名": staff_name,
-                            "内容": "夜勤の翌日に休みが登録されていません。",
+                            "内容": "夜勤の翌日に「明」が登録されていません。",
+                        })
+
+                if "夜勤明け" in prev_kinds:
+                    if "日勤" in kinds or "夜勤" in kinds:
+                        rows.append({
+                            "重要度": "高",
+                            "種類": "明け翌日勤務",
+                            "日付": target_date,
+                            "職員名": staff_name,
+                            "内容": "明けの翌日に勤務が入っています。原則として休みにしてください。",
+                        })
+                    if not any(k in kinds for k in ["休み", "有休", "希望休"]):
+                        rows.append({
+                            "重要度": "中",
+                            "種類": "明け翌日休み未登録",
+                            "日付": target_date,
+                            "職員名": staff_name,
+                            "内容": "明けの翌日に休みが登録されていません。",
                         })
             except Exception:
                 pass
@@ -3821,8 +3841,11 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
     try:
         prev_date = (pd.to_datetime(date_text).date() - timedelta(days=1)).strftime("%Y-%m-%d")
         prev_df = staff_df[staff_df["shift_date"].astype(str) == prev_date] if not staff_df.empty else pd.DataFrame()
-        if not prev_df.empty and "夜勤" in prev_df["shift_kind"].astype(str).tolist():
-            return False, "前日夜勤のため翌日は休み"
+        prev_kinds = prev_df["shift_kind"].astype(str).tolist() if not prev_df.empty else []
+        if "夜勤" in prev_kinds:
+            return False, "前日夜勤のため翌日は明け"
+        if "夜勤明け" in prev_kinds:
+            return False, "前日明けのため翌日は休み"
     except Exception:
         pass
 
@@ -3941,9 +3964,12 @@ def create_ai_shift_draft(df, staff_names, year, month):
             if need_kind == "夜勤":
                 night_counts[selected] = night_counts.get(selected, 0) + 1
 
-                # 夜勤の翌日は休みを自動で入れる
+                # 夜勤の翌日は「明」、明けの翌日は「休み」を自動で入れる
                 try:
                     next_date_obj = pd.to_datetime(target_date).date() + timedelta(days=1)
+                    rest_date_obj = pd.to_datetime(target_date).date() + timedelta(days=2)
+
+                    # D+1：夜勤明け
                     if next_date_obj.month == int(month):
                         next_date = next_date_obj.strftime("%Y-%m-%d")
                         next_df = working_df[
@@ -3951,28 +3977,95 @@ def create_ai_shift_draft(df, staff_names, year, month):
                             (working_df["shift_date"].astype(str) == next_date)
                         ] if not working_df.empty else pd.DataFrame()
                         next_kinds = next_df["shift_kind"].astype(str).tolist() if not next_df.empty else []
-                        if not any(k in next_kinds for k in ["休み", "有休", "希望休", "日勤", "夜勤"]):
+                        if any(k in next_kinds for k in ["日勤", "夜勤", "休み", "有休", "希望休"]):
                             rows.append({
                                 "日付": next_date,
+                                "勤務": "注意",
+                                "候補職員": selected,
+                                "理由": f"夜勤翌日は明けにしたいですが、既に {', '.join(next_kinds)} が入っています。要確認です。",
+                                "保存対象": False,
+                            })
+                        elif "夜勤明け" not in next_kinds:
+                            rows.append({
+                                "日付": next_date,
+                                "勤務": "夜勤明け",
+                                "候補職員": selected,
+                                "理由": "夜勤翌日の明けを自動付与",
+                                "保存対象": True,
+                            })
+                            ake_row = pd.DataFrame([{
+                                "shift_date": next_date,
+                                "staff_name": selected,
+                                "shift_kind": "夜勤明け",
+                                "start_time": "",
+                                "end_time": "",
+                                "next_day": 0,
+                                "memo": "夜勤翌日の明け自動付与",
+                                "created_at": now_text(),
+                                "updated_at": now_text(),
+                            }])
+                            working_df = pd.concat([working_df, ake_row], ignore_index=True)
+                    else:
+                        rows.append({
+                            "日付": next_date_obj.strftime("%Y-%m-%d"),
+                            "勤務": "注意",
+                            "候補職員": selected,
+                            "理由": "夜勤翌日の明けが翌月になるため、翌月シフトで確認してください。",
+                            "保存対象": False,
+                        })
+
+                    # D+2：明け翌日の休み
+                    if rest_date_obj.month == int(month):
+                        rest_date = rest_date_obj.strftime("%Y-%m-%d")
+                        rest_df = working_df[
+                            (working_df["staff_name"].astype(str) == selected) &
+                            (working_df["shift_date"].astype(str) == rest_date)
+                        ] if not working_df.empty else pd.DataFrame()
+                        rest_kinds = rest_df["shift_kind"].astype(str).tolist() if not rest_df.empty else []
+                        if any(k in rest_kinds for k in ["日勤", "夜勤"]):
+                            rows.append({
+                                "日付": rest_date,
+                                "勤務": "注意",
+                                "候補職員": selected,
+                                "理由": f"明け翌日は休みにしたいですが、既に {', '.join(rest_kinds)} が入っています。要確認です。",
+                                "保存対象": False,
+                            })
+                        elif not any(k in rest_kinds for k in ["休み", "有休", "希望休"]):
+                            rows.append({
+                                "日付": rest_date,
                                 "勤務": "休み",
                                 "候補職員": selected,
-                                "理由": "夜勤翌日の休みを自動付与",
+                                "理由": "明け翌日の休みを自動付与",
                                 "保存対象": True,
                             })
                             rest_row = pd.DataFrame([{
-                                "shift_date": next_date,
+                                "shift_date": rest_date,
                                 "staff_name": selected,
                                 "shift_kind": "休み",
                                 "start_time": "",
                                 "end_time": "",
                                 "next_day": 0,
-                                "memo": "夜勤翌日の休み自動付与",
+                                "memo": "明け翌日の休み自動付与",
                                 "created_at": now_text(),
                                 "updated_at": now_text(),
                             }])
                             working_df = pd.concat([working_df, rest_row], ignore_index=True)
-                except Exception:
-                    pass
+                    else:
+                        rows.append({
+                            "日付": rest_date_obj.strftime("%Y-%m-%d"),
+                            "勤務": "注意",
+                            "候補職員": selected,
+                            "理由": "明け翌日の休みが翌月になるため、翌月シフトで確認してください。",
+                            "保存対象": False,
+                        })
+                except Exception as e:
+                    rows.append({
+                        "日付": target_date,
+                        "勤務": "注意",
+                        "候補職員": selected,
+                        "理由": f"夜勤後の明け・休み自動付与に失敗しました：{e}",
+                        "保存対象": False,
+                    })
 
     return pd.DataFrame(rows)
 
@@ -4301,7 +4394,7 @@ def page_shift_manager():
             st.rerun()
 
     st.markdown("### 4. AIシフト案作成")
-    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日休み・職員別上限を見て下書きを作ります。保存前に仮シフト表で確認できます。")
+    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日の明け・明け翌日休み・職員別上限を見て下書きを作ります。保存前に仮シフト表で確認できます。")
     if st.button("不足分のAIシフト案を作成", use_container_width=True):
         st.session_state["ai_shift_draft"] = create_ai_shift_draft(
             shift_df,
@@ -4314,6 +4407,12 @@ def page_shift_manager():
     if isinstance(draft, pd.DataFrame) and not draft.empty:
         st.markdown("#### AIシフト案一覧（まだ保存されていません）")
         st.dataframe(draft, use_container_width=True, hide_index=True)
+
+        warning_rows = draft[draft["勤務"].astype(str) == "注意"] if "勤務" in draft.columns else pd.DataFrame()
+        if not warning_rows.empty:
+            st.warning("明け翌日の休みなど、AIが自動で入れられなかった注意事項があります。保存前に確認してください。")
+            for _, wr in warning_rows.iterrows():
+                st.caption(f"⚠️ {wr.get('日付', '')}｜{wr.get('候補職員', '')}｜{wr.get('理由', '')}")
 
         preview_shift_df = apply_ai_shift_draft_to_df(shift_df, draft)
         st.markdown("#### AI案を反映した仮シフト表")
@@ -4385,7 +4484,7 @@ def page_shift_manager():
         st.dataframe(ng, use_container_width=True, hide_index=True)
 
     if checks is None or checks.empty:
-        st.success("夜勤翌日勤務・5連勤以上・希望休重複などの大きな確認事項はありません。")
+        st.success("夜勤翌日勤務・明け翌日勤務・5連勤以上・希望休重複などの大きな確認事項はありません。")
     else:
         st.warning("シフト確認事項があります。赤・黄色相当のチェックとして確認してください。")
         st.dataframe(checks, use_container_width=True, hide_index=True)
@@ -4816,7 +4915,7 @@ def main():
     init_db_once()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.4.4 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.4.5 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
