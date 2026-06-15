@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-ひだまり帳 Ver1.3.7
+ひだまり帳 Ver1.3.8
 PostgreSQL永続化版
 Python + Streamlit + PostgreSQL
 
@@ -48,7 +48,7 @@ except ImportError:
     psycopg2 = None
 
 
-APP_TITLE = "ひだまり帳 Ver1.3.7 PostgreSQL版"
+APP_TITLE = "ひだまり帳 Ver1.3.8 PostgreSQL版"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -1146,6 +1146,144 @@ def render_event_detail_panel():
 
 
 
+def clear_last_saved_event_state():
+    """保存後確認エリア用の一時情報を消す。"""
+    for key in [
+        "last_saved_event_id",
+        "last_saved_photo_saved",
+        "last_saved_photo_failed",
+        "last_saved_file_saved",
+        "last_saved_file_failed",
+        "last_saved_had_photos",
+        "last_saved_had_files",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def render_saved_event_confirmation(event_id=None):
+    """
+    予定登録直後に、保存した予定・写真メモ・添付ファイルの紐づきをその場で確認する。
+    入力ミスやStorage保存失敗にすぐ気づけるようにするための確認パネル。
+    """
+    if event_id is None:
+        event_id = st.session_state.get("last_saved_event_id")
+    if not event_id:
+        return
+
+    ev_df = get_event_by_id(event_id)
+    if ev_df.empty:
+        st.warning("保存後確認：保存した予定が見つかりません。")
+        return
+
+    ev = ev_df.iloc[0]
+    photos = get_event_photos(event_id)
+    files = get_event_files(event_id)
+
+    photo_saved = int(st.session_state.get("last_saved_photo_saved", len(photos)) or 0)
+    photo_failed = int(st.session_state.get("last_saved_photo_failed", 0) or 0)
+    file_saved = int(st.session_state.get("last_saved_file_saved", len(files)) or 0)
+    file_failed = int(st.session_state.get("last_saved_file_failed", 0) or 0)
+    had_photos = bool(st.session_state.get("last_saved_had_photos", False))
+    had_files = bool(st.session_state.get("last_saved_had_files", False))
+
+    st.markdown("---")
+    st.subheader("保存後の確認")
+    st.caption("いま保存した予定の内容と、写真・添付ファイルの紐づき状態を確認できます。")
+
+    if photo_failed or file_failed:
+        st.warning("予定本体は保存されていますが、写真メモまたは添付ファイルで保存失敗があります。")
+    else:
+        st.success("予定本体と、保存できた写真・添付ファイルの紐づきを確認できます。")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("予定ID", int(event_id))
+    with c2:
+        st.metric("写真紐づき", len(photos))
+    with c3:
+        st.metric("添付紐づき", len(files))
+    with c4:
+        ng_count = int(photo_failed + file_failed)
+        st.metric("保存失敗", ng_count)
+
+    if had_photos:
+        if photo_failed:
+            st.warning(f"写真メモ：{photo_saved}件保存、{photo_failed}件失敗")
+        else:
+            st.info(f"写真メモ：{photo_saved}件保存")
+    if had_files:
+        if file_failed:
+            st.warning(f"Excel・書類：{file_saved}件保存、{file_failed}件失敗")
+        else:
+            st.info(f"Excel・書類：{file_saved}件保存")
+
+    st.markdown("#### 保存した予定の詳細")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.write(f"**日付**：{ev['event_date']}")
+        st.write(f"**カテゴリ**：{ev['category']}")
+        st.write(f"**タイトル**：{ev['title']}")
+    with d2:
+        st.write(f"**利用者**：{ev['user_name'] or ''}")
+        st.caption(f"利用者ID：{ev['user_id'] or ''}")
+        st.write(f"**担当**：{ev['staff_name'] or ''}")
+    with d3:
+        st.write(f"**時間**：{ev['start_time'] or ''} 〜 {ev['end_time'] or ''}")
+        st.write(f"**重要**：{'あり' if int(ev['important'] or 0) == 1 else 'なし'}")
+        st.caption(f"登録日時：{ev['created_at']}")
+
+    st.write("**メモ**")
+    st.info(ev["memo"] or "メモはありません。")
+
+    st.markdown("#### 写真メモの確認")
+    if photos.empty:
+        if had_photos:
+            st.warning("写真を選択していましたが、DB上の写真メモ紐づきは0件です。Storage保存失敗の可能性があります。")
+        else:
+            st.info("写真メモは添付されていません。")
+    else:
+        st.caption(f"DBに紐づいた写真メモ：{len(photos)}件")
+        cols = st.columns(3)
+        for i, (_, p) in enumerate(photos.iterrows()):
+            with cols[i % 3]:
+                render_saved_image(
+                    p["file_path"],
+                    caption=p["photo_memo"] or p["file_name"],
+                    use_container_width=True,
+                )
+                st.caption(f"写真ID：{p['id']}")
+
+    st.markdown("#### Excel・書類ファイルの確認")
+    if files.empty:
+        if had_files:
+            st.warning("ファイルを選択していましたが、DB上の添付ファイル紐づきは0件です。Storage保存失敗の可能性があります。")
+        else:
+            st.info("Excel・書類ファイルは添付されていません。")
+    else:
+        st.caption(f"DBに紐づいた添付ファイル：{len(files)}件")
+        for _, frow in files.iterrows():
+            st.write(f"📎 **{frow['file_name']}**　{frow['file_memo'] or ''}")
+            st.caption(f"ファイルID：{frow['id']} / 保存先：{frow['file_path']}")
+            render_saved_download_button(
+                "ダウンロードして確認",
+                frow["file_path"],
+                frow["file_name"],
+                key=f"saved_confirm_download_{frow['id']}",
+            )
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        if st.button("この予定を下の詳細パネルでも表示", use_container_width=True):
+            set_selected_event(int(event_id))
+            st.rerun()
+    with cc2:
+        if st.button("保存後確認を閉じる", use_container_width=True):
+            clear_last_saved_event_state()
+            st.rerun()
+
+
+
+
 def render_calendar(year, month):
     """
     紙の壁カレンダー風レイアウト。
@@ -1330,6 +1468,13 @@ def page_event_register():
         file_saved, file_failed = save_uploaded_files(event_id, uploaded_files, file_memo)
 
         st.session_state["selected_calendar_event_id"] = int(event_id)
+        st.session_state["last_saved_event_id"] = int(event_id)
+        st.session_state["last_saved_photo_saved"] = int(photo_saved)
+        st.session_state["last_saved_photo_failed"] = int(photo_failed)
+        st.session_state["last_saved_file_saved"] = int(file_saved)
+        st.session_state["last_saved_file_failed"] = int(file_failed)
+        st.session_state["last_saved_had_photos"] = bool(uploaded_photos)
+        st.session_state["last_saved_had_files"] = bool(uploaded_files)
 
         messages = [f"予定を保存しました（予定ID: {event_id}）。"]
         if uploaded_photos:
@@ -1345,6 +1490,9 @@ def page_event_register():
             st.warning(" / ".join(messages))
         else:
             st.success(" / ".join(messages))
+
+
+    render_saved_event_confirmation()
 
 
 def page_event_manage():
@@ -3061,7 +3209,7 @@ def main():
     init_db()
     add_css()
 
-    st.title("📅 ひだまり帳 Ver1.3.7 PostgreSQL版")
+    st.title("📅 ひだまり帳 Ver1.3.8 PostgreSQL版")
     st.caption("紙の壁カレンダー感覚で、通院・面会・行事・注意事項を一枚で")
 
     menu = st.sidebar.radio(
