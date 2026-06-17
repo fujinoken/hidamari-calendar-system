@@ -47,9 +47,20 @@ try:
 except ImportError:
     psycopg2 = None
 
+try:
+    from openpyxl import Workbook as OpenpyxlWorkbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OpenpyxlWorkbook = None
+    Font = PatternFill = Alignment = Border = Side = None
+    get_column_letter = None
+    OPENPYXL_AVAILABLE = False
+
 
 APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
-AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v6_staff_deduplicate"
+AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v6_staff_deduplicate_excel_export"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -4736,6 +4747,156 @@ def make_staff_shift_pdf(year, month):
     return buffer.getvalue()
 
 
+
+def make_staff_shift_excel(year, month):
+    """
+    確定済みシフトをExcel（xlsx）で出力する。
+    勤務表シートに月間表、別シートに不足・確認事項・上限確認を出す。
+    """
+    if not OPENPYXL_AVAILABLE:
+        raise RuntimeError("openpyxl がインストールされていません。requirements.txt に openpyxl を追加してください。")
+
+    year = int(year)
+    month = int(month)
+    df = get_staff_shifts_month(year, month, include_prev_day=True)
+    matrix = create_shift_matrix(df, year, month)
+    shortage = create_shift_shortage_table(df, year, month)
+    checks = create_shift_quality_check_table(df, year, month)
+    limit_checks = create_shift_limit_check_table(matrix)
+    status = get_shift_month_status(year, month)
+    last_day = calendar.monthrange(year, month)[1]
+
+    wb = OpenpyxlWorkbook()
+    ws = wb.active
+    ws.title = "勤務表"
+
+    title_fill = PatternFill("solid", fgColor="F3EEE6")
+    header_fill = PatternFill("solid", fgColor="E7EEF8")
+    weekend_sun_fill = PatternFill("solid", fgColor="FCE4D6")
+    weekend_sat_fill = PatternFill("solid", fgColor="DDEBF7")
+    summary_fill = PatternFill("solid", fgColor="E2F0D9")
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
+    ws.cell(1, 1).value = f"従業員勤務表　{year}年{month}月"
+    ws.cell(1, 1).font = Font(bold=True, size=16)
+    ws.cell(1, 1).fill = title_fill
+    ws.cell(1, 1).alignment = left
+
+    status_text = "確定" if status.get("is_confirmed") else "作成中"
+    ws.cell(2, 1).value = "状態"
+    ws.cell(2, 2).value = status_text
+    ws.cell(2, 3).value = "確定日時"
+    ws.cell(2, 4).value = status.get("confirmed_at", "") or ""
+    ws.cell(2, 5).value = "出力日"
+    ws.cell(2, 6).value = today_jst().strftime("%Y-%m-%d")
+
+    ws.cell(3, 1).value = "凡例"
+    ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 休みは日別セルには表示しません"
+    ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
+
+    start_row = 5
+    if matrix is None or matrix.empty:
+        ws.cell(start_row, 1).value = "この月のシフトはまだ登録されていません。"
+    else:
+        columns = list(matrix.columns)
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell = ws.cell(start_row, col_idx)
+            cell.value = col_name
+            cell.font = Font(bold=True)
+            cell.alignment = center
+            cell.border = border
+            cell.fill = header_fill
+            if str(col_name).isdigit():
+                d = int(col_name)
+                weekday = date(year, month, d).weekday()  # 月=0 日=6
+                if weekday == 6:
+                    cell.fill = weekend_sun_fill
+                elif weekday == 5:
+                    cell.fill = weekend_sat_fill
+            elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+                cell.fill = summary_fill
+
+        for row_idx, (_, row) in enumerate(matrix.iterrows(), start=start_row + 1):
+            for col_idx, col_name in enumerate(columns, start=1):
+                value = row.get(col_name, "")
+                if pd.isna(value):
+                    value = ""
+                cell = ws.cell(row_idx, col_idx)
+                cell.value = value
+                cell.alignment = center if col_name != "職員名" else left
+                cell.border = border
+                if str(col_name).isdigit():
+                    d = int(col_name)
+                    weekday = date(year, month, d).weekday()
+                    if weekday == 6:
+                        cell.fill = PatternFill("solid", fgColor="FFF2CC")
+                    elif weekday == 5:
+                        cell.fill = PatternFill("solid", fgColor="EAF3F8")
+                elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+                    cell.fill = PatternFill("solid", fgColor="F2F8EE")
+
+        ws.freeze_panes = "B6"
+        ws.auto_filter.ref = f"A{start_row}:{get_column_letter(len(columns))}{start_row + len(matrix)}"
+
+        # 列幅調整
+        for col_idx, col_name in enumerate(columns, start=1):
+            letter = get_column_letter(col_idx)
+            if col_name == "職員名":
+                ws.column_dimensions[letter].width = 14
+            elif str(col_name).isdigit():
+                ws.column_dimensions[letter].width = 4
+            else:
+                ws.column_dimensions[letter].width = 8
+
+    for row in range(1, 4):
+        for col in range(1, max(8, (len(matrix.columns) if not matrix.empty else 8)) + 1):
+            ws.cell(row, col).alignment = left if col <= 2 else center
+
+    def add_df_sheet(sheet_name, data_df, empty_message):
+        safe_name = sheet_name[:31]
+        s = wb.create_sheet(safe_name)
+        if data_df is None or data_df.empty:
+            s.cell(1, 1).value = empty_message
+            s.cell(1, 1).font = Font(bold=True)
+            s.column_dimensions["A"].width = 60
+            return s
+        cols = list(data_df.columns)
+        for cidx, col in enumerate(cols, start=1):
+            cell = s.cell(1, cidx)
+            cell.value = col
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = center
+            cell.border = border
+            s.column_dimensions[get_column_letter(cidx)].width = 18 if col not in ["内容", "理由"] else 55
+        for ridx, (_, r) in enumerate(data_df.iterrows(), start=2):
+            for cidx, col in enumerate(cols, start=1):
+                value = r.get(col, "")
+                if pd.isna(value):
+                    value = ""
+                cell = s.cell(ridx, cidx)
+                cell.value = value
+                cell.alignment = Alignment(horizontal="left" if col in ["内容", "理由"] else "center", vertical="center", wrap_text=True)
+                cell.border = border
+        s.freeze_panes = "A2"
+        s.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(data_df)+1}"
+        return s
+
+    ng = shortage[shortage["状態"] != "OK"] if shortage is not None and not shortage.empty else pd.DataFrame()
+    add_df_sheet("不足確認", ng, "日勤2名・夜勤1名の不足日はありません。")
+    add_df_sheet("確認事項", checks, "夜勤翌日勤務・明け翌日勤務・5連勤以上・希望休重複などの確認事項はありません。")
+    add_df_sheet("上限確認", limit_checks, "職員別の日勤・夜勤・合計勤務回数は上限内です。")
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def page_shift_manager():
     st.subheader("職員シフト管理・AI担当割当")
     st.caption("希望休 → AIシフト案 → 不足・連勤チェック → 人が修正 → 確定 → PDF出力の流れで使えます。")
@@ -5020,8 +5181,8 @@ def page_shift_manager():
         st.warning("職員別の勤務回数上限を超えている箇所があります。")
         st.dataframe(limit_checks, use_container_width=True, hide_index=True)
 
-    st.markdown("### 6. 確定・PDF出力")
-    c1, c2, c3 = st.columns(3)
+    st.markdown("### 6. 確定・PDF・Excel出力")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
             if st.button("この月のシフトを確定する", use_container_width=True):
@@ -5050,7 +5211,33 @@ def page_shift_manager():
             except Exception as e:
                 st.error(f"シフトPDFを作成できませんでした：{e}")
     with c3:
-        st.caption("確定前は作成中、確定後は掲示・印刷用としてPDF保存する運用を想定しています。")
+        if OPENPYXL_AVAILABLE:
+            if month_status.get("is_confirmed"):
+                try:
+                    excel_bytes = make_staff_shift_excel(int(shift_year), int(shift_month))
+                    st.download_button(
+                        "確定勤務表Excelをダウンロード",
+                        data=excel_bytes,
+                        file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}_confirmed.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"シフトExcelを作成できませんでした：{e}")
+            else:
+                st.download_button(
+                    "確定勤務表Excelをダウンロード",
+                    data=b"",
+                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}_confirmed.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    disabled=True,
+                    help="この月のシフトを確定するとExcel出力できます。",
+                )
+        else:
+            st.warning("openpyxl が未導入のためExcel出力できません。")
+    with c4:
+        st.caption("確定前は作成中、確定後はPDF・Excelとして保存できます。Excelは編集・集計用、PDFは掲示・印刷用を想定しています。")
 
     st.markdown("---")
     st.markdown("### 7. 過去シフト検索・更新・削除")
