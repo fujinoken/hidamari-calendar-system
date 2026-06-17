@@ -49,7 +49,7 @@ except ImportError:
 
 
 APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
-AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v5_ake_off_guard"
+AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v6_staff_deduplicate"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FILE_DIR = Path("attached_files")
@@ -854,8 +854,24 @@ def user_display_map():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_active_staff():
+    """
+    有効な職員名を取得する。
+    「職員 A」と「職員A」のような空白違いは同一職員として扱い、
+    シフト表に重複行が出ないようにする。
+    """
     df = fetch_df("SELECT staff_name FROM staff WHERE is_active=1 ORDER BY staff_name")
-    return df["staff_name"].tolist() if not df.empty else []
+    if df.empty:
+        return []
+
+    names = []
+    seen = set()
+    for raw_name in df["staff_name"].dropna().astype(str).tolist():
+        name = normalize_staff_name(raw_name)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
 
 
 # -----------------------------
@@ -2008,20 +2024,33 @@ def page_master_staff():
         add = st.form_submit_button("職員を追加")
 
     if add:
-        if not staff_name.strip():
+        clean_staff_name = normalize_staff_name(staff_name)
+        if not clean_staff_name:
             st.error("職員名を入力してください。")
         else:
-            try:
-                execute("""
-                    INSERT INTO staff (staff_name, role, is_active, created_at)
-                    VALUES (?, ?, 1, ?)
-                """, (staff_name.strip(), role.strip(), now_text()))
-                st.success("職員を追加しました。")
-            except DB_INTEGRITY_ERROR:
-                st.error("同じ職員名がすでに登録されています。")
+            existing_staff = fetch_df("SELECT staff_name FROM staff")
+            existing_norms = set()
+            if existing_staff is not None and not existing_staff.empty:
+                existing_norms = set(existing_staff["staff_name"].dropna().astype(str).apply(normalize_staff_name).tolist())
+            if clean_staff_name in existing_norms:
+                st.error("同じ職員名がすでに登録されています。（空白違いも同一職員として扱います）")
+            else:
+                try:
+                    execute("""
+                        INSERT INTO staff (staff_name, role, is_active, created_at)
+                        VALUES (?, ?, 1, ?)
+                    """, (clean_staff_name, role.strip(), now_text()))
+                    st.success("職員を追加しました。")
+                except DB_INTEGRITY_ERROR:
+                    st.error("同じ職員名がすでに登録されています。")
 
     df = fetch_df("SELECT * FROM staff ORDER BY is_active DESC, staff_name")
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    duplicate_df = get_duplicate_staff_name_groups()
+    if not duplicate_df.empty:
+        st.warning("職員マスタに空白違いの重複があります。シフト表では1人として表示します。不要な重複行は無効にしてください。")
+        st.dataframe(duplicate_df, use_container_width=True, hide_index=True)
 
     if not df.empty:
         selected = st.selectbox("有効／無効を変更する職員ID", df["id"].tolist())
@@ -3222,10 +3251,12 @@ def save_staff_shift_limits_from_editor(limits_df):
         return 0
     execute("DELETE FROM staff_shift_limits")
     params = []
+    seen_staff_names = set()
     for _, r in limits_df.iterrows():
         staff_name = normalize_staff_name(r.get("職員名", ""))
-        if not staff_name:
+        if not staff_name or staff_name in seen_staff_names:
             continue
+        seen_staff_names.add(staff_name)
         params.append((
             staff_name,
             safe_shift_limit_value(r.get("日勤上限", 31), 31),
@@ -3248,14 +3279,43 @@ def save_staff_shift_limits_from_editor(limits_df):
 
 def normalize_staff_name(value):
     """
-    職員名を比較用に正規化する。
-    末尾スペース・全角スペースの違いで、上限設定がAI候補に反映されない事故を防ぐ。
+    職員名を比較・保存用に正規化する。
+    「職員 A」「職員　A」「職員A」のような空白違いを同一職員として扱う。
+    シフト表・上限表・AI案ではこの正規化名を使い、重複行を防ぐ。
     """
     if value is None:
         return ""
     v = str(value).replace("\u3000", " ").strip()
-    v = re.sub(r"\s+", " ", v)
+    v = re.sub(r"\s+", "", v)
     return v
+
+
+def get_duplicate_staff_name_groups():
+    """職員マスタ内の空白違い重複を確認するための一覧を作る。"""
+    try:
+        df = fetch_df("SELECT id, staff_name, role, is_active, created_at FROM staff ORDER BY is_active DESC, staff_name")
+    except Exception:
+        return pd.DataFrame(columns=["正規化名", "登録ID", "登録名", "状態"])
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["正規化名", "登録ID", "登録名", "状態"])
+
+    tmp = df.copy()
+    tmp["正規化名"] = tmp["staff_name"].apply(normalize_staff_name)
+    dup_names = tmp[tmp["正規化名"].duplicated(keep=False)]["正規化名"].unique().tolist()
+    if not dup_names:
+        return pd.DataFrame(columns=["正規化名", "登録ID", "登録名", "状態"])
+
+    rows = []
+    for norm in dup_names:
+        part = tmp[tmp["正規化名"] == norm]
+        for _, r in part.iterrows():
+            rows.append({
+                "正規化名": norm,
+                "登録ID": int(r.get("id")),
+                "登録名": str(r.get("staff_name") or ""),
+                "状態": "有効" if int(r.get("is_active") or 0) == 1 else "無効",
+            })
+    return pd.DataFrame(rows, columns=["正規化名", "登録ID", "登録名", "状態"])
 
 
 def safe_shift_limit_value(value, default=31):
@@ -3455,6 +3515,7 @@ def get_staff_shifts_month(year, month, include_prev_day=False):
 
 def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_time=None, next_day=0, memo=""):
     """1件のシフトを追加保存する。"""
+    staff_name = normalize_staff_name(staff_name)
     if not staff_name or not shift_kind:
         return None
     if start_time is None or end_time is None:
@@ -3485,9 +3546,11 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
     execute("DELETE FROM staff_shifts WHERE shift_date=? AND shift_kind IN ('日勤', '夜勤')", (shift_date,))
     params = []
     for staff_name in [day_staff_1, day_staff_2]:
+        staff_name = normalize_staff_name(staff_name)
         if staff_name:
             stime, etime, nd = default_shift_times("日勤")
             params.append((shift_date, staff_name, "日勤", stime, etime, nd, memo.strip() or None, now_text(), now_text()))
+    night_staff = normalize_staff_name(night_staff)
     if night_staff:
         stime, etime, nd = default_shift_times("夜勤")
         params.append((shift_date, night_staff, "夜勤", stime, etime, nd, memo.strip() or None, now_text(), now_text()))
@@ -3622,11 +3685,22 @@ def create_editable_shift_matrix(staff_names, df, year, month):
     各セルは「」「日」「夜」「明」「休」「希」「有」「日/夜」からプルダウン入力する。
     """
     last_day = calendar.monthrange(int(year), int(month))[1]
-    staff_names = [s for s in staff_names if str(s).strip()]
+    # 職員名は正規化し、空白違いの重複行を1行にまとめる。
+    unique_staff_names = []
+    seen_staff_names = set()
+    for s in staff_names:
+        ns = normalize_staff_name(s)
+        if ns and ns not in seen_staff_names:
+            seen_staff_names.add(ns)
+            unique_staff_names.append(ns)
+    staff_names = unique_staff_names
+
     if df is not None and not df.empty:
         for s in sorted(df["staff_name"].dropna().astype(str).unique().tolist()):
-            if s and s not in staff_names:
-                staff_names.append(s)
+            ns = normalize_staff_name(s)
+            if ns and ns not in seen_staff_names:
+                seen_staff_names.add(ns)
+                staff_names.append(ns)
 
     columns = ["職員名"] + [str(d) for d in range(1, last_day + 1)]
     rows = []
@@ -3651,21 +3725,37 @@ def save_shift_matrix_from_editor(year, month, edited_df):
         return 0
 
     last_day = calendar.monthrange(int(year), int(month))[1]
-    staff_names = [str(v).strip() for v in edited_df["職員名"].tolist() if str(v).strip()]
+    staff_names = []
+    seen_staff_names = set()
+    for v in edited_df["職員名"].tolist():
+        ns = normalize_staff_name(v)
+        if ns and ns not in seen_staff_names:
+            seen_staff_names.add(ns)
+            staff_names.append(ns)
     if not staff_names:
         return 0
 
     start = f"{int(year)}-{int(month):02d}-01"
     end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
+
+    # 既存データに「職員 A」「職員A」のような空白違いがあっても、
+    # 同じ正規化名としてまとめて削除してから保存する。
+    existing_month_df = get_staff_shifts(start, end)
     for staff_name in staff_names:
-        execute(
-            "DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ? AND staff_name=?",
-            (start, end, staff_name),
-        )
+        aliases = {staff_name}
+        if existing_month_df is not None and not existing_month_df.empty:
+            for old_name in existing_month_df["staff_name"].dropna().astype(str).unique().tolist():
+                if normalize_staff_name(old_name) == staff_name:
+                    aliases.add(old_name)
+        for alias in aliases:
+            execute(
+                "DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ? AND staff_name=?",
+                (start, end, alias),
+            )
 
     params = []
     for _, row in edited_df.iterrows():
-        staff_name = str(row.get("職員名", "")).strip()
+        staff_name = normalize_staff_name(row.get("職員名", ""))
         if not staff_name:
             continue
         for d in range(1, last_day + 1):
