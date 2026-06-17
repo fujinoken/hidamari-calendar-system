@@ -132,6 +132,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS staff (
         id SERIAL PRIMARY KEY,
         staff_name TEXT NOT NULL UNIQUE,
+        staff_code TEXT,
         role TEXT,
         is_active INTEGER DEFAULT 1,
         created_at TEXT NOT NULL
@@ -195,6 +196,7 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS user_id TEXT")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS room_no TEXT")
     cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS user_id TEXT")
+    cur.execute("ALTER TABLE staff ADD COLUMN IF NOT EXISTS staff_code TEXT")
 
     # 既存利用者にIDがない場合、U0001形式で仮IDを付与
     cur.execute("SELECT id, user_id FROM users")
@@ -285,6 +287,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_categories_active_sort ON categories(is_active, sort_order)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_active_name ON users(is_active, user_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_active_name ON staff(is_active, staff_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_code ON staff(staff_code)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_date ON staff_shifts(shift_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_staff ON staff_shifts(staff_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_date_kind ON staff_shifts(shift_date, shift_kind)")
@@ -883,6 +886,52 @@ def get_active_staff():
         seen.add(name)
         names.append(name)
     return names
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_staff_code_map(active_only=True):
+    """
+    KING OF TIME CSV出力用に、職員名（正規化後）と従業員コードの対応表を取得する。
+    空白違いの職員名がある場合は、先に見つかった有効な従業員コードを優先する。
+    """
+    where = "WHERE is_active=1" if active_only else ""
+    try:
+        df = fetch_df(f"""
+            SELECT staff_name, staff_code, is_active
+            FROM staff
+            {where}
+            ORDER BY is_active DESC, staff_name
+        """)
+    except Exception:
+        return {}
+
+    mapping = {}
+    if df is None or df.empty:
+        return mapping
+
+    for _, r in df.iterrows():
+        staff_name = normalize_staff_name(r.get("staff_name", ""))
+        staff_code = str(r.get("staff_code") or "").strip()
+        if not staff_name:
+            continue
+        if staff_name not in mapping or (not mapping.get(staff_name) and staff_code):
+            mapping[staff_name] = staff_code
+    return mapping
+
+
+def get_missing_staff_code_names(staff_names):
+    """KING OF TIME従業員コードが未登録の職員名一覧を返す。"""
+    code_map = get_staff_code_map(active_only=True)
+    missing = []
+    seen = set()
+    for name in staff_names or []:
+        staff_name = normalize_staff_name(name)
+        if not staff_name or staff_name in seen:
+            continue
+        seen.add(staff_name)
+        if not str(code_map.get(staff_name, "") or "").strip():
+            missing.append(staff_name)
+    return missing
 
 
 # -----------------------------
@@ -2025,37 +2074,43 @@ def page_master_users():
 
 def page_master_staff():
     st.subheader("職員マスタ")
+    st.caption("KING OF TIMEへシフトCSVを出力する場合は、従業員コードを登録しておくとCSVの「従業員コード」に反映されます。")
 
     with st.form("staff_add_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             staff_name = st.text_input("職員名")
         with c2:
+            staff_code = st.text_input("従業員コード（KING OF TIME）", placeholder="例：001")
+        with c3:
             role = st.text_input("役割", placeholder="例：管理者、日勤、夜勤")
         add = st.form_submit_button("職員を追加")
 
     if add:
         clean_staff_name = normalize_staff_name(staff_name)
+        clean_staff_code = str(staff_code or "").strip()
         if not clean_staff_name:
             st.error("職員名を入力してください。")
         else:
-            existing_staff = fetch_df("SELECT staff_name FROM staff")
+            existing_staff = fetch_df("SELECT staff_name, staff_code FROM staff")
             existing_norms = set()
             if existing_staff is not None and not existing_staff.empty:
                 existing_norms = set(existing_staff["staff_name"].dropna().astype(str).apply(normalize_staff_name).tolist())
             if clean_staff_name in existing_norms:
                 st.error("同じ職員名がすでに登録されています。（空白違いも同一職員として扱います）")
+            elif clean_staff_code and existing_staff is not None and not existing_staff.empty and clean_staff_code in existing_staff["staff_code"].fillna("").astype(str).str.strip().tolist():
+                st.error("同じKING OF TIME従業員コードがすでに登録されています。")
             else:
                 try:
                     execute("""
-                        INSERT INTO staff (staff_name, role, is_active, created_at)
-                        VALUES (?, ?, 1, ?)
-                    """, (clean_staff_name, role.strip(), now_text()))
+                        INSERT INTO staff (staff_name, staff_code, role, is_active, created_at)
+                        VALUES (?, ?, ?, 1, ?)
+                    """, (clean_staff_name, clean_staff_code or None, role.strip(), now_text()))
                     st.success("職員を追加しました。")
                 except DB_INTEGRITY_ERROR:
                     st.error("同じ職員名がすでに登録されています。")
 
-    df = fetch_df("SELECT * FROM staff ORDER BY is_active DESC, staff_name")
+    df = fetch_df("SELECT id, staff_name, staff_code, role, is_active, created_at FROM staff ORDER BY is_active DESC, staff_name")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     duplicate_df = get_duplicate_staff_name_groups()
@@ -2064,12 +2119,56 @@ def page_master_staff():
         st.dataframe(duplicate_df, use_container_width=True, hide_index=True)
 
     if not df.empty:
-        selected = st.selectbox("有効／無効を変更する職員ID", df["id"].tolist())
+        selected = st.selectbox("編集する職員ID", df["id"].tolist())
         target = df[df["id"] == selected].iloc[0]
-        new_active = st.radio("状態", [1, 0], index=0 if target["is_active"] == 1 else 1, format_func=lambda x: "有効" if x == 1 else "無効")
-        if st.button("職員状態を更新"):
-            execute("UPDATE staff SET is_active=? WHERE id=?", (int(new_active), int(selected)))
-            st.success("状態を更新しました。")
+
+        with st.form("staff_edit_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                edit_staff_name = st.text_input("職員名", value=str(target.get("staff_name") or ""))
+            with c2:
+                edit_staff_code = st.text_input("従業員コード（KING OF TIME）", value=str(target.get("staff_code") or ""))
+            with c3:
+                edit_role = st.text_input("役割", value=str(target.get("role") or ""))
+
+            new_active = st.radio(
+                "状態",
+                [1, 0],
+                index=0 if int(target["is_active"] or 0) == 1 else 1,
+                format_func=lambda x: "有効" if x == 1 else "無効",
+            )
+            update_staff = st.form_submit_button("職員情報を更新")
+
+        if update_staff:
+            clean_staff_name = normalize_staff_name(edit_staff_name)
+            clean_staff_code = str(edit_staff_code or "").strip()
+            if not clean_staff_name:
+                st.error("職員名を入力してください。")
+            else:
+                other_df = fetch_df("SELECT id, staff_name, staff_code FROM staff WHERE id<>?", (int(selected),))
+                other_norms = set()
+                other_codes = set()
+                if other_df is not None and not other_df.empty:
+                    other_norms = set(other_df["staff_name"].dropna().astype(str).apply(normalize_staff_name).tolist())
+                    other_codes = set([str(x or "").strip() for x in other_df["staff_code"].tolist() if str(x or "").strip()])
+                if clean_staff_name in other_norms:
+                    st.error("同じ職員名がすでに登録されています。（空白違いも同一職員として扱います）")
+                elif clean_staff_code and clean_staff_code in other_codes:
+                    st.error("同じKING OF TIME従業員コードがすでに登録されています。")
+                else:
+                    execute("""
+                        UPDATE staff
+                        SET staff_name=?, staff_code=?, role=?, is_active=?
+                        WHERE id=?
+                    """, (
+                        clean_staff_name,
+                        clean_staff_code or None,
+                        edit_role.strip() or None,
+                        int(new_active),
+                        int(selected),
+                    ))
+                    st.success("職員情報を更新しました。")
+                    st.rerun()
 
 
 
@@ -4748,6 +4847,125 @@ def make_staff_shift_pdf(year, month):
 
 
 
+def get_kot_pattern_code(shift_kind):
+    """KING OF TIME用パターンコード。secrets/envで上書き可能。"""
+    key_map = {
+        "日勤": ("KOT_DAY_PATTERN_CODE", "日勤"),
+        "夜勤": ("KOT_NIGHT_PATTERN_CODE", "夜勤"),
+    }
+    key, default = key_map.get(str(shift_kind), ("", str(shift_kind or "")))
+    if key:
+        return get_secret_or_env(key, default=default)
+    return default
+
+
+def kot_time_value(time_text, next_day=False):
+    """KING OF TIMEの対象日HH:mm形式へ変換する。"""
+    value = str(time_text or "").strip()
+    if not value:
+        return ""
+    prefix = "翌日" if next_day else "当日"
+    if value.startswith(("当日", "翌日", "前日")):
+        return value
+    return f"{prefix}{value}"
+
+
+def kot_break_minutes(shift_kind):
+    """KING OF TIME CSV用の休憩予定時間。必要に応じて施設運用に合わせて変更する。"""
+    if str(shift_kind) == "日勤":
+        return 60
+    if str(shift_kind) == "夜勤":
+        return 120
+    return ""
+
+
+def make_king_of_time_shift_csv(year, month):
+    """
+    ひだまり帳の月間シフトをKING OF TIMEのスケジュールデータCSV向けに出力する。
+    出力列：勤務日・従業員コード・パターンコード・出勤予定・退勤予定・休憩予定時間・全日休暇・備考
+    """
+    year = int(year)
+    month = int(month)
+    last_day = calendar.monthrange(year, month)[1]
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{last_day:02d}"
+    df = get_staff_shifts(start, end)
+
+    columns = ["勤務日", "従業員コード", "パターンコード", "出勤予定", "退勤予定", "休憩予定時間", "全日休暇", "備考"]
+    if df is None or df.empty:
+        empty_df = pd.DataFrame(columns=columns)
+        return empty_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+    code_map = get_staff_code_map(active_only=False)
+    rows = []
+    df = df.sort_values(["shift_date", "staff_name", "shift_kind", "id"])
+    for _, r in df.iterrows():
+        shift_kind = str(r.get("shift_kind") or "").strip()
+        staff_name = normalize_staff_name(r.get("staff_name", ""))
+        if not staff_name:
+            continue
+
+        # 夜勤明け・休みはKING OF TIMEへ勤務予定として登録しない。
+        # 希望休・その他は備考行として出す。不要な場合はCSV上で削除できる。
+        if shift_kind in ["夜勤明け", "休み"]:
+            continue
+
+        shift_date = str(r.get("shift_date") or "").strip()
+        try:
+            work_date = pd.to_datetime(shift_date).date().strftime("%Y%m%d")
+        except Exception:
+            work_date = shift_date.replace("-", "").replace("/", "")
+
+        staff_code = str(code_map.get(staff_name, "") or "").strip()
+        pattern_code = ""
+        start_plan = ""
+        end_plan = ""
+        break_minutes = ""
+        full_day_leave = ""
+        memo_parts = []
+        original_memo = str(r.get("memo") or "").strip()
+
+        if shift_kind in ["日勤", "夜勤"]:
+            pattern_code = get_kot_pattern_code(shift_kind)
+            stime = str(r.get("start_time") or "").strip()
+            etime = str(r.get("end_time") or "").strip()
+            if not stime or not etime:
+                default_start, default_end, default_next_day = default_shift_times(shift_kind)
+                stime = stime or default_start
+                etime = etime or default_end
+                next_day = bool(default_next_day)
+            else:
+                next_day = bool(int(r.get("next_day") or 0))
+            start_plan = kot_time_value(stime, next_day=False)
+            end_plan = kot_time_value(etime, next_day=next_day)
+            break_minutes = kot_break_minutes(shift_kind)
+        elif shift_kind == "有休":
+            full_day_leave = "有休"
+        elif shift_kind == "希望休":
+            memo_parts.append("希望休（ひだまり帳）")
+        elif shift_kind == "その他":
+            memo_parts.append("その他（ひだまり帳）")
+        else:
+            memo_parts.append(shift_kind)
+
+        if original_memo:
+            memo_parts.append(original_memo)
+
+        rows.append({
+            "勤務日": work_date,
+            "従業員コード": staff_code,
+            "パターンコード": pattern_code,
+            "出勤予定": start_plan,
+            "退勤予定": end_plan,
+            "休憩予定時間": break_minutes,
+            "全日休暇": full_day_leave,
+            "備考": " / ".join([x for x in memo_parts if x]),
+        })
+
+    out_df = pd.DataFrame(rows, columns=columns)
+    return out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
 def make_staff_shift_excel(year, month):
     """
     確定済みシフトをExcel（xlsx）で出力する。
@@ -5237,7 +5455,22 @@ def page_shift_manager():
         else:
             st.warning("openpyxl が未導入のためExcel出力できません。")
     with c4:
-        st.caption("確定前は作成中、確定後はPDF・Excelとして保存できます。Excelは編集・集計用、PDFは掲示・印刷用を想定しています。")
+        missing_codes = get_missing_staff_code_names(get_active_staff())
+        if missing_codes:
+            st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("…" if len(missing_codes) > 8 else ""))
+        try:
+            kot_csv_bytes = make_king_of_time_shift_csv(int(shift_year), int(shift_month))
+            st.download_button(
+                "KING OF TIME用CSVをダウンロード",
+                data=kot_csv_bytes,
+                file_name=f"king_of_time_shift_{int(shift_year)}_{int(shift_month):02d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="出力項目：勤務日・従業員コード・パターンコード・出勤予定・退勤予定・休憩予定時間・全日休暇・備考",
+            )
+            st.caption("KING OF TIME取込前に、パターンコードと従業員コードが施設側の設定と一致しているか確認してください。")
+        except Exception as e:
+            st.error(f"KING OF TIME用CSVを作成できませんでした：{e}")
 
     st.markdown("---")
     st.markdown("### 7. 過去シフト検索・更新・削除")
