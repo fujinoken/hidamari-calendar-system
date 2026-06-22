@@ -1146,14 +1146,14 @@ def page_master_users():
 
 def page_master_staff():
     st.subheader("職員マスタ")
-    st.caption("KING OF TIMEへシフトCSVを出力する場合は、従業員コードを登録しておくとCSVの「従業員コード」に反映されます。")
+    st.caption("KING OF TIMEへシフトCSVを出力する場合は、従業員コードを登録しておくとCSVの「従業員コード」に反映されます。未入力でも保存できます。")
 
     with st.form("staff_add_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
             staff_name = st.text_input("職員名")
         with c2:
-            staff_code = st.text_input("従業員コード（KING OF TIME）", placeholder="例：001")
+            staff_code = st.text_input("従業員コード（KING OF TIME）", placeholder="例：001（未入力可）")
         with c3:
             role = st.text_input("役割", placeholder="例：管理者、日勤、夜勤")
         add = st.form_submit_button("職員を追加")
@@ -2852,6 +2852,12 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
                 return False, f"翌日に休み系（{', '.join(next_off)}）があるため夜勤不可"
             if next_active:
                 return False, f"翌日に勤務系（{', '.join(next_active)}）があるため夜勤不可"
+
+            rest_date = (pd.to_datetime(date_text).date() + timedelta(days=2)).strftime("%Y-%m-%d")
+            rest_kinds = get_staff_day_shift_kinds(df, target_staff, rest_date)
+            rest_active = [k for k in rest_kinds if k in ACTIVE_SHIFT_KINDS]
+            if rest_active:
+                return False, f"明け翌日に勤務系（{', '.join(rest_active)}）があるため夜勤不可"
         except Exception:
             pass
 
@@ -2860,6 +2866,42 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
         return False, reason
 
     return True, "候補"
+
+
+def summarize_ai_reject_reasons(reject_reasons):
+    """AI候補から外れた理由を、現場で読みやすいカテゴリ別に要約する。"""
+    buckets = {
+        "上限": 0,
+        "休み系": 0,
+        "夜勤明け": 0,
+        "明け翌日": 0,
+        "重複": 0,
+        "その他": 0,
+    }
+    samples = []
+    for reason in reject_reasons or []:
+        text = str(reason)
+        if len(samples) < 4:
+            samples.append(text)
+        if "上限" in text:
+            buckets["上限"] += 1
+        elif "前日夜勤" in text or "翌日は明け" in text or "夜勤明け" in text:
+            buckets["夜勤明け"] += 1
+        elif "前日明け" in text or "明け翌日" in text:
+            buckets["明け翌日"] += 1
+        elif "休み系" in text or "希望休" in text or "有休" in text or "休み" in text:
+            buckets["休み系"] += 1
+        elif "既に" in text or "重複" in text or "勤務系" in text:
+            buckets["重複"] += 1
+        else:
+            buckets["その他"] += 1
+
+    parts = [f"{name}{count}名" for name, count in buckets.items() if count]
+    summary = "、".join(parts) if parts else "候補理由なし"
+    if samples:
+        summary += "。例：" + " / ".join(samples)
+    return summary
+
 
 def create_ai_shift_draft(df, staff_names, year, month):
     """
@@ -2960,7 +3002,7 @@ def create_ai_shift_draft(df, staff_names, year, month):
             if not candidates:
                 reason_text = "日勤・夜勤・合計上限、希望休、有休、休み、その他、夜勤翌日の明け重複を考慮した結果、候補なし"
                 if reject_reasons:
-                    reason_text += "（" + " / ".join(reject_reasons[:6]) + (" ほか" if len(reject_reasons) > 6 else "") + "）"
+                    reason_text += "（" + summarize_ai_reject_reasons(reject_reasons) + "）"
                 rows.append({
                     "日付": target_date,
                     "勤務": need_kind,

@@ -30,7 +30,10 @@ except ImportError:
 
 from config import (
     KOT_DAY_PATTERN_CODE_KEY,
+    KOT_HOPE_REST_LEAVE_NAME_KEY,
     KOT_NIGHT_PATTERN_CODE_KEY,
+    KOT_PAID_LEAVE_NAME_KEY,
+    KOT_REST_LEAVE_NAME_KEY,
     PDF_FONT_GOTHIC,
     PDF_FONT_MINCHO,
 )
@@ -561,9 +564,9 @@ def make_staff_shift_pdf(
     c = canvas.Canvas(buffer, pagesize=page_size)
     width, height = page_size
 
-    margin = 16
-    title_y = height - 26
-    c.setFont(PDF_FONT_GOTHIC, 14)
+    margin = 14
+    title_y = height - 24
+    c.setFont(PDF_FONT_GOTHIC, 14.5)
     c.drawString(margin, title_y, f"従業員勤務表　{int(year)}年{int(month)}月")
     c.setFont(PDF_FONT_GOTHIC, 8)
     status_text = "確定" if status.get("is_confirmed") else "作成中"
@@ -571,30 +574,39 @@ def make_staff_shift_pdf(
 
     last_day = calendar.monthrange(int(year), int(month))[1]
     table_x = margin
-    table_y_top = height - 46
-    staff_w = 54
+    table_y_top = height - 48
+    staff_w = 58
     summary_w = 22
     day_w = (width - margin * 2 - staff_w - summary_w * 7) / last_day
-    row_h = 15
+    row_h = 15.2
 
     def draw_shift_table_vertical_lines(y0, y1):
-        """日付ごとの縦罫線を細く引く。"""
+        """日付ごとの縦罫線を見やすく引く。週境界と集計欄は少し強調する。"""
         old_stroke = getattr(c, "_strokeColorObj", colors.black)
         old_width = getattr(c, "_lineWidth", 1)
-        c.setStrokeColor(colors.HexColor("#b8b8b8"))
-        c.setLineWidth(0.25)
 
         # 氏名欄と日付欄の境界
         x_line = table_x + staff_w
+        c.setStrokeColor(colors.HexColor("#8f8f8f"))
+        c.setLineWidth(0.55)
         c.line(x_line, y0, x_line, y1)
 
         # 日付欄の縦罫線
         for d in range(1, last_day + 1):
             x_line = table_x + staff_w + day_w * d
+            if d % 7 == 0:
+                c.setStrokeColor(colors.HexColor("#8f8f8f"))
+                c.setLineWidth(0.45)
+            else:
+                c.setStrokeColor(colors.HexColor("#c9c9c9"))
+                c.setLineWidth(0.25)
             c.line(x_line, y0, x_line, y1)
 
         # 集計欄の縦罫線
         summary_start = table_x + staff_w + day_w * last_day
+        c.setStrokeColor(colors.HexColor("#8f8f8f"))
+        c.setLineWidth(0.45)
+        c.line(summary_start, y0, summary_start, y1)
         for i in range(1, 7):
             x_line = summary_start + summary_w * i
             c.line(x_line, y0, x_line, y1)
@@ -603,7 +615,7 @@ def make_staff_shift_pdf(
         c.setLineWidth(old_width)
 
     # 凡例
-    c.setFont(PDF_FONT_GOTHIC, 7)
+    c.setFont(PDF_FONT_GOTHIC, 7.2)
     c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　※休みは日別セルには表示しません")
 
     # ヘッダ
@@ -611,7 +623,7 @@ def make_staff_shift_pdf(
     c.rect(table_x, table_y_top - row_h, width - margin * 2, row_h, fill=1, stroke=1)
     draw_shift_table_vertical_lines(table_y_top - row_h, table_y_top)
     c.setFillColor(colors.black)
-    c.setFont(PDF_FONT_GOTHIC, 6.2)
+    c.setFont(PDF_FONT_GOTHIC, 6.4)
     c.drawString(table_x + 3, table_y_top - 10, "氏名")
     x = table_x + staff_w
     for d in range(1, last_day + 1):
@@ -626,7 +638,7 @@ def make_staff_shift_pdf(
         c.setFont(PDF_FONT_GOTHIC, 10)
         c.drawString(margin, y - 24, "この月のシフトは登録されていません。")
     else:
-        c.setFont(PDF_FONT_GOTHIC, 5.8)
+        c.setFont(PDF_FONT_GOTHIC, 6.0)
         for _, row in matrix.iterrows():
             if y < 58:
                 c.showPage()
@@ -647,21 +659,32 @@ def make_staff_shift_pdf(
                 c.drawCentredString(x + summary_w / 2, y + 4, str(row.get(key, "")))
                 x += summary_w
 
-    # 不足・警告を下部表示
-    y -= 18
-    c.setFont(PDF_FONT_GOTHIC, 7)
+    # 不足・警告を下部表示。長い場合は右端で省略して、PDF外にはみ出さないようにする。
+    y -= 16
+    c.setFont(PDF_FONT_GOTHIC, 7.2)
+    warning_width = width - margin * 2
+
+    def draw_warning_line(label, text, y_pos):
+        c.setFillColor(colors.HexColor("#b00020"))
+        draw_single_line(c, f"{label}: {text}", margin, y_pos, warning_width, PDF_FONT_GOTHIC, 7.2, color=colors.HexColor("#b00020"))
+        return y_pos - 9.5
+
     ng = shortage[shortage["状態"] != "OK"]
     if not ng.empty:
-        c.setFillColor(colors.HexColor("#8a2d18"))
-        c.drawString(margin, y, "不足日: " + " / ".join([f"{str(r['日付'])[-2:]}日 {r['不足']}" for _, r in ng.head(10).iterrows()]))
-        y -= 10
+        warning_text = " / ".join([f"{str(r['日付'])[-2:]}日 {r['不足']}" for _, r in ng.head(12).iterrows()])
+        if len(ng) > 12:
+            warning_text += f" / ほか{len(ng) - 12}件"
+        y = draw_warning_line("不足日", warning_text, y)
     if checks is not None and not checks.empty:
-        c.setFillColor(colors.HexColor("#8a2d18"))
-        c.drawString(margin, y, "確認事項: " + " / ".join([f"{r['日付']} {r['職員名']} {r['種類']}" for _, r in checks.head(6).iterrows()]))
-        y -= 10
+        warning_text = " / ".join([f"{r['日付']} {r['職員名']} {r['種類']}" for _, r in checks.head(8).iterrows()])
+        if len(checks) > 8:
+            warning_text += f" / ほか{len(checks) - 8}件"
+        y = draw_warning_line("確認事項", warning_text, y)
     if limit_checks is not None and not limit_checks.empty:
-        c.setFillColor(colors.HexColor("#8a2d18"))
-        c.drawString(margin, y, "上限確認: " + " / ".join([f"{r['職員名']} {r['種類']}" for _, r in limit_checks.head(6).iterrows()]))
+        warning_text = " / ".join([f"{r['職員名']} {r['種類']}" for _, r in limit_checks.head(8).iterrows()])
+        if len(limit_checks) > 8:
+            warning_text += f" / ほか{len(limit_checks) - 8}件"
+        y = draw_warning_line("上限確認", warning_text, y)
     c.setFillColor(colors.black)
 
     c.save()
@@ -702,6 +725,17 @@ def kot_break_minutes(shift_kind):
     return ""
 
 
+def kot_full_day_leave_name(shift_kind):
+    """KING OF TIME CSVの全日休暇名。施設設定に合わせてsecrets/envで上書きできる。"""
+    if str(shift_kind) == "休み":
+        return get_secret_or_env(KOT_REST_LEAVE_NAME_KEY, default="公休")
+    if str(shift_kind) == "有休":
+        return get_secret_or_env(KOT_PAID_LEAVE_NAME_KEY, default="有休")
+    if str(shift_kind) == "希望休":
+        return get_secret_or_env(KOT_HOPE_REST_LEAVE_NAME_KEY, default="希望休")
+    return ""
+
+
 def make_king_of_time_shift_csv(
     year,
     month,
@@ -735,11 +769,6 @@ def make_king_of_time_shift_csv(
         if not staff_name:
             continue
 
-        # 夜勤明け・休みはKING OF TIMEへ勤務予定として登録しない。
-        # 希望休・その他は備考行として出す。不要な場合はCSV上で削除できる。
-        if shift_kind in ["夜勤明け", "休み"]:
-            continue
-
         shift_date = str(r.get("shift_date") or "").strip()
         try:
             work_date = pd.to_datetime(shift_date).date().strftime("%Y%m%d")
@@ -769,10 +798,11 @@ def make_king_of_time_shift_csv(
             start_plan = kot_time_value(stime, next_day=False)
             end_plan = kot_time_value(etime, next_day=next_day)
             break_minutes = kot_break_minutes(shift_kind)
-        elif shift_kind == "有休":
-            full_day_leave = "有休"
-        elif shift_kind == "希望休":
-            memo_parts.append("希望休（ひだまり帳）")
+        elif shift_kind in ["休み", "有休", "希望休"]:
+            full_day_leave = kot_full_day_leave_name(shift_kind)
+            memo_parts.append(f"{shift_kind}（ひだまり帳）")
+        elif shift_kind == "夜勤明け":
+            memo_parts.append("夜勤明け（ひだまり帳）")
         elif shift_kind == "その他":
             memo_parts.append("その他（ひだまり帳）")
         else:
