@@ -335,7 +335,8 @@ def render_event_button_list(df, empty_message="予定はありません。", in
     for i, (_, ev) in enumerate(df.iterrows()):
         mark = get_category_mark(ev["category"])
         label_date = str(ev["event_date"])[5:] if include_date and ev["event_date"] else ""
-        label_time = f" {ev['start_time']}" if ev["start_time"] else ""
+        start_text = format_time_for_display(ev.get("start_time"))
+        label_time = f" {start_text}" if start_text else ""
         label_user = f"／{ev['user_name']}" if ev["user_name"] else ""
         important = "⚠️ " if int(ev["important"] or 0) == 1 else ""
         label = f"{label_date}{label_time} {important}{mark}{ev['title']}{label_user}".strip()
@@ -357,6 +358,32 @@ def first_line_text(text, max_len=42):
     if len(first) > max_len:
         return first[:max_len] + "…"
     return first
+
+
+def format_time_for_display(value):
+    """DBやDataFrameから来た時刻値を画面表示用の文字列に安全変換する。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if value == "":
+        return ""
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%H:%M")
+        except Exception:
+            return str(value)
+    return str(value).strip()
+
+
+def format_time_range_for_display(start_value, end_value, empty_text="時刻未設定", separator=" - "):
+    start_text = format_time_for_display(start_value)
+    end_text = format_time_for_display(end_value)
+    time_parts = [x for x in [start_text, end_text] if x]
+    return separator.join(time_parts) if time_parts else empty_text
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -381,7 +408,7 @@ def render_today_board(df):
     for _, ev in df.iterrows():
         important = int(ev["important"] or 0) == 1
         card_class = "today-board-card today-board-card-important" if important else "today-board-card"
-        time_text = ev["start_time"] if ev["start_time"] else "時間未定"
+        time_text = format_time_for_display(ev.get("start_time")) or "時間未定"
         mark = get_category_mark(ev["category"])
         category = html_escape(ev["category"])
         title = html_escape(ev["title"])
@@ -467,7 +494,7 @@ def render_event_detail_panel():
         st.write(f"**利用者**：{ev['user_name'] or ''}")
         st.caption(f"利用者ID：{ev['user_id'] or ''}")
     with c2:
-        st.write(f"**時間**：{ev['start_time'] or ''} 〜 {ev['end_time'] or ''}")
+        st.write(f"**時間**：{format_time_range_for_display(ev.get('start_time'), ev.get('end_time'), empty_text='')}")
     with c3:
         st.write(f"**担当**：{ev['staff_name'] or ''}")
 
@@ -593,7 +620,7 @@ def render_saved_event_confirmation(event_id=None):
         st.caption(f"利用者ID：{ev['user_id'] or ''}")
         st.write(f"**担当**：{ev['staff_name'] or ''}")
     with d3:
-        st.write(f"**時間**：{ev['start_time'] or ''} 〜 {ev['end_time'] or ''}")
+        st.write(f"**時間**：{format_time_range_for_display(ev.get('start_time'), ev.get('end_time'), empty_text='')}")
         st.write(f"**重要**：{'あり' if int(ev['important'] or 0) == 1 else 'なし'}")
         st.caption(f"登録日時：{ev['created_at']}")
 
@@ -657,7 +684,7 @@ def get_weekday_label(target_date):
 
 def format_event_for_calendar(event):
     mark = get_category_mark(event.get("category", ""))
-    time_text = str(event.get("start_time") or "").strip()
+    time_text = format_time_for_display(event.get("start_time"))
     title = str(event.get("title") or "").strip()
     category = str(event.get("category") or "").strip()
     important = "!" if int(event.get("important") or 0) == 1 else ""
@@ -765,7 +792,7 @@ def render_selected_day_events(selected_date):
     for _, ev in df.iterrows():
         event_id = int(ev["id"])
         important = "重要 " if int(ev.get("important") or 0) == 1 else ""
-        time_text = " - ".join([x for x in [ev.get("start_time"), ev.get("end_time")] if x]) or "時刻未設定"
+        time_text = format_time_range_for_display(ev.get("start_time"), ev.get("end_time"))
         title = html_escape(ev.get("title") or "")
         category = html_escape(ev.get("category") or "")
         memo = html_escape(ev.get("memo") or "")
@@ -860,8 +887,8 @@ def render_event_form(selected_date, editing_event_id=None):
                 key=f"{form_key}_category",
             )
         with c2:
-            start_time = st.text_input("開始時刻", value=str(editing_event.get("start_time") or "") if editing_event is not None else "", placeholder="例：10:00")
-            end_time = st.text_input("終了時刻", value=str(editing_event.get("end_time") or "") if editing_event is not None else "", placeholder="例：11:00")
+            start_time = st.text_input("開始時刻", value=format_time_for_display(editing_event.get("start_time")) if editing_event is not None else "", placeholder="例：10:00")
+            end_time = st.text_input("終了時刻", value=format_time_for_display(editing_event.get("end_time")) if editing_event is not None else "", placeholder="例：11:00")
         with c3:
             user_name = st.selectbox("利用者", users, index=user_index, key=f"{form_key}_user")
             staff_name = st.selectbox("担当職員", staff, index=staff_index, key=f"{form_key}_staff")
@@ -1313,8 +1340,8 @@ def page_event_manage():
                 index=category_options.index(target["category"]) if target["category"] in category_options else 0
             )
         with c2:
-            new_start_time = st.text_input("開始時刻", value=target["start_time"] or "")
-            new_end_time = st.text_input("終了時刻", value=target["end_time"] or "")
+            new_start_time = st.text_input("開始時刻", value=format_time_for_display(target.get("start_time")))
+            new_end_time = st.text_input("終了時刻", value=format_time_for_display(target.get("end_time")))
         with c3:
             current_user_label = ""
             if target["user_name"] and target["user_id"]:
@@ -3221,7 +3248,7 @@ def get_shift_candidates_for_event(event_row, shift_df):
         rows.append({
             "職員名": staff_name,
             "シフト": shift_kind,
-            "時間": f"{r['start_time'] or ''}〜{r['end_time'] or ''}{'翌' if int(r['next_day'] or 0) else ''}",
+            "時間": f"{format_time_for_display(r.get('start_time'))}〜{format_time_for_display(r.get('end_time'))}{'翌' if int(r['next_day'] or 0) else ''}",
             "スコア": int(score),
             "理由": " / ".join(reason),
         })
@@ -4369,8 +4396,8 @@ def page_shift_manager():
                 u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(current_kind) if current_kind in SHIFT_KINDS else 0)
             with c4:
                 u_next = st.checkbox("終了は翌日", value=bool(target["next_day"]))
-            u_start = st.text_input("開始時刻", value=target["start_time"] or "")
-            u_end = st.text_input("終了時刻", value=target["end_time"] or "")
+            u_start = st.text_input("開始時刻", value=format_time_for_display(target.get("start_time")))
+            u_end = st.text_input("終了時刻", value=format_time_for_display(target.get("end_time")))
             u_memo = st.text_input("メモ", value=target["memo"] or "")
             c_update, c_delete = st.columns(2)
             with c_update:
@@ -4409,7 +4436,8 @@ def page_shift_manager():
     options = {}
     for _, ev in events_df.iterrows():
         current_staff = ev["staff_name"] if ev.get("staff_name") else "未担当"
-        label = f"ID:{ev['id']}｜{ev['event_date']}｜{ev.get('start_time') or ''}｜{ev['title']}｜担当:{current_staff}"
+        start_text = format_time_for_display(ev.get("start_time"))
+        label = f"ID:{ev['id']}｜{ev['event_date']}｜{start_text}｜{ev['title']}｜担当:{current_staff}"
         options[label] = int(ev["id"])
 
     if options:
