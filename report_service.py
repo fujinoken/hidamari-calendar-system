@@ -578,8 +578,10 @@ def make_staff_shift_pdf(
     table_x = margin
     table_y_top = height - 48
     staff_w = 58
-    summary_w = 22
-    day_w = (width - margin * 2 - staff_w - summary_w * 7) / last_day
+    summary_labels = ["日", "管", "夜", "明", "休", "希", "有", "他", "計"]
+    summary_keys = ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計"]
+    summary_w = 18
+    day_w = (width - margin * 2 - staff_w - summary_w * len(summary_labels)) / last_day
     row_h = 15.2
 
     def draw_shift_table_vertical_lines(y0, y1):
@@ -609,7 +611,7 @@ def make_staff_shift_pdf(
         c.setStrokeColor(colors.HexColor("#8f8f8f"))
         c.setLineWidth(0.45)
         c.line(summary_start, y0, summary_start, y1)
-        for i in range(1, 7):
+        for i in range(1, len(summary_labels)):
             x_line = summary_start + summary_w * i
             c.line(x_line, y0, x_line, y1)
 
@@ -618,7 +620,7 @@ def make_staff_shift_pdf(
 
     # 凡例
     c.setFont(PDF_FONT_GOTHIC, 7.2)
-    c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　※休みは日別セルには表示しません")
+    c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　管=管理業務 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　他=その他")
 
     # ヘッダ
     c.setFillColor(colors.HexColor("#f3eee6"))
@@ -631,7 +633,7 @@ def make_staff_shift_pdf(
     for d in range(1, last_day + 1):
         c.drawCentredString(x + day_w / 2, table_y_top - 10, str(d))
         x += day_w
-    for label in ["日", "夜", "明", "休", "希", "有", "計"]:
+    for label in summary_labels:
         c.drawCentredString(x + summary_w / 2, table_y_top - 10, label)
         x += summary_w
 
@@ -657,7 +659,7 @@ def make_staff_shift_pdf(
                 val = str(row[str(d)] or "")
                 c.drawCentredString(x + day_w / 2, y + 4, val)
                 x += day_w
-            for key in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計"]:
+            for key in summary_keys:
                 c.drawCentredString(x + summary_w / 2, y + 4, str(row.get(key, "")))
                 x += summary_w
 
@@ -699,6 +701,7 @@ def get_kot_pattern_code(shift_kind):
     """KING OF TIME用パターンコード。secrets/envで上書き可能。"""
     key_map = {
         "日勤": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
+        "管理業務": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
         "夜勤": (KOT_NIGHT_PATTERN_CODE_KEY, "夜勤"),
     }
     key, default = key_map.get(str(shift_kind), ("", str(shift_kind or "")))
@@ -720,7 +723,7 @@ def kot_time_value(time_text, next_day=False):
 
 def kot_break_minutes(shift_kind):
     """KING OF TIME CSV用の休憩予定時間。必要に応じて施設運用に合わせて変更する。"""
-    if str(shift_kind) == "日勤":
+    if str(shift_kind) in ["日勤", "管理業務"]:
         return 60
     if str(shift_kind) == "夜勤":
         return 120
@@ -786,12 +789,12 @@ def make_king_of_time_shift_csv(
         memo_parts = []
         original_memo = str(r.get("memo") or "").strip()
 
-        if shift_kind in ["日勤", "夜勤"]:
+        if shift_kind in ["日勤", "管理業務", "夜勤"]:
             pattern_code = get_kot_pattern_code(shift_kind)
             stime = str(r.get("start_time") or "").strip()
             etime = str(r.get("end_time") or "").strip()
             if not stime or not etime:
-                default_start, default_end, default_next_day = default_shift_times(shift_kind)
+                default_start, default_end, default_next_day = default_shift_times("日勤" if shift_kind == "管理業務" else shift_kind)
                 stime = stime or default_start
                 etime = etime or default_end
                 next_day = bool(default_next_day)
@@ -800,6 +803,8 @@ def make_king_of_time_shift_csv(
             start_plan = kot_time_value(stime, next_day=False)
             end_plan = kot_time_value(etime, next_day=next_day)
             break_minutes = kot_break_minutes(shift_kind)
+            if shift_kind == "管理業務":
+                memo_parts.append("管理業務")
         elif shift_kind in ["休み", "有休", "希望休"]:
             full_day_leave = kot_full_day_leave_name(shift_kind)
             memo_parts.append(f"{shift_kind}（ひだまり帳）")
@@ -884,7 +889,7 @@ def make_staff_shift_excel(
     ws.cell(2, 6).value = today_jst().strftime("%Y-%m-%d")
 
     ws.cell(3, 1).value = "凡例"
-    ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 休みは日別セルには表示しません"
+    ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 管=管理業務 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 他=その他 / 休みは日別セルには表示しません"
     ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
 
     start_row = 5
@@ -906,7 +911,7 @@ def make_staff_shift_excel(
                     cell.fill = weekend_sun_fill
                 elif weekday == 5:
                     cell.fill = weekend_sat_fill
-            elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+            elif col_name in ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]:
                 cell.fill = summary_fill
 
         for row_idx, (_, row) in enumerate(matrix.iterrows(), start=start_row + 1):
@@ -925,7 +930,7 @@ def make_staff_shift_excel(
                         cell.fill = PatternFill("solid", fgColor="FFF2CC")
                     elif weekday == 5:
                         cell.fill = PatternFill("solid", fgColor="EAF3F8")
-                elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+                elif col_name in ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]:
                     cell.fill = PatternFill("solid", fgColor="F2F8EE")
 
         ws.freeze_panes = "B6"
