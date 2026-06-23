@@ -21,7 +21,7 @@ CATEGORY_MARK = {
     "その他": "・",
 }
 
-SHIFT_KINDS = ["日勤", "管理業務", "夜勤", "夜勤明け", "休み", "希望休", "有休", "その他"]
+SHIFT_KINDS = ["日勤", "管", "夜勤", "夜勤明け", "休み", "希望休", "有休", "その他"]
 SHIFT_EDITOR_OPTIONS = ["", "日", "管", "夜", "明", "希", "有", "他"]
 
 PDF_FONT_GOTHIC = "HeiseiKakuGo-W5"
