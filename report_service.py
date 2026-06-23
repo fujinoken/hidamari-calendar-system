@@ -178,7 +178,9 @@ def calendar_events_df(year, month):
     last_day = calendar.monthrange(int(year), int(month))[1]
     end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
     return fetch_df("""
-        SELECT *
+        SELECT
+            id, event_date, category, title, user_id, user_name, staff_name,
+            start_time, end_time, memo, important, created_at, updated_at
         FROM events
         WHERE event_date BETWEEN ? AND ?
         ORDER BY event_date,

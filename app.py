@@ -15,6 +15,7 @@ Python + Streamlit + PostgreSQL
 import calendar
 import re
 import hashlib
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -52,6 +53,8 @@ from report_service import (
 from storage_service import (
     REQUESTS_AVAILABLE,
     check_storage_bucket_access,
+    clear_event_files_cache,
+    clear_event_photos_cache,
     delete_saved_file,
     get_event_files,
     get_event_photos,
@@ -87,6 +90,73 @@ def count_query(sql, params=()):
         return 0
 
 
+
+
+EVENT_LIST_COLUMNS = """
+    id, event_date, category, title, user_id, user_name, staff_name,
+    start_time, end_time, important, created_at, updated_at
+"""
+
+EVENT_TODAY_COLUMNS = """
+    id, event_date, category, title, user_id, user_name, staff_name,
+    start_time, end_time, memo, important, created_at, updated_at
+"""
+
+EVENT_DETAIL_COLUMNS = """
+    id, event_date, category, title, user_id, user_name, staff_name,
+    start_time, end_time, memo, important, created_at, updated_at
+"""
+
+USER_COLUMNS = "id, user_id, user_name, kana, room_no, note, is_active, created_at"
+STAFF_COLUMNS = "id, staff_name, staff_code, role, is_active, created_at"
+CATEGORY_COLUMNS = "id, category_name, mark, sort_order, is_active, created_at, updated_at"
+SHIFT_COLUMNS = """
+    id, shift_date, staff_name, shift_kind, start_time, end_time,
+    next_day, memo, created_at, updated_at
+"""
+
+
+def note_perf(label, started_at):
+    elapsed = time.perf_counter() - started_at
+    st.session_state.setdefault("perf_log", [])
+    st.session_state["perf_log"] = (
+        [{"label": label, "sec": elapsed, "at": datetime.now().strftime("%H:%M:%S")}]
+        + st.session_state["perf_log"]
+    )[:8]
+    return elapsed
+
+
+def show_perf_log():
+    rows = st.session_state.get("perf_log", [])
+    if not rows:
+        return
+    with st.sidebar.expander("処理時間", expanded=False):
+        for row in rows:
+            st.caption(f"{row['at']} {row['label']}: {row['sec']:.2f}s")
+
+
+def clear_event_caches():
+    for fn in (monthly_events, events_by_date, get_event_by_id, get_attachment_counts):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def clear_master_caches():
+    for fn in (get_active_users, get_active_staff, get_staff_code_map, get_categories, get_category_mark_map):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def clear_shift_caches():
+    for fn in (get_shift_month_status, get_staff_shifts_month, get_staff_shift_limits):
+        try:
+            fn.clear()
+        except Exception:
+            pass
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -212,14 +282,15 @@ def get_category_mark(category_name):
     return mark_map.get(category_name, CATEGORY_MARK.get(category_name, "・"))
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def monthly_events(year, month):
     start = f"{year}-{month:02d}-01"
     last_day = calendar.monthrange(year, month)[1]
     end = f"{year}-{month:02d}-{last_day:02d}"
 
-    df = fetch_df("""
-        SELECT * FROM events
+    df = fetch_df(f"""
+        SELECT {EVENT_LIST_COLUMNS}
+        FROM events
         WHERE event_date BETWEEN ? AND ?
         ORDER BY event_date, start_time, category, id
     """, (start, end))
@@ -231,13 +302,13 @@ def monthly_events(year, month):
 
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def events_by_date(target_date):
     """指定日の予定一覧を取得する。"""
     if hasattr(target_date, "strftime"):
         target_date = target_date.strftime("%Y-%m-%d")
-    return fetch_df("""
-        SELECT *
+    return fetch_df(f"""
+        SELECT {EVENT_TODAY_COLUMNS}
         FROM events
         WHERE event_date = ?
         ORDER BY
@@ -266,7 +337,6 @@ def render_event_button_list(df, empty_message="予定はありません。", in
         with cols[i % 3]:
             if st.button(label, key=f"event_btn_{ev['id']}", use_container_width=True):
                 set_selected_event(int(ev["id"]))
-                st.rerun()
 
 
 
@@ -343,7 +413,6 @@ def render_today_board(df):
 
         if st.button("詳細を見る", key=f"today_detail_{ev['id']}", use_container_width=True):
             set_selected_event(int(ev["id"]))
-            st.rerun()
 
 
 def html_escape(text):
@@ -364,11 +433,11 @@ def set_selected_event(event_id):
     st.session_state["selected_calendar_event_id"] = int(event_id)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_event_by_id(event_id):
     if not event_id:
         return pd.DataFrame()
-    return fetch_df("SELECT * FROM events WHERE id=? LIMIT 1", (int(event_id),))
+    return fetch_df(f"SELECT {EVENT_DETAIL_COLUMNS} FROM events WHERE id=? LIMIT 1", (int(event_id),))
 
 
 def render_event_detail_panel():
@@ -756,6 +825,7 @@ def page_event_register():
         ))
         photo_saved, photo_failed = save_uploaded_photos(event_id, uploaded_photos, photo_memo)
         file_saved, file_failed = save_uploaded_files(event_id, uploaded_files, file_memo)
+        clear_event_caches()
 
         st.session_state["selected_calendar_event_id"] = int(event_id)
         st.session_state["last_saved_event_id"] = int(event_id)
@@ -798,8 +868,9 @@ def page_event_manage():
 
     keyword = st.text_input("キーワード検索", placeholder="タイトル・メモ・利用者名・職員名")
 
-    query = """
-        SELECT * FROM events
+    query = f"""
+        SELECT {EVENT_TODAY_COLUMNS}
+        FROM events
         WHERE event_date BETWEEN ? AND ?
     """
     params = [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]
@@ -847,6 +918,8 @@ def page_event_manage():
                 if st.button(f"この写真を削除 ID:{p['id']}", key=f"delete_photo_{p['id']}"):
                     delete_saved_file(p["file_path"])
                     execute("DELETE FROM event_photos WHERE id=?", (int(p["id"]),))
+                    clear_event_photos_cache()
+                    clear_event_caches()
                     st.success("写真メモを削除しました。画面を再読み込みしてください。")
 
     with st.expander("この予定に写真メモを追加する"):
@@ -859,6 +932,8 @@ def page_event_manage():
         add_photo_memo = st.text_input("追加写真メモ", key=f"add_photo_memo_{selected_id}")
         if st.button("写真メモを追加", key=f"add_photo_btn_{selected_id}"):
             saved, failed = save_uploaded_photos(selected_id, add_photos, add_photo_memo)
+            if saved:
+                clear_event_caches()
             if failed:
                 st.warning(f"写真メモ：{saved}件保存、{failed}件失敗しました。")
             else:
@@ -887,6 +962,8 @@ def page_event_manage():
                 if st.button(f"削除 ID:{frow['id']}", key=f"delete_file_{frow['id']}"):
                     delete_saved_file(frow["file_path"])
                     execute("DELETE FROM event_files WHERE id=?", (int(frow["id"]),))
+                    clear_event_files_cache()
+                    clear_event_caches()
                     st.success("ファイルを削除しました。画面を再読み込みしてください。")
 
     with st.expander("この予定にExcel・書類ファイルを追加する"):
@@ -899,6 +976,8 @@ def page_event_manage():
         add_file_memo = st.text_input("追加ファイルメモ", key=f"add_file_memo_{selected_id}")
         if st.button("Excel・書類ファイルを追加", key=f"add_file_btn_{selected_id}"):
             saved, failed = save_uploaded_files(selected_id, add_files, add_file_memo)
+            if saved:
+                clear_event_caches()
             if failed:
                 st.warning(f"Excel・書類ファイル：{saved}件保存、{failed}件失敗しました。")
             else:
@@ -976,6 +1055,7 @@ def page_event_manage():
             now_text(),
             int(selected_id),
         ))
+        clear_event_caches()
         st.success("予定を更新しました。画面を再読み込みしてください。")
 
     if delete_btn:
@@ -988,6 +1068,9 @@ def page_event_manage():
         execute("DELETE FROM event_photos WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM event_files WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM events WHERE id=?", (int(selected_id),))
+        clear_event_photos_cache()
+        clear_event_files_cache()
+        clear_event_caches()
         st.warning("予定と紐づく写真メモ・Excelファイルを削除しました。画面を再読み込みしてください。")
 
 
@@ -1023,6 +1106,7 @@ def page_category_master():
                     now_text(),
                     now_text(),
                 ))
+                clear_master_caches()
                 st.success("カテゴリを追加しました。")
             except Exception as e:
                 st.error(f"追加できませんでした。同じカテゴリ名がある可能性があります：{e}")
@@ -1082,6 +1166,7 @@ def page_category_master():
                     now_text(),
                     int(selected_id),
                 ))
+                clear_master_caches()
                 st.success("カテゴリを更新しました。画面を再読み込みしてください。")
             except Exception as e:
                 st.error(f"更新できませんでした：{e}")
@@ -1092,9 +1177,11 @@ def page_category_master():
         count = int(used.iloc[0]["cnt"]) if not used.empty else 0
         if count > 0:
             execute("UPDATE categories SET is_active=0, updated_at=? WHERE id=?", (now_text(), int(selected_id)))
+            clear_master_caches()
             st.warning(f"このカテゴリは既存予定で {count} 件使われているため、削除せず非表示にしました。")
         else:
             execute("DELETE FROM categories WHERE id=?", (int(selected_id),))
+            clear_master_caches()
             st.warning("カテゴリを削除しました。画面を再読み込みしてください。")
 
 
@@ -1128,11 +1215,12 @@ def page_master_users():
                     INSERT INTO users (user_id, user_name, kana, room_no, note, is_active, created_at)
                     VALUES (?, ?, ?, ?, ?, 1, ?)
                 """, (user_id_value, user_name.strip(), kana.strip(), room_no.strip(), note.strip(), now_text()))
+                clear_master_caches()
                 st.success("利用者を追加しました。")
             except DB_INTEGRITY_ERROR:
                 st.error("同じ利用者名がすでに登録されています。")
 
-    df = fetch_df("SELECT * FROM users ORDER BY is_active DESC, user_name")
+    df = fetch_df(f"SELECT {USER_COLUMNS} FROM users ORDER BY is_active DESC, user_name")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if not df.empty:
@@ -1141,6 +1229,7 @@ def page_master_users():
         new_active = st.radio("状態", [1, 0], index=0 if target["is_active"] == 1 else 1, format_func=lambda x: "有効" if x == 1 else "無効")
         if st.button("利用者状態を更新"):
             execute("UPDATE users SET is_active=? WHERE id=?", (int(new_active), int(selected)))
+            clear_master_caches()
             st.success("状態を更新しました。")
 
 
@@ -1178,6 +1267,7 @@ def page_master_staff():
                         INSERT INTO staff (staff_name, staff_code, role, is_active, created_at)
                         VALUES (?, ?, ?, 1, ?)
                     """, (clean_staff_name, clean_staff_code or None, role.strip(), now_text()))
+                    clear_master_caches()
                     st.success("職員を追加しました。")
                 except DB_INTEGRITY_ERROR:
                     st.error("同じ職員名がすでに登録されています。")
@@ -1239,8 +1329,8 @@ def page_master_staff():
                         int(new_active),
                         int(selected),
                     ))
+                    clear_master_caches()
                     st.success("職員情報を更新しました。")
-                    st.rerun()
 
 
 
@@ -1260,8 +1350,7 @@ def page_photo_notes():
             e.title,
             e.user_id,
             e.user_name,
-            e.staff_name,
-            e.memo
+            e.staff_name
         FROM event_photos p
         JOIN events e ON p.event_id = e.id
         ORDER BY e.event_date DESC, p.id DESC
@@ -1279,8 +1368,7 @@ def page_photo_notes():
             df["user_id"].fillna("").str.contains(kw, case=False, na=False) |
             df["user_name"].fillna("").str.contains(kw, case=False, na=False) |
             df["staff_name"].fillna("").str.contains(kw, case=False, na=False) |
-            df["photo_memo"].fillna("").str.contains(kw, case=False, na=False) |
-            df["memo"].fillna("").str.contains(kw, case=False, na=False)
+            df["photo_memo"].fillna("").str.contains(kw, case=False, na=False)
         )
         df = df[mask]
 
@@ -1288,24 +1376,26 @@ def page_photo_notes():
         st.info("該当する写真メモはありません。")
         return
 
-    for _, row in df.iterrows():
-        st.markdown("---")
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            render_saved_image(
-                row["file_path"],
-                use_container_width=True,
-            )
-        with c2:
-            st.write(f"**{row['event_date']}｜{row['category']}｜{row['title']}**")
-            if row["user_name"]:
-                st.write(f"利用者：{row['user_name']}（ID:{row['user_id'] or ''}）")
-            if row["staff_name"]:
-                st.write(f"担当：{row['staff_name']}")
-            st.write(f"写真メモ：{row['photo_memo'] or ''}")
-            if row["memo"]:
-                st.caption(f"予定メモ：{row['memo']}")
-            st.caption(f"写真登録：{row['photo_created_at']}")
+    show_df = df.drop(columns=["file_path"], errors="ignore")
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    selected_photo_id = st.selectbox("表示する写真ID", df["photo_id"].tolist())
+    row = df[df["photo_id"] == selected_photo_id].iloc[0]
+    st.markdown("---")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        render_saved_image(
+            row["file_path"],
+            use_container_width=True,
+        )
+    with c2:
+        st.write(f"**{row['event_date']}｜{row['category']}｜{row['title']}**")
+        if row["user_name"]:
+            st.write(f"利用者：{row['user_name']}（ID:{row['user_id'] or ''}）")
+        if row["staff_name"]:
+            st.write(f"担当：{row['staff_name']}")
+        st.write(f"写真メモ：{row['photo_memo'] or ''}")
+        st.caption(f"写真登録：{row['photo_created_at']}")
 
 
 
@@ -1326,8 +1416,7 @@ def page_attached_files():
             e.title,
             e.user_id,
             e.user_name,
-            e.staff_name,
-            e.memo
+            e.staff_name
         FROM event_files f
         JOIN events e ON f.event_id = e.id
         ORDER BY e.event_date DESC, f.id DESC
@@ -1346,8 +1435,7 @@ def page_attached_files():
             df["user_name"].fillna("").str.contains(kw, case=False, na=False) |
             df["staff_name"].fillna("").str.contains(kw, case=False, na=False) |
             df["file_name"].fillna("").str.contains(kw, case=False, na=False) |
-            df["file_memo"].fillna("").str.contains(kw, case=False, na=False) |
-            df["memo"].fillna("").str.contains(kw, case=False, na=False)
+            df["file_memo"].fillna("").str.contains(kw, case=False, na=False)
         )
         df = df[mask]
 
@@ -1355,23 +1443,27 @@ def page_attached_files():
         st.info("該当するファイルはありません。")
         return
 
-    for _, row in df.iterrows():
-        st.markdown("---")
-        st.write(f"📎 **{row['file_name']}**")
-        st.write(f"{row['event_date']}｜{row['category']}｜{row['title']}")
-        if row["user_name"]:
-            st.write(f"利用者：{row['user_name']}")
-        if row["staff_name"]:
-            st.write(f"担当：{row['staff_name']}")
-        st.write(f"ファイルメモ：{row['file_memo'] or ''}")
-        st.caption(f"登録：{row['file_created_at']}")
+    show_df = df.drop(columns=["file_path"], errors="ignore")
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
 
-        render_saved_download_button(
-            "ダウンロード",
-            row["file_path"],
-            row["file_name"],
-            key=f"file_list_download_{row['file_id']}",
-        )
+    selected_file_id = st.selectbox("ダウンロードするファイルID", df["file_id"].tolist())
+    row = df[df["file_id"] == selected_file_id].iloc[0]
+    st.markdown("---")
+    st.write(f"📎 **{row['file_name']}**")
+    st.write(f"{row['event_date']}｜{row['category']}｜{row['title']}")
+    if row["user_name"]:
+        st.write(f"利用者：{row['user_name']}")
+    if row["staff_name"]:
+        st.write(f"担当：{row['staff_name']}")
+    st.write(f"ファイルメモ：{row['file_memo'] or ''}")
+    st.caption(f"登録：{row['file_created_at']}")
+
+    render_saved_download_button(
+        "ダウンロード",
+        row["file_path"],
+        row["file_name"],
+        key=f"file_list_download_{row['file_id']}",
+    )
 
 
 
@@ -1630,6 +1722,7 @@ def ensure_import_category(category_name):
             (category_name, mark, sort_order, is_active, created_at, updated_at)
             VALUES (?, ?, 900, 1, ?, ?)
         """, (category_name, mark, now_text(), now_text()))
+        clear_master_caches()
     except Exception:
         pass
 
@@ -1648,6 +1741,7 @@ def upsert_import_user(user_id, user_name):
             INSERT INTO users (user_id, user_name, kana, room_no, note, is_active, created_at)
             VALUES (?, ?, '', '', '予定データ取込から自動追加', 1, ?)
         """, (user_id, user_name, now_text()))
+        clear_master_caches()
     except Exception:
         pass
 
@@ -1656,7 +1750,7 @@ def insert_import_event(row):
     """正規化済み1行をeventsへ登録。"""
     ensure_import_category(row.get("category", "その他"))
     upsert_import_user(row.get("user_id", ""), row.get("user_name", ""))
-    return execute("""
+    event_id = execute("""
         INSERT INTO events
         (event_date, category, title, user_id, user_name, staff_name, start_time, end_time, memo, important, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1674,6 +1768,8 @@ def insert_import_event(row):
         now_text(),
         now_text(),
     ))
+    clear_event_caches()
+    return event_id
 
 
 def page_schedule_import():
@@ -1849,11 +1945,12 @@ def shift_kind_from_editor_label(label):
     return mapping.get(value, [])
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_shift_month_status(year, month):
     """指定月のシフト確定状態を取得する。"""
     try:
         df = fetch_df("""
-            SELECT *
+            SELECT id, shift_year, shift_month, is_confirmed, confirmed_at, confirmed_by, created_at, updated_at
             FROM shift_month_status
             WHERE shift_year=? AND shift_month=?
             LIMIT 1
@@ -1890,9 +1987,11 @@ def set_shift_month_status(year, month, is_confirmed, confirmed_by=""):
             now_text(),
             now_text(),
         ))
+        clear_shift_caches()
     except Exception as e:
         st.warning(f"シフト確定状態の保存に失敗しました：{e}")
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_staff_shift_limits():
     """
     職員別の月間勤務回数上限を取得する。
@@ -1953,12 +2052,15 @@ def save_staff_shift_limits_from_editor(limits_df):
             now_text(),
         ))
     if not params:
+        clear_shift_caches()
         return 0
-    return execute_many("""
+    saved = execute_many("""
         INSERT INTO staff_shift_limits
         (staff_name, max_day_shifts, max_night_shifts, max_total_shifts, note, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, params)
+    clear_shift_caches()
+    return saved
 
 
 
@@ -2160,6 +2262,7 @@ def clear_month_staff_shifts(year, month):
     end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
     execute("DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ?", (start, end))
     set_shift_month_status(int(year), int(month), False, current_login_user_for_shift())
+    clear_shift_caches()
     try:
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["shift_editor_reset_counter"] = int(st.session_state.get("shift_editor_reset_counter", 0) or 0) + 1
@@ -2173,8 +2276,8 @@ def shift_month_is_confirmed(year, month):
 
 
 def get_staff_shifts(start_date, end_date, keyword=""):
-    query = """
-        SELECT *
+    query = f"""
+        SELECT {SHIFT_COLUMNS}
         FROM staff_shifts
         WHERE shift_date BETWEEN ? AND ?
     """
@@ -2187,6 +2290,7 @@ def get_staff_shifts(start_date, end_date, keyword=""):
     return fetch_df(query, params)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_staff_shifts_month(year, month, include_prev_day=False):
     last_day = calendar.monthrange(int(year), int(month))[1]
     start_date = date(int(year), int(month), 1)
@@ -2207,7 +2311,7 @@ def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_t
     if start_time is None or end_time is None:
         start_time, end_time, default_next = default_shift_times(shift_kind)
         next_day = default_next
-    return execute("""
+    shift_id = execute("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2222,6 +2326,8 @@ def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_t
         now_text(),
         now_text(),
     ))
+    clear_shift_caches()
+    return shift_id
 
 
 def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo=""):
@@ -2240,11 +2346,13 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
     if night_staff:
         stime, etime, nd = default_shift_times("夜勤")
         params.append((shift_date, night_staff, "夜勤", stime, etime, nd, memo.strip() or None, now_text(), now_text()))
-    return execute_many("""
+    saved = execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
+    clear_shift_caches()
+    return saved
 
 
 def shift_day_labels_for_staff(df, staff_name, target_date):
@@ -2469,13 +2577,16 @@ def save_shift_matrix_from_editor(year, month, edited_df):
                 ))
 
     if not params:
+        clear_shift_caches()
         return 0
 
-    return execute_many("""
+    saved = execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
+    clear_shift_caches()
+    return saved
 
 
 def create_shift_shortage_table(df, year, month):
@@ -3331,11 +3442,13 @@ def save_ai_shift_draft_rows(draft_df):
 
     if not params:
         return 0
-    return execute_many("""
+    saved = execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
+    clear_shift_caches()
+    return saved
 
 def make_staff_shift_pdf(year, month):
     return report_make_staff_shift_pdf(
@@ -3780,10 +3893,12 @@ def page_shift_manager():
                     SET shift_date=?, staff_name=?, shift_kind=?, start_time=?, end_time=?, next_day=?, memo=?, updated_at=?
                     WHERE id=?
                 """, (u_date.strftime("%Y-%m-%d"), u_staff, u_kind, u_start or None, u_end or None, 1 if u_next else 0, u_memo or None, now_text(), int(selected_shift_id)))
+                clear_shift_caches()
                 st.success("シフトを更新しました。")
                 st.rerun()
         if delete_shift:
             execute("DELETE FROM staff_shifts WHERE id=?", (int(selected_shift_id),))
+            clear_shift_caches()
             st.warning("シフトを削除しました。")
             st.rerun()
 
@@ -3792,8 +3907,8 @@ def page_shift_manager():
 
     month_start = f"{int(shift_year)}-{int(shift_month):02d}-01"
     month_end = f"{int(shift_year)}-{int(shift_month):02d}-{calendar.monthrange(int(shift_year), int(shift_month))[1]:02d}"
-    events_df = fetch_df("""
-        SELECT *
+    events_df = fetch_df(f"""
+        SELECT {EVENT_TODAY_COLUMNS}
         FROM events
         WHERE event_date BETWEEN ? AND ?
         ORDER BY event_date, start_time, id
@@ -3823,12 +3938,14 @@ def page_shift_manager():
             ai_staff = st.selectbox("AI候補から選ぶ", candidates["職員名"].tolist())
             if st.button("AI候補を担当に反映", use_container_width=True):
                 execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (ai_staff, now_text(), int(selected_event_id)))
+                clear_event_caches()
                 st.success(f"予定ID:{selected_event_id} の担当を {ai_staff} さんにしました。")
                 st.rerun()
         with c2:
             manual_staff = st.selectbox("自分で担当を選ぶ", staff_options, key="manual_assign_staff")
             if st.button("自分で選んだ担当を反映", use_container_width=True):
                 execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (manual_staff or None, now_text(), int(selected_event_id)))
+                clear_event_caches()
                 st.success("担当を更新しました。")
                 st.rerun()
 
@@ -3843,6 +3960,7 @@ def page_shift_manager():
             if st.button("未担当予定へ第1候補を一括反映", use_container_width=True):
                 params = [(r["AI候補"], now_text(), int(r["予定ID"])) for _, r in assignable.iterrows()]
                 updated = execute_many("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", params)
+                clear_event_caches()
                 st.success(f"{updated}件の予定へ担当候補を反映しました。")
                 st.rerun()
 
@@ -4059,12 +4177,14 @@ def page_export():
     st.subheader("Excel・PDF出力")
 
     st.markdown("### Excel出力")
-    events = fetch_df("SELECT * FROM events ORDER BY event_date, start_time, id")
-    photos = fetch_df("SELECT * FROM event_photos ORDER BY event_id, id")
-    files = fetch_df("SELECT * FROM event_files ORDER BY event_id, id")
-    categories = fetch_df("SELECT * FROM categories ORDER BY sort_order, category_name")
-    users = fetch_df("SELECT * FROM users ORDER BY user_name")
-    staff = fetch_df("SELECT * FROM staff ORDER BY staff_name")
+    started = time.perf_counter()
+    events = fetch_df(f"SELECT {EVENT_DETAIL_COLUMNS} FROM events ORDER BY event_date, start_time, id")
+    photos = fetch_df("SELECT id, event_id, file_name, file_path, photo_memo, created_at FROM event_photos ORDER BY event_id, id")
+    files = fetch_df("SELECT id, event_id, file_name, file_path, file_type, file_memo, created_at FROM event_files ORDER BY event_id, id")
+    categories = fetch_df(f"SELECT {CATEGORY_COLUMNS} FROM categories ORDER BY sort_order, category_name")
+    users = fetch_df(f"SELECT {USER_COLUMNS} FROM users ORDER BY user_name")
+    staff = fetch_df(f"SELECT {STAFF_COLUMNS} FROM staff ORDER BY staff_name")
+    note_perf("Excel出力データ取得", started)
 
     output = Path("hidamari_calendar_export.xlsx")
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -4142,6 +4262,7 @@ def main():
         ],
     )
 
+    page_started = time.perf_counter()
     if menu == "月間カレンダー":
         page_calendar()
     elif menu == "今日は何ある":
@@ -4168,6 +4289,9 @@ def main():
         page_master_staff()
     elif menu == "Excel・PDF出力":
         page_export()
+
+    note_perf(menu, page_started)
+    show_perf_log()
 
 
 if __name__ == "__main__":

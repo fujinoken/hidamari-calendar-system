@@ -289,7 +289,7 @@ def fetch_df(query, params=()):
 def clear_read_cache():
     """DB更新後に読み取りキャッシュをクリアする。"""
     try:
-        st.cache_data.clear()
+        _fetch_df_cached.clear()
     except Exception:
         pass
 

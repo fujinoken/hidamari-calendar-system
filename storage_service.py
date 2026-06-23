@@ -42,6 +42,7 @@ def get_secret_or_env(*keys, default=None):
     return default
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_supabase_url():
     """
     Supabase Project URLを取得する。
@@ -57,6 +58,7 @@ def get_supabase_url():
     return url.rstrip("/")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_supabase_storage_key():
     """
     Supabase Storage操作用キーを取得する。
@@ -65,6 +67,7 @@ def get_supabase_storage_key():
     return get_secret_or_env(*SUPABASE_STORAGE_KEY_KEYS, default="")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_supabase_storage_bucket():
     """Storageバケット名。未指定時は hidamari-calendar-files を使う。"""
     return get_secret_or_env(SUPABASE_STORAGE_BUCKET_KEY, default=DEFAULT_SUPABASE_STORAGE_BUCKET)
@@ -374,15 +377,30 @@ def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
             failed_count += 1
             st.error(f"写真メモのStorage保存に失敗しました：{uploaded.name}｜{e}")
 
+    if saved_count:
+        clear_event_photos_cache()
+
     return saved_count, failed_count
 
 
 @st.cache_data(ttl=20, show_spinner=False)
 def get_event_photos(event_id):
     return fetch_df(
-        "SELECT * FROM event_photos WHERE event_id=? ORDER BY id",
+        """
+        SELECT id, event_id, file_name, file_path, photo_memo, created_at
+        FROM event_photos
+        WHERE event_id=?
+        ORDER BY id
+        """,
         (int(event_id),)
     )
+
+
+def clear_event_photos_cache():
+    try:
+        get_event_photos.clear()
+    except Exception:
+        pass
 
 
 def save_uploaded_files(event_id, uploaded_files, file_memo=""):
@@ -429,14 +447,29 @@ def save_uploaded_files(event_id, uploaded_files, file_memo=""):
             failed_count += 1
             st.error(f"Excel・書類ファイルのStorage保存に失敗しました：{uploaded.name}｜{e}")
 
+    if saved_count:
+        clear_event_files_cache()
+
     return saved_count, failed_count
 
 
 @st.cache_data(ttl=20, show_spinner=False)
 def get_event_files(event_id):
     return fetch_df(
-        "SELECT * FROM event_files WHERE event_id=? ORDER BY id",
+        """
+        SELECT id, event_id, file_name, file_path, file_type, file_memo, created_at
+        FROM event_files
+        WHERE event_id=?
+        ORDER BY id
+        """,
         (int(event_id),)
     )
+
+
+def clear_event_files_cache():
+    try:
+        get_event_files.clear()
+    except Exception:
+        pass
 
 
