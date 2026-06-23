@@ -222,3 +222,4 @@ __marimo__/
 *.db
 uploads/
 attached_files/　
+backup-before-*/
