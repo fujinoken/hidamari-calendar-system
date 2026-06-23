@@ -701,6 +701,7 @@ def get_kot_pattern_code(shift_kind):
     """KING OF TIME用パターンコード。secrets/envで上書き可能。"""
     key_map = {
         "日勤": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
+        "管": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
         "管理業務": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
         "夜勤": (KOT_NIGHT_PATTERN_CODE_KEY, "夜勤"),
     }
@@ -723,7 +724,7 @@ def kot_time_value(time_text, next_day=False):
 
 def kot_break_minutes(shift_kind):
     """KING OF TIME CSV用の休憩予定時間。必要に応じて施設運用に合わせて変更する。"""
-    if str(shift_kind) in ["日勤", "管理業務"]:
+    if str(shift_kind) in ["日勤", "管", "管理業務"]:
         return 60
     if str(shift_kind) == "夜勤":
         return 120
@@ -789,12 +790,12 @@ def make_king_of_time_shift_csv(
         memo_parts = []
         original_memo = str(r.get("memo") or "").strip()
 
-        if shift_kind in ["日勤", "管理業務", "夜勤"]:
+        if shift_kind in ["日勤", "管", "管理業務", "夜勤"]:
             pattern_code = get_kot_pattern_code(shift_kind)
             stime = str(r.get("start_time") or "").strip()
             etime = str(r.get("end_time") or "").strip()
             if not stime or not etime:
-                default_start, default_end, default_next_day = default_shift_times("日勤" if shift_kind == "管理業務" else shift_kind)
+                default_start, default_end, default_next_day = default_shift_times("日勤" if shift_kind in ["管", "管理業務"] else shift_kind)
                 stime = stime or default_start
                 etime = etime or default_end
                 next_day = bool(default_next_day)
@@ -803,7 +804,7 @@ def make_king_of_time_shift_csv(
             start_plan = kot_time_value(stime, next_day=False)
             end_plan = kot_time_value(etime, next_day=next_day)
             break_minutes = kot_break_minutes(shift_kind)
-            if shift_kind == "管理業務":
+            if shift_kind in ["管", "管理業務"]:
                 memo_parts.append("管理業務")
         elif shift_kind in ["休み", "有休", "希望休"]:
             full_day_leave = kot_full_day_leave_name(shift_kind)

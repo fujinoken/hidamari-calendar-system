@@ -118,7 +118,8 @@ SHIFT_COLUMNS = """
 DAY_STAFFING_SHIFT_KINDS = ["日勤"]
 DAY_LIMIT_SHIFT_KINDS = ["日勤"]
 NIGHT_LIMIT_SHIFT_KINDS = ["夜勤"]
-WORKDAY_SHIFT_KINDS = ["日勤", "管理業務", "夜勤", "夜勤明け"]
+MANAGEMENT_SHIFT_KINDS = ["管", "管理業務"]
+WORKDAY_SHIFT_KINDS = ["日勤", "管", "管理業務", "夜勤", "夜勤明け"]
 
 
 def note_perf(label, started_at):
@@ -2219,7 +2220,7 @@ def make_calendar_pdf(year, month, include_detail=True):
 
 def default_shift_times(shift_kind):
     """基本勤務時間。日勤2名、夜勤1名の運用を想定。"""
-    if shift_kind in ["日勤", "管理業務"]:
+    if shift_kind == "日勤" or shift_kind in MANAGEMENT_SHIFT_KINDS:
         return "08:30", "17:30", 0
     if shift_kind == "夜勤":
         return "16:30", "09:30", 1
@@ -2231,6 +2232,7 @@ def default_shift_times(shift_kind):
 def shift_short_label(shift_kind):
     return {
         "日勤": "日",
+        "管": "管",
         "管理業務": "管",
         "夜勤": "夜",
         "夜勤明け": "明",
@@ -2246,7 +2248,7 @@ def shift_kind_from_editor_label(label):
     value = str(label or "").strip()
     mapping = {
         "日": ["日勤"],
-        "管": ["管理業務"],
+        "管": ["管"],
         "夜": ["夜勤"],
         "明": ["夜勤明け"],
         "希": ["希望休"],
@@ -2254,6 +2256,14 @@ def shift_kind_from_editor_label(label):
         "他": ["その他"],
     }
     return mapping.get(value, [])
+
+
+def shift_kind_for_selectbox(shift_kind):
+    """古い保存値の管理業務も、画面上の選択肢では管として扱う。"""
+    value = str(shift_kind or "").strip()
+    if value in MANAGEMENT_SHIFT_KINDS:
+        return "管"
+    return value
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2795,7 +2805,7 @@ def max_consecutive_ones(values):
 def create_editable_shift_matrix(staff_names, df, year, month):
     """
     st.data_editorで直接入力しやすい月間シフト表を作る。
-    各セルは「」「日」「夜」「明」「休」「希」「有」「日/夜」からプルダウン入力する。
+    各セルは「」「日」「管」「夜」「明」「希」「有」「他」からプルダウン入力する。
     """
     last_day = calendar.monthrange(int(year), int(month))[1]
     # 職員名は正規化し、空白違いの重複行を1行にまとめる。
@@ -3811,6 +3821,7 @@ def make_staff_shift_excel(year, month):
 def format_shift_label(shift_value):
     mapping = {
         "日勤": "日",
+        "管": "管",
         "管理業務": "管",
         "夜勤": "夜",
         "夜勤明け": "明",
@@ -3869,7 +3880,10 @@ def render_shift_calendar(year, month, shift_df):
                 lines = []
                 if not day_df.empty:
                     for kind in SHIFT_KINDS:
-                        members = day_df[day_df["shift_kind"].astype(str) == kind]["staff_name"].dropna().astype(str).tolist()
+                        if kind == "管":
+                            members = day_df[day_df["shift_kind"].astype(str).isin(MANAGEMENT_SHIFT_KINDS)]["staff_name"].dropna().astype(str).tolist()
+                        else:
+                            members = day_df[day_df["shift_kind"].astype(str) == kind]["staff_name"].dropna().astype(str).tolist()
                         if members:
                             names = "、".join(members[:3])
                             if len(members) > 3:
@@ -3906,7 +3920,7 @@ def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_s
             options=SHIFT_EDITOR_OPTIONS,
             required=False,
             width="small",
-            help="日・夜・明・希・有・他を選択。空欄にすると削除扱いです。",
+            help="日・管・夜・明・希・有・他を選択。空欄にすると削除扱いです。",
         )
 
     st.caption("各セルをクリックして、日・夜・明・希・有・他を直接入力できます。列見出しには曜日を表示しています。")
@@ -4196,7 +4210,8 @@ def page_shift_manager():
                 current_staff = target["staff_name"] if target["staff_name"] in staff_options else ""
                 u_staff = st.selectbox("職員", staff_options, index=staff_options.index(current_staff) if current_staff in staff_options else 0)
             with c3:
-                u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(target["shift_kind"]) if target["shift_kind"] in SHIFT_KINDS else 0)
+                current_kind = shift_kind_for_selectbox(target["shift_kind"])
+                u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(current_kind) if current_kind in SHIFT_KINDS else 0)
             with c4:
                 u_next = st.checkbox("終了は翌日", value=bool(target["next_day"]))
             u_start = st.text_input("開始時刻", value=target["start_time"] or "")
