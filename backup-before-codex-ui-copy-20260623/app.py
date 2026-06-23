@@ -12,67 +12,718 @@ Python + Streamlit + PostgreSQL
     pip install streamlit pandas openpyxl psycopg2-binary reportlab requests
 """
 
+import os
 import calendar
 import re
 import hashlib
-import time
+import mimetypes
+import urllib.parse
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 
+try:
+    import requests
+except ImportError:
+    requests = None
 
-from config import (
-    AI_SHIFT_RULE_VERSION,
-    APP_TITLE,
-    CATEGORY_MARK,
-    DEFAULT_CATEGORIES,
-    FILE_DIR,
-    SHIFT_EDITOR_OPTIONS,
-    SHIFT_KINDS,
-    UPLOAD_DIR,
-)
-from db import (
-    DB_INTEGRITY_ERROR,
-    execute,
-    execute_many,
-    fetch_df,
-    init_db_once,
-    now_text,
-    today_jst,
-)
-from report_service import (
-    OPENPYXL_AVAILABLE,
-    REPORTLAB_AVAILABLE,
-    make_calendar_pdf as report_make_calendar_pdf,
-    make_king_of_time_shift_csv as report_make_king_of_time_shift_csv,
-    make_staff_shift_excel as report_make_staff_shift_excel,
-    make_staff_shift_pdf as report_make_staff_shift_pdf,
-)
-from storage_service import (
-    REQUESTS_AVAILABLE,
-    check_storage_bucket_access,
-    clear_event_files_cache,
-    clear_event_photos_cache,
-    delete_saved_file,
-    get_event_files,
-    get_event_photos,
-    get_supabase_storage_bucket,
-    get_supabase_storage_key,
-    get_supabase_url,
-    is_storage_file,
-    render_saved_download_button,
-    render_saved_image,
-    save_uploaded_files,
-    save_uploaded_photos,
-    storage_is_configured,
-    storage_object_exists,
-)
-from ui_styles import add_css
 
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
+try:
+    from openpyxl import Workbook as OpenpyxlWorkbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OpenpyxlWorkbook = None
+    Font = PatternFill = Alignment = Border = Side = None
+    get_column_letter = None
+    OPENPYXL_AVAILABLE = False
+
+
+APP_TITLE = "ひだまり帳 Ver1.4.7 PostgreSQL版"
+AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v6_staff_deduplicate_excel_export"
+UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+FILE_DIR = Path("attached_files")
 FILE_DIR.mkdir(exist_ok=True)
+
+DB_INTEGRITY_ERROR = psycopg2.IntegrityError if psycopg2 else Exception
+
+
+# -----------------------------
+# DB（PostgreSQL / Supabase対応）
+# -----------------------------
+def get_database_url():
+    """
+    PostgreSQL接続URLを取得する。
+    Streamlit Cloudでは st.secrets["DATABASE_URL"] を推奨。
+    ローカルでは環境変数 DATABASE_URL / SUPABASE_DB_URL でも動作する。
+    """
+    try:
+        if "DATABASE_URL" in st.secrets:
+            return st.secrets["DATABASE_URL"]
+        if "SUPABASE_DB_URL" in st.secrets:
+            return st.secrets["SUPABASE_DB_URL"]
+        if "postgres" in st.secrets and "url" in st.secrets["postgres"]:
+            return st.secrets["postgres"]["url"]
+    except Exception:
+        pass
+    return os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
+
+
+def to_pg_query(query):
+    """既存コードの ? プレースホルダを PostgreSQL/psycopg2 の %s へ変換する。"""
+    return str(query).replace("?", "%s")
+
+
+def get_conn():
+    if psycopg2 is None:
+        st.error("psycopg2 がインストールされていません。requirements.txt に psycopg2-binary を追加してください。")
+        st.stop()
+
+    database_url = get_database_url()
+    if not database_url:
+        st.error("PostgreSQL接続URLが未設定です。Streamlit secrets に DATABASE_URL を設定してください。")
+        st.stop()
+
+    # SupabaseではSSL必須のことが多いため、URLにsslmodeが無い場合はrequireを付ける。
+    if "sslmode=" in database_url:
+        return psycopg2.connect(database_url)
+    return psycopg2.connect(database_url, sslmode=os.getenv("PGSSLMODE", "require"))
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT UNIQUE,
+        user_name TEXT NOT NULL UNIQUE,
+        kana TEXT,
+        room_no TEXT,
+        note TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS staff (
+        id SERIAL PRIMARY KEY,
+        staff_name TEXT NOT NULL UNIQUE,
+        staff_code TEXT,
+        role TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS categories (
+        id SERIAL PRIMARY KEY,
+        category_name TEXT NOT NULL UNIQUE,
+        mark TEXT,
+        sort_order INTEGER DEFAULT 100,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id SERIAL PRIMARY KEY,
+        event_date TEXT NOT NULL,
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        user_id TEXT,
+        user_name TEXT,
+        staff_name TEXT,
+        start_time TEXT,
+        end_time TEXT,
+        memo TEXT,
+        important INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS event_photos (
+        id SERIAL PRIMARY KEY,
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        photo_memo TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS event_files (
+        id SERIAL PRIMARY KEY,
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        file_type TEXT,
+        file_memo TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    # 既存PostgreSQLテーブルからの移行：列がなければ追加する
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS user_id TEXT")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS room_no TEXT")
+    cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS user_id TEXT")
+    cur.execute("ALTER TABLE staff ADD COLUMN IF NOT EXISTS staff_code TEXT")
+
+    # 既存利用者にIDがない場合、U0001形式で仮IDを付与
+    cur.execute("SELECT id, user_id FROM users")
+    for row_id, user_id in cur.fetchall():
+        if not user_id:
+            cur.execute("UPDATE users SET user_id=%s WHERE id=%s", (f"U{int(row_id):04d}", int(row_id)))
+
+    # 既存予定にIDがない場合、利用者名から補完
+    cur.execute("""
+        UPDATE events
+        SET user_id = (
+            SELECT users.user_id FROM users
+            WHERE users.user_name = events.user_name
+            LIMIT 1
+        )
+        WHERE (user_id IS NULL OR user_id = '') AND user_name IS NOT NULL
+    """)
+
+    # カテゴリマスタ初期投入
+    cur.execute("SELECT COUNT(*) FROM categories")
+    category_count = cur.fetchone()[0]
+    if category_count == 0:
+        default_marks = {
+            "通院": "🏥",
+            "面会": "👪",
+            "行事": "🎉",
+            "外出": "🚶",
+            "注意": "⚠️",
+            "申し送り": "📝",
+            "夜勤": "🌙",
+            "その他": "・",
+        }
+        for i, name in enumerate(DEFAULT_CATEGORIES, start=1):
+            cur.execute("""
+                INSERT INTO categories
+                (category_name, mark, sort_order, is_active, created_at, updated_at)
+                VALUES (%s, %s, %s, 1, %s, %s)
+                ON CONFLICT (category_name) DO NOTHING
+            """, (name, default_marks.get(name, "・"), i * 10, now_text(), now_text()))
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS staff_shifts (
+        id SERIAL PRIMARY KEY,
+        shift_date TEXT NOT NULL,
+        staff_name TEXT NOT NULL,
+        shift_kind TEXT NOT NULL,
+        start_time TEXT,
+        end_time TEXT,
+        next_day INTEGER DEFAULT 0,
+        memo TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS shift_month_status (
+        id SERIAL PRIMARY KEY,
+        shift_year INTEGER NOT NULL,
+        shift_month INTEGER NOT NULL,
+        is_confirmed INTEGER DEFAULT 0,
+        confirmed_at TEXT,
+        confirmed_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS staff_shift_limits (
+        id SERIAL PRIMARY KEY,
+        staff_name TEXT NOT NULL UNIQUE,
+        max_day_shifts INTEGER DEFAULT 31,
+        max_night_shifts INTEGER DEFAULT 31,
+        max_total_shifts INTEGER DEFAULT 31,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    # よく使う検索用インデックス。既存DBにも安全に追加できる。
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event_date ON events(event_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date, start_time)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_user_name ON events(user_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_event_photos_event_id ON event_photos(event_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_event_files_event_id ON event_files(event_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_categories_active_sort ON categories(is_active, sort_order)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_active_name ON users(is_active, user_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_active_name ON staff(is_active, staff_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_code ON staff(staff_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_date ON staff_shifts(shift_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_staff ON staff_shifts(staff_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_date_kind ON staff_shifts(shift_date, shift_kind)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_shift_month_status_ym ON shift_month_status(shift_year, shift_month)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shift_limits_staff ON staff_shift_limits(staff_name)")
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def now_text():
+    """
+    Streamlit Cloud上でも日本時間で保存する。
+    """
+    return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_jst():
+    return datetime.now(JST).date()
+
+
+def normalize_query_params(params=()):
+    """cache用にSQLパラメータをtupleへ正規化する。"""
+    if params is None:
+        return ()
+    if isinstance(params, tuple):
+        return params
+    if isinstance(params, list):
+        return tuple(params)
+    return (params,)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _fetch_df_cached(query, params_tuple=()):
+    """
+    読み取りSQLを短時間キャッシュする。
+    予定表示・マスタ取得・件数確認の体感速度を上げる。
+    """
+    conn = get_conn()
+    try:
+        df = pd.read_sql_query(to_pg_query(query), conn, params=params_tuple)
+    finally:
+        conn.close()
+    return df
+
+
+def fetch_df(query, params=()):
+    return _fetch_df_cached(str(query), normalize_query_params(params))
+
+
+def clear_read_cache():
+    """DB更新後に読み取りキャッシュをクリアする。"""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
+def execute(query, params=()):
+    """
+    INSERT/UPDATE/DELETEを実行する。
+    INSERTの場合は自動で RETURNING id を付け、登録IDを返す。
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    q = to_pg_query(query).strip()
+    q_no_semicolon = q[:-1].strip() if q.endswith(";") else q
+    is_insert = q_no_semicolon.lower().startswith("insert")
+    if is_insert and " returning " not in q_no_semicolon.lower():
+        q_exec = q_no_semicolon + " RETURNING id"
+    else:
+        q_exec = q_no_semicolon
+
+    try:
+        cur.execute(q_exec, normalize_query_params(params))
+        last_id = None
+        if is_insert:
+            row = cur.fetchone()
+            last_id = row[0] if row else None
+        conn.commit()
+        clear_read_cache()
+        return last_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def execute_many(query, params_list):
+    """複数行のINSERT/UPDATEをまとめて実行する。"""
+    if not params_list:
+        return 0
+    conn = get_conn()
+    cur = conn.cursor()
+    q = to_pg_query(query).strip()
+    try:
+        cur.executemany(q, [normalize_query_params(p) for p in params_list])
+        conn.commit()
+        clear_read_cache()
+        return len(params_list)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def init_db_once():
+    """
+    init_dbはALTER TABLEや初期投入を含むため、毎回実行せずセッション内で1回だけ実行する。
+    これだけで画面切替・再描画が1テンポ軽くなる。
+    """
+    if not st.session_state.get("_hidamari_db_initialized", False):
+        init_db()
+        st.session_state["_hidamari_db_initialized"] = True
+        clear_read_cache()
+
+
+
+
+# -----------------------------
+# Supabase Storage（第1段階：新規ファイル保存）
+# -----------------------------
+STORAGE_PATH_PREFIX = "storage://"
+
+
+def get_secret_or_env(*keys, default=None):
+    """Streamlit secrets または環境変数から設定値を取得する。"""
+    for key in keys:
+        try:
+            if key in st.secrets:
+                value = st.secrets[key]
+                if value:
+                    return str(value).strip()
+        except Exception:
+            pass
+        value = os.getenv(key)
+        if value:
+            return str(value).strip()
+    return default
+
+
+def get_supabase_url():
+    """
+    Supabase Project URLを取得する。
+    /rest/v1 や /storage/v1 まで入れてしまった場合も、プロジェクトURLへ補正する。
+    """
+    url = get_secret_or_env("SUPABASE_URL", "SUPABASE_PROJECT_URL", default="")
+    if not url:
+        return ""
+    url = str(url).strip().rstrip("/")
+    for suffix in ["/rest/v1", "/storage/v1", "/storage/v1/object"]:
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url.rstrip("/")
+
+
+def get_supabase_storage_key():
+    """
+    Supabase Storage操作用キーを取得する。
+    非公開バケットをサーバー側から扱うため、Streamlit secretsには SERVICE_ROLE_KEY を入れる。
+    """
+    return get_secret_or_env("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_STORAGE_KEY", default="")
+
+
+def get_supabase_storage_bucket():
+    """Storageバケット名。未指定時は hidamari-calendar-files を使う。"""
+    return get_secret_or_env("SUPABASE_STORAGE_BUCKET", default="hidamari-calendar-files")
+
+
+def storage_is_configured():
+    """Supabase Storage保存に必要な設定が揃っているか確認する。"""
+    return bool(get_supabase_url() and get_supabase_storage_key() and get_supabase_storage_bucket())
+
+
+def require_storage_ready():
+    """Storage未設定やrequests未導入の場合に分かりやすいエラーを出す。"""
+    if requests is None:
+        raise RuntimeError("requests がインストールされていません。requirements.txt に requests を追加してください。")
+    if not get_supabase_url():
+        raise RuntimeError("SUPABASE_URL が未設定です。Streamlit secrets に設定してください。")
+    if not get_supabase_storage_key():
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY が未設定です。Streamlit secrets に設定してください。")
+    if not get_supabase_storage_bucket():
+        raise RuntimeError("SUPABASE_STORAGE_BUCKET が未設定です。")
+
+
+def guess_content_type(file_name):
+    content_type, _ = mimetypes.guess_type(str(file_name or ""))
+    return content_type or "application/octet-stream"
+
+
+def make_storage_object_path(event_id, original_name, kind):
+    """
+    Storage内の保存パスを作る。
+    元ファイル名はDBのfile_nameに保存し、Storage側は衝突しにくい安全な名前にする。
+    """
+    suffix = Path(str(original_name or "")).suffix.lower()
+    if not suffix:
+        suffix = ".bin"
+    timestamp = datetime.now(JST).strftime("%Y%m%d%H%M%S%f")
+    digest = hashlib.md5(f"{event_id}-{original_name}-{timestamp}".encode("utf-8")).hexdigest()[:12]
+    safe_kind = "photos" if kind == "photos" else "files"
+    return f"events/{int(event_id)}/{safe_kind}/{timestamp}_{digest}{suffix}"
+
+
+def make_storage_db_path(bucket, object_path):
+    """DBには storage://bucket/path の形式で保存する。"""
+    return f"{STORAGE_PATH_PREFIX}{bucket}/{object_path}"
+
+
+def parse_storage_db_path(file_path):
+    """storage://bucket/path を (bucket, path) に分解する。"""
+    value = str(file_path or "").strip()
+    if not value.startswith(STORAGE_PATH_PREFIX):
+        return None, None
+    rest = value[len(STORAGE_PATH_PREFIX):]
+    if "/" not in rest:
+        return None, None
+    bucket, object_path = rest.split("/", 1)
+    return bucket, object_path
+
+
+def is_storage_file(file_path):
+    return str(file_path or "").strip().startswith(STORAGE_PATH_PREFIX)
+
+
+def storage_url_for_object(bucket, object_path, authenticated=False):
+    """
+    Supabase Storage REST URLを作る。
+    upload/delete は /object、非公開ファイルの取得は /object/authenticated を使う。
+    """
+    base_url = get_supabase_url()
+    quoted_bucket = urllib.parse.quote(str(bucket), safe="")
+    quoted_path = urllib.parse.quote(str(object_path), safe="/")
+    prefix = "object/authenticated" if authenticated else "object"
+    return f"{base_url}/storage/v1/{prefix}/{quoted_bucket}/{quoted_path}"
+
+
+def storage_headers(content_type=None, upsert=False):
+    key = get_supabase_storage_key()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if upsert:
+        headers["x-upsert"] = "true"
+    return headers
+
+
+def upload_bytes_to_storage(file_bytes, object_path, content_type):
+    """Supabase Storageへファイル本体をアップロードする。"""
+    require_storage_ready()
+    bucket = get_supabase_storage_bucket()
+    url = storage_url_for_object(bucket, object_path)
+    response = requests.post(
+        url,
+        headers=storage_headers(content_type=content_type, upsert=True),
+        data=file_bytes,
+        timeout=90,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase Storageへのアップロードに失敗しました: {response.status_code} {response.text[:300]}")
+    return make_storage_db_path(bucket, object_path)
+
+
+def download_bytes_from_storage(file_path):
+    """storage:// のDBパスからStorage上のファイル本体を取得する。"""
+    require_storage_ready()
+    bucket, object_path = parse_storage_db_path(file_path)
+    if not bucket or not object_path:
+        raise RuntimeError("Storageパスの形式が不正です。")
+    url = storage_url_for_object(bucket, object_path, authenticated=True)
+    response = requests.get(url, headers=storage_headers(), timeout=90)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase Storageからの取得に失敗しました: {response.status_code} {response.text[:300]}")
+    return response.content
+
+
+def delete_storage_object(file_path):
+    """
+    Storage上のファイル削除。
+    環境やAPI仕様差に備え、失敗しても画面操作を止めないためFalseを返す。
+    """
+    if not is_storage_file(file_path):
+        return False
+    try:
+        require_storage_ready()
+        bucket, object_path = parse_storage_db_path(file_path)
+        if not bucket or not object_path:
+            return False
+        url = storage_url_for_object(bucket, object_path)
+        response = requests.delete(url, headers=storage_headers(), timeout=60)
+        return response.status_code < 400
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _read_saved_file_bytes_cached(file_path):
+    """
+    Storage保存・旧ローカル保存の両方に対応してファイル本体を読む。
+    画像や添付の再表示を速くするため、短時間キャッシュする。
+    """
+    if is_storage_file(file_path):
+        return download_bytes_from_storage(file_path)
+
+    local_path = Path(str(file_path or ""))
+    if local_path.exists():
+        with open(local_path, "rb") as f:
+            return f.read()
+    return None
+
+
+def read_saved_file_bytes(file_path):
+    return _read_saved_file_bytes_cached(str(file_path or ""))
+
+
+def render_saved_image(file_path, caption=None, use_container_width=True):
+    """Storage保存・旧ローカル保存の両方に対応して画像を表示する。"""
+    try:
+        data = read_saved_file_bytes(file_path)
+        if data:
+            st.image(data, caption=caption, use_container_width=use_container_width)
+            return True
+    except Exception as e:
+        st.warning(f"画像を取得できません：{e}")
+        return False
+
+    st.warning("画像ファイルが見つかりません。")
+    return False
+
+
+def render_saved_download_button(label, file_path, file_name, key):
+    """Storage保存・旧ローカル保存の両方に対応してダウンロードボタンを表示する。"""
+    try:
+        data = read_saved_file_bytes(file_path)
+        if data:
+            st.download_button(
+                label,
+                data=data,
+                file_name=file_name,
+                key=key,
+            )
+            return True
+    except Exception as e:
+        st.warning(f"ファイルを取得できません：{e}")
+        return False
+
+    st.warning("ファイルが見つかりません。")
+    return False
+
+
+def delete_saved_file(file_path):
+    """Storage保存・旧ローカル保存の両方に対応してファイル本体を削除する。"""
+    if is_storage_file(file_path):
+        return delete_storage_object(file_path)
+
+    local_path = Path(str(file_path or ""))
+    if local_path.exists():
+        try:
+            local_path.unlink()
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def storage_object_exists(file_path):
+    """
+    DBに保存されたfile_pathが実際に読めるか確認する。
+    Storage保存はHEAD、失敗時はGETで確認。旧ローカル保存はファイル存在で確認。
+    """
+    value = str(file_path or "").strip()
+    if not value:
+        return False, "file_path空欄"
+
+    if is_storage_file(value):
+        try:
+            require_storage_ready()
+            bucket, object_path = parse_storage_db_path(value)
+            if not bucket or not object_path:
+                return False, "Storageパス形式不正"
+
+            url = storage_url_for_object(bucket, object_path, authenticated=True)
+            response = requests.head(url, headers=storage_headers(), timeout=30)
+            if response.status_code < 400:
+                return True, "OK"
+
+            # 環境によってHEADが許可されない場合の保険
+            response = requests.get(url, headers=storage_headers(), timeout=30)
+            if response.status_code < 400:
+                return True, "OK"
+
+            return False, f"Storage取得不可 {response.status_code}: {response.text[:120]}"
+        except Exception as e:
+            return False, f"Storage確認エラー: {e}"
+
+    local_path = Path(value)
+    if local_path.exists():
+        return True, "OK（旧ローカル）"
+    return False, "旧ローカルファイルなし"
+
+
+def check_storage_bucket_access():
+    """Storageバケットにアクセスできるか簡易確認する。"""
+    if requests is None:
+        return False, "requests が未導入です。"
+    if not storage_is_configured():
+        return False, "Storage設定が未完了です。"
+
+    try:
+        bucket = get_supabase_storage_bucket()
+        base_url = get_supabase_url()
+        quoted_bucket = urllib.parse.quote(str(bucket), safe="")
+        url = f"{base_url}/storage/v1/object/list/{quoted_bucket}"
+        response = requests.post(
+            url,
+            headers=storage_headers(content_type="application/json"),
+            json={"prefix": "", "limit": 1, "offset": 0},
+            timeout=30,
+        )
+        if response.status_code < 400:
+            return True, "Storageバケットへ接続できました。"
+        return False, f"Storageバケット確認失敗 {response.status_code}: {response.text[:180]}"
+    except Exception as e:
+        return False, f"Storageバケット確認エラー: {e}"
 
 
 def count_query(sql, params=()):
@@ -92,71 +743,112 @@ def count_query(sql, params=()):
 
 
 
-EVENT_LIST_COLUMNS = """
-    id, event_date, category, title, user_id, user_name, staff_name,
-    start_time, end_time, important, created_at, updated_at
-"""
+def save_uploaded_photos(event_id, uploaded_files, photo_memo=""):
+    """
+    アップロード写真をSupabase Storageへ保存し、DBへ紐づける。
+    戻り値: (保存成功数, 失敗数)
+    """
+    if not uploaded_files:
+        return 0, 0
 
-EVENT_TODAY_COLUMNS = """
-    id, event_date, category, title, user_id, user_name, staff_name,
-    start_time, end_time, memo, important, created_at, updated_at
-"""
+    saved_count = 0
+    failed_count = 0
 
-EVENT_DETAIL_COLUMNS = """
-    id, event_date, category, title, user_id, user_name, staff_name,
-    start_time, end_time, memo, important, created_at, updated_at
-"""
+    if not storage_is_configured():
+        st.error("Supabase Storage設定が未完了のため、写真メモは保存されませんでした。")
+        return 0, len(uploaded_files)
 
-USER_COLUMNS = "id, user_id, user_name, kana, room_no, note, is_active, created_at"
-STAFF_COLUMNS = "id, staff_name, staff_code, role, is_active, created_at"
-CATEGORY_COLUMNS = "id, category_name, mark, sort_order, is_active, created_at, updated_at"
-SHIFT_COLUMNS = """
-    id, shift_date, staff_name, shift_kind, start_time, end_time,
-    next_day, memo, created_at, updated_at
-"""
-
-
-def note_perf(label, started_at):
-    elapsed = time.perf_counter() - started_at
-    st.session_state.setdefault("perf_log", [])
-    st.session_state["perf_log"] = (
-        [{"label": label, "sec": elapsed, "at": datetime.now().strftime("%H:%M:%S")}]
-        + st.session_state["perf_log"]
-    )[:8]
-    return elapsed
-
-
-def show_perf_log():
-    rows = st.session_state.get("perf_log", [])
-    if not rows:
-        return
-    with st.sidebar.expander("処理時間", expanded=False):
-        for row in rows:
-            st.caption(f"{row['at']} {row['label']}: {row['sec']:.2f}s")
-
-
-def clear_event_caches():
-    for fn in (monthly_events, events_by_date, get_event_by_id, get_attachment_counts):
+    for uploaded in uploaded_files:
         try:
-            fn.clear()
-        except Exception:
-            pass
+            object_path = make_storage_object_path(event_id, uploaded.name, kind="photos")
+            file_bytes = bytes(uploaded.getbuffer())
+            storage_path = upload_bytes_to_storage(
+                file_bytes,
+                object_path,
+                guess_content_type(uploaded.name),
+            )
+
+            photo_id = execute("""
+                INSERT INTO event_photos
+                (event_id, file_name, file_path, photo_memo, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                int(event_id),
+                uploaded.name,
+                storage_path,
+                photo_memo.strip() or None,
+                now_text(),
+            ))
+            if photo_id:
+                saved_count += 1
+        except Exception as e:
+            failed_count += 1
+            st.error(f"写真メモのStorage保存に失敗しました：{uploaded.name}｜{e}")
+
+    return saved_count, failed_count
 
 
-def clear_master_caches():
-    for fn in (get_active_users, get_active_staff, get_staff_code_map, get_categories, get_category_mark_map):
+@st.cache_data(ttl=20, show_spinner=False)
+def get_event_photos(event_id):
+    return fetch_df(
+        "SELECT * FROM event_photos WHERE event_id=? ORDER BY id",
+        (int(event_id),)
+    )
+
+
+def save_uploaded_files(event_id, uploaded_files, file_memo=""):
+    """
+    Excel等の添付ファイルをSupabase Storageへ保存し、DBへ紐づける。
+    戻り値: (保存成功数, 失敗数)
+    """
+    if not uploaded_files:
+        return 0, 0
+
+    saved_count = 0
+    failed_count = 0
+
+    if not storage_is_configured():
+        st.error("Supabase Storage設定が未完了のため、Excel・書類ファイルは保存されませんでした。")
+        return 0, len(uploaded_files)
+
+    for uploaded in uploaded_files:
         try:
-            fn.clear()
-        except Exception:
-            pass
+            suffix = Path(uploaded.name).suffix.lower()
+            object_path = make_storage_object_path(event_id, uploaded.name, kind="files")
+            file_bytes = bytes(uploaded.getbuffer())
+            storage_path = upload_bytes_to_storage(
+                file_bytes,
+                object_path,
+                guess_content_type(uploaded.name),
+            )
+
+            file_id = execute("""
+                INSERT INTO event_files
+                (event_id, file_name, file_path, file_type, file_memo, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                int(event_id),
+                uploaded.name,
+                storage_path,
+                suffix.replace(".", ""),
+                file_memo.strip() or None,
+                now_text(),
+            ))
+            if file_id:
+                saved_count += 1
+        except Exception as e:
+            failed_count += 1
+            st.error(f"Excel・書類ファイルのStorage保存に失敗しました：{uploaded.name}｜{e}")
+
+    return saved_count, failed_count
 
 
-def clear_shift_caches():
-    for fn in (get_shift_month_status, get_staff_shifts_month, get_staff_shift_limits):
-        try:
-            fn.clear()
-        except Exception:
-            pass
+@st.cache_data(ttl=20, show_spinner=False)
+def get_event_files(event_id):
+    return fetch_df(
+        "SELECT * FROM event_files WHERE event_id=? ORDER BY id",
+        (int(event_id),)
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -245,6 +937,20 @@ def get_missing_staff_code_names(staff_names):
 # -----------------------------
 # UI helpers
 # -----------------------------
+DEFAULT_CATEGORIES = ["通院", "面会", "行事", "外出", "注意", "申し送り", "夜勤", "その他"]
+
+CATEGORY_MARK = {
+    "通院": "🏥",
+    "面会": "👪",
+    "行事": "🎉",
+    "外出": "🚶",
+    "注意": "⚠️",
+    "申し送り": "📝",
+    "夜勤": "🌙",
+    "その他": "・",
+}
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_categories(active_only=True):
     where = "WHERE is_active=1" if active_only else ""
@@ -282,15 +988,166 @@ def get_category_mark(category_name):
     return mark_map.get(category_name, CATEGORY_MARK.get(category_name, "・"))
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+def add_css():
+    st.markdown("""
+    <style>
+    .main .block-container {
+        padding-top: 1.2rem;
+        max-width: 1200px;
+    }
+    .calendar-title {
+        font-size: 1.6rem;
+        font-weight: 700;
+        margin: 12px 0 10px 0;
+        color: #3f3a35;
+    }
+    .calendar-grid {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 0;
+        width: 100%;
+        border-top: 1px solid #d8d0c4;
+        border-left: 1px solid #d8d0c4;
+        background: #fffdf8;
+    }
+    .day-head {
+        font-weight: 700;
+        text-align: center;
+        padding: 8px 4px;
+        border-right: 1px solid #d8d0c4;
+        border-bottom: 1px solid #d8d0c4;
+        background: #f3eee6;
+        color: #4b4035;
+        font-size: 0.82rem;
+        letter-spacing: 0.08em;
+    }
+    .day-cell {
+        min-height: 135px;
+        border-right: 1px solid #d8d0c4;
+        border-bottom: 1px solid #d8d0c4;
+        padding: 8px;
+        background: #fffdf8;
+        box-sizing: border-box;
+        overflow: hidden;
+    }
+    .blank-cell {
+        background: #fffdf8;
+    }
+    .day-cell-muted {
+        min-height: 150px;
+        border: 1px solid #eee6dc;
+        border-radius: 4px;
+        padding: 8px;
+        background: #fffdf8;
+        color: #aaa;
+    }
+    .day-num {
+        font-size: 2.4rem;
+        font-weight: 700;
+        line-height: 1;
+        margin-bottom: 8px;
+        letter-spacing: -1px;
+    }
+    .write-lines {
+        height: 34px;
+        margin: 4px 0 6px 0;
+        background-image: repeating-linear-gradient(
+            to bottom,
+            transparent 0px,
+            transparent 13px,
+            #d9d2c8 14px
+        );
+        opacity: 0.75;
+    }
+    .sunday { color: #c0392b; }
+    .saturday { color: #1f4e79; }
+    .event-line {
+        font-size: 0.78rem;
+        line-height: 1.35;
+        margin: 3px 0;
+        padding: 3px 5px;
+        border-radius: 5px;
+        background: #f6efe6;
+        overflow-wrap: anywhere;
+        border-left: 3px solid #bfae9b;
+    }
+    .important {
+        background: #ffe9e0;
+        border-left: 4px solid #d65a31;
+    }
+    .small-note {
+        color: #7a6a5b;
+        font-size: 0.9rem;
+    }
+
+    .today-board-card {
+        border: 2px solid #d8d0c4;
+        border-left: 10px solid #bfae9b;
+        background: #fffdf8;
+        border-radius: 8px;
+        padding: 14px 16px;
+        margin: 10px 0;
+        box-shadow: none;
+    }
+    .today-board-card-important {
+        border-left: 10px solid #d65a31;
+        background: #fff3ee;
+    }
+    .today-board-main {
+        font-size: 1.35rem;
+        font-weight: 800;
+        line-height: 1.35;
+        color: #3f3a35;
+    }
+    .today-board-time {
+        display: inline-block;
+        min-width: 76px;
+        font-size: 1.45rem;
+        font-weight: 900;
+        color: #2f2a25;
+    }
+    .today-board-memo {
+        font-size: 1.05rem;
+        margin-top: 8px;
+        padding-left: 82px;
+        color: #4f463d;
+    }
+    .today-board-sub {
+        font-size: 0.9rem;
+        margin-top: 8px;
+        padding-left: 82px;
+        color: #7a6a5b;
+    }
+    .today-board-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #f2eadf;
+        font-size: 0.82rem;
+        margin-right: 4px;
+    }
+    .today-summary-box {
+        border: 2px solid #d8d0c4;
+        background: #f9f5ee;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin: 8px 0 14px 0;
+        font-size: 1.05rem;
+        font-weight: 700;
+    }
+
+    </style>
+    """, unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def monthly_events(year, month):
     start = f"{year}-{month:02d}-01"
     last_day = calendar.monthrange(year, month)[1]
     end = f"{year}-{month:02d}-{last_day:02d}"
 
-    df = fetch_df(f"""
-        SELECT {EVENT_LIST_COLUMNS}
-        FROM events
+    df = fetch_df("""
+        SELECT * FROM events
         WHERE event_date BETWEEN ? AND ?
         ORDER BY event_date, start_time, category, id
     """, (start, end))
@@ -302,13 +1159,13 @@ def monthly_events(year, month):
 
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def events_by_date(target_date):
     """指定日の予定一覧を取得する。"""
     if hasattr(target_date, "strftime"):
         target_date = target_date.strftime("%Y-%m-%d")
-    return fetch_df(f"""
-        SELECT {EVENT_TODAY_COLUMNS}
+    return fetch_df("""
+        SELECT *
         FROM events
         WHERE event_date = ?
         ORDER BY
@@ -337,6 +1194,7 @@ def render_event_button_list(df, empty_message="予定はありません。", in
         with cols[i % 3]:
             if st.button(label, key=f"event_btn_{ev['id']}", use_container_width=True):
                 set_selected_event(int(ev["id"]))
+                st.rerun()
 
 
 
@@ -413,6 +1271,7 @@ def render_today_board(df):
 
         if st.button("詳細を見る", key=f"today_detail_{ev['id']}", use_container_width=True):
             set_selected_event(int(ev["id"]))
+            st.rerun()
 
 
 def html_escape(text):
@@ -433,11 +1292,11 @@ def set_selected_event(event_id):
     st.session_state["selected_calendar_event_id"] = int(event_id)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def get_event_by_id(event_id):
     if not event_id:
         return pd.DataFrame()
-    return fetch_df(f"SELECT {EVENT_DETAIL_COLUMNS} FROM events WHERE id=? LIMIT 1", (int(event_id),))
+    return fetch_df("SELECT * FROM events WHERE id=? LIMIT 1", (int(event_id),))
 
 
 def render_event_detail_panel():
@@ -643,385 +1502,81 @@ def render_saved_event_confirmation(event_id=None):
 
 
 
-
-def get_weekday_label(target_date):
-    labels = ["月", "火", "水", "木", "金", "土", "日"]
-    return labels[target_date.weekday()]
-
-
-def format_event_for_calendar(event):
-    mark = get_category_mark(event.get("category", ""))
-    time_text = str(event.get("start_time") or "").strip()
-    title = str(event.get("title") or "").strip()
-    category = str(event.get("category") or "").strip()
-    important = "!" if int(event.get("important") or 0) == 1 else ""
-    head = f"{time_text} " if time_text else ""
-    cat = f"［{category}］" if category else ""
-    return f"{important}{mark} {head}{cat}{title}".strip()
-
-
-def render_day_cell(target_date, day_events):
-    date_key = target_date.strftime("%Y-%m-%d")
-    is_selected = st.session_state.get("selected_calendar_date") == date_key
-    is_today = target_date == today_jst()
-    weekday = target_date.weekday()
-    classes = ["hm-day-card"]
-    if weekday == 6:
-        classes.append("hm-sunday")
-    if weekday == 5:
-        classes.append("hm-saturday")
-    if is_today:
-        classes.append("hm-today")
-    if is_selected:
-        classes.append("hm-selected")
-    if day_events:
-        classes.append("hm-has-events")
-
-    event_lines = []
-    for ev in day_events[:3]:
-        event_lines.append(
-            f'<div class="hm-event-pill">{html_escape(format_event_for_calendar(ev))}</div>'
-        )
-    if len(day_events) > 3:
-        event_lines.append(f'<div class="hm-more-events">ほか {len(day_events) - 3} 件</div>')
-
-    count_badge = f'<span class="hm-event-count">{len(day_events)}件</span>' if day_events else ""
-    html = (
-        f'<div class="{" ".join(classes)}">'
-        f'<div class="hm-day-top"><span class="hm-day-number">{target_date.day}</span>'
-        f'<span class="hm-weekday">{get_weekday_label(target_date)}</span>{count_badge}</div>'
-        f'<div class="hm-day-events">{"".join(event_lines)}</div>'
-        f'</div>'
-    )
-    st.markdown(html, unsafe_allow_html=True)
-    if st.button("この日を選択", key=f"select_day_{date_key}", use_container_width=True):
-        st.session_state["selected_calendar_date"] = date_key
-        st.session_state["editing_event_id"] = None
-        st.session_state["pending_delete_event_id"] = None
-        st.rerun()
-
-
-def render_month_calendar(year, month, events=None):
-    events = events if events is not None else monthly_events(year, month)
-    first_weekday, last_day = calendar.monthrange(year, month)
-    start_col = (first_weekday + 1) % 7
-    days = [None] * start_col
-    days.extend(date(year, month, day) for day in range(1, last_day + 1))
-    while len(days) % 7 != 0:
-        days.append(None)
-
-    st.markdown(f'<div class="hm-calendar-title">{year}年 {month}月</div>', unsafe_allow_html=True)
-    header_cols = st.columns(7)
-    for idx, label in enumerate(["日", "月", "火", "水", "木", "金", "土"]):
-        cls = "hm-cal-head hm-sunday-text" if idx == 0 else "hm-cal-head hm-saturday-text" if idx == 6 else "hm-cal-head"
-        header_cols[idx].markdown(f'<div class="{cls}">{label}</div>', unsafe_allow_html=True)
-
-    for week_start in range(0, len(days), 7):
-        cols = st.columns(7)
-        for idx, target_date in enumerate(days[week_start:week_start + 7]):
-            with cols[idx]:
-                if target_date is None:
-                    st.markdown('<div class="hm-day-card hm-blank"></div>', unsafe_allow_html=True)
-                else:
-                    key = target_date.strftime("%Y-%m-%d")
-                    render_day_cell(target_date, events.get(key, []))
-
-
-def _event_user_label(user_map, event_row):
-    user_id = str(event_row.get("user_id") or "")
-    user_name = str(event_row.get("user_name") or "")
-    if user_id and user_name:
-        expected = f"{user_name}（ID:{user_id}）"
-        if expected in user_map:
-            return expected
-    for label, pair in user_map.items():
-        if pair[0] == user_id or pair[1] == user_name:
-            return label
-    return ""
-
-
-def _event_date_value(value, fallback_date):
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d").date()
-    except Exception:
-        return fallback_date
-
-
-def render_selected_day_events(selected_date):
-    st.markdown("### 選択日の予定詳細")
-    date_text = selected_date.strftime("%Y-%m-%d")
-    st.caption(f"{date_text}（{get_weekday_label(selected_date)}）")
-    df = events_by_date(date_text)
-    if df.empty:
-        st.info("この日の予定はまだありません。下のフォームから登録できます。")
-        return
-
-    for _, ev in df.iterrows():
-        event_id = int(ev["id"])
-        important = "重要 " if int(ev.get("important") or 0) == 1 else ""
-        time_text = " - ".join([x for x in [ev.get("start_time"), ev.get("end_time")] if x]) or "時刻未設定"
-        title = html_escape(ev.get("title") or "")
-        category = html_escape(ev.get("category") or "")
-        memo = html_escape(ev.get("memo") or "")
-        staff = html_escape(ev.get("staff_name") or "")
-        user = html_escape(ev.get("user_name") or "")
-        mark = get_category_mark(ev.get("category"))
-
-        st.markdown(
-            f'<div class="hm-detail-card">'
-            f'<div class="hm-detail-title">{important}{mark} {title}</div>'
-            f'<div class="hm-detail-meta">{time_text}　{category}'
-            f'{"　利用者: " + user if user else ""}'
-            f'{"　担当: " + staff if staff else ""}</div>'
-            f'<div class="hm-detail-memo">{memo if memo else "メモなし"}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        c1, c2, c3 = st.columns([1, 1, 4])
-        with c1:
-            if st.button("編集", key=f"edit_event_{event_id}", use_container_width=True):
-                st.session_state["editing_event_id"] = event_id
-                st.session_state["pending_delete_event_id"] = None
-                st.rerun()
-        with c2:
-            if st.button("削除", key=f"ask_delete_event_{event_id}", use_container_width=True):
-                st.session_state["pending_delete_event_id"] = event_id
-                st.rerun()
-        if st.session_state.get("pending_delete_event_id") == event_id:
-            st.warning(f"予定ID {event_id} を削除します。写真メモ・添付ファイルも一緒に削除されます。")
-            d1, d2 = st.columns(2)
-            with d1:
-                if st.button("削除を確定", key=f"confirm_delete_event_{event_id}", type="primary", use_container_width=True):
-                    photos = get_event_photos(event_id)
-                    for _, photo in photos.iterrows():
-                        delete_saved_file(photo["file_path"])
-                    files = get_event_files(event_id)
-                    for _, file_row in files.iterrows():
-                        delete_saved_file(file_row["file_path"])
-                    execute("DELETE FROM event_photos WHERE event_id=?", (event_id,))
-                    execute("DELETE FROM event_files WHERE event_id=?", (event_id,))
-                    execute("DELETE FROM events WHERE id=?", (event_id,))
-                    clear_event_photos_cache()
-                    clear_event_files_cache()
-                    clear_event_caches()
-                    st.session_state["pending_delete_event_id"] = None
-                    st.session_state["editing_event_id"] = None
-                    st.success("予定を削除しました。")
-                    st.rerun()
-            with d2:
-                if st.button("キャンセル", key=f"cancel_delete_event_{event_id}", use_container_width=True):
-                    st.session_state["pending_delete_event_id"] = None
-                    st.rerun()
-
-
-def render_event_form(selected_date, editing_event_id=None):
-    editing_event = None
-    if editing_event_id:
-        edit_df = get_event_by_id(editing_event_id)
-        if not edit_df.empty:
-            editing_event = edit_df.iloc[0]
-        else:
-            st.session_state["editing_event_id"] = None
-            st.warning("編集中の予定が見つかりません。")
-
-    st.markdown("### 選択日の予定登録・編集フォーム")
-    if editing_event is not None:
-        st.info(f"予定ID {int(editing_event['id'])} を編集中です。")
-
-    user_map = user_display_map()
-    users = list(user_map.keys())
-    staff = [""] + get_active_staff()
-    category_options = get_categories()
-    if editing_event is not None and editing_event.get("category") and editing_event["category"] not in category_options:
-        category_options = [editing_event["category"]] + category_options
-
-    default_date = _event_date_value(editing_event.get("event_date"), selected_date) if editing_event is not None else selected_date
-    default_category = editing_event.get("category") if editing_event is not None else (category_options[0] if category_options else "")
-    default_staff = editing_event.get("staff_name") if editing_event is not None else ""
-    staff_index = staff.index(default_staff) if default_staff in staff else 0
-    user_label = _event_user_label(user_map, editing_event) if editing_event is not None else ""
-    user_index = users.index(user_label) if user_label in users else 0
-    form_key = f"selected_day_event_form_{selected_date.strftime('%Y%m%d')}_{editing_event_id or 'new'}"
-
-    with st.form(form_key, clear_on_submit=editing_event is None):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            event_date = st.date_input("日付", value=default_date, key=f"{form_key}_date")
-            category = st.selectbox(
-                "種別",
-                category_options,
-                index=category_options.index(default_category) if default_category in category_options else 0,
-                key=f"{form_key}_category",
-            )
-        with c2:
-            start_time = st.text_input("開始時刻", value=str(editing_event.get("start_time") or "") if editing_event is not None else "", placeholder="例：10:00")
-            end_time = st.text_input("終了時刻", value=str(editing_event.get("end_time") or "") if editing_event is not None else "", placeholder="例：11:00")
-        with c3:
-            user_name = st.selectbox("利用者", users, index=user_index, key=f"{form_key}_user")
-            staff_name = st.selectbox("担当職員", staff, index=staff_index, key=f"{form_key}_staff")
-
-        title = st.text_input("予定タイトル", value=str(editing_event.get("title") or "") if editing_event is not None else "", placeholder="例：内科受診、家族面会、外出支援")
-        memo = st.text_area("メモ", value=str(editing_event.get("memo") or "") if editing_event is not None else "", placeholder="持ち物、注意点、申し送りなど")
-        important = st.checkbox("重要マーク", value=bool(editing_event.get("important")) if editing_event is not None else False)
-
-        uploaded_photos = uploaded_files = []
-        photo_memo = file_memo = ""
-        if editing_event is None:
-            uploaded_photos = st.file_uploader("写真メモ（複数可）", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key=f"{form_key}_photos")
-            photo_memo = st.text_input("写真メモ補足", key=f"{form_key}_photo_memo")
-            uploaded_files = st.file_uploader("Excel・書類ファイル（複数可）", type=["xlsx", "xls", "csv"], accept_multiple_files=True, key=f"{form_key}_files")
-            file_memo = st.text_input("Excel・書類メモ補足", key=f"{form_key}_file_memo")
-        else:
-            st.caption("写真メモ・添付ファイルの追加や削除は、従来の予定検索・更新・削除画面でも行えます。")
-
-        submit_label = "予定を更新" if editing_event is not None else "予定を登録"
-        submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
-
-    if not submitted:
-        if editing_event is not None and st.button("編集をやめる", key=f"cancel_edit_{editing_event_id}", use_container_width=True):
-            st.session_state["editing_event_id"] = None
-            st.rerun()
-        return
-
-    if not title.strip():
-        st.error("予定タイトルを入力してください。")
-        return
-
-    selected_user_id, selected_user_name = user_map.get(user_name, ("", ""))
-    if editing_event is not None:
-        execute("""
-            UPDATE events
-            SET event_date=?, category=?, title=?, user_id=?, user_name=?, staff_name=?,
-                start_time=?, end_time=?, memo=?, important=?, updated_at=?
-            WHERE id=?
-        """, (
-            event_date.strftime("%Y-%m-%d"),
-            category,
-            title.strip(),
-            selected_user_id or None,
-            selected_user_name or None,
-            staff_name or None,
-            start_time.strip() or None,
-            end_time.strip() or None,
-            memo.strip() or None,
-            1 if important else 0,
-            now_text(),
-            int(editing_event_id),
-        ))
-        clear_event_caches()
-        st.session_state["selected_calendar_date"] = event_date.strftime("%Y-%m-%d")
-        st.session_state["editing_event_id"] = None
-        st.success("予定を更新しました。")
-        st.rerun()
-
-    event_id = execute("""
-        INSERT INTO events
-        (event_date, category, title, user_id, user_name, staff_name, start_time, end_time, memo, important, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        event_date.strftime("%Y-%m-%d"),
-        category,
-        title.strip(),
-        selected_user_id or None,
-        selected_user_name or None,
-        staff_name or None,
-        start_time.strip() or None,
-        end_time.strip() or None,
-        memo.strip() or None,
-        1 if important else 0,
-        now_text(),
-        now_text(),
-    ))
-    photo_saved, photo_failed = save_uploaded_photos(event_id, uploaded_photos, photo_memo)
-    file_saved, file_failed = save_uploaded_files(event_id, uploaded_files, file_memo)
-    clear_event_caches()
-    st.session_state["selected_calendar_date"] = event_date.strftime("%Y-%m-%d")
-    st.session_state["selected_calendar_event_id"] = int(event_id)
-    st.session_state["last_saved_event_id"] = int(event_id)
-    st.session_state["last_saved_photo_saved"] = int(photo_saved)
-    st.session_state["last_saved_photo_failed"] = int(photo_failed)
-    st.session_state["last_saved_file_saved"] = int(file_saved)
-    st.session_state["last_saved_file_failed"] = int(file_failed)
-    st.session_state["last_saved_had_photos"] = bool(uploaded_photos)
-    st.session_state["last_saved_had_files"] = bool(uploaded_files)
-    if photo_failed or file_failed:
-        st.warning("予定は保存しましたが、一部の写真メモまたは添付ファイルの保存に失敗しました。")
-    else:
-        st.success("予定を保存しました。")
-    st.rerun()
-
-
 def render_calendar(year, month):
-    render_month_calendar(year, month, monthly_events(year, month))
+    """
+    紙の壁カレンダー風レイアウト。
+    カレンダーはHTMLで表示し、予定詳細は下部の予定ボタンから同じページ内に表示する。
+    """
+    events_by_day = monthly_events(year, month)
+    first_weekday, last_day = calendar.monthrange(year, month)  # Monday=0, Sunday=6
+    start_col = (first_weekday + 1) % 7
+
+    cells = [""] * 42
+    for day in range(1, last_day + 1):
+        cells[start_col + day - 1] = day
+
+    html = []
+    html.append(f'<div class="calendar-title">{year}年 {month}月</div>')
+    html.append('<div class="calendar-grid">')
+
+    for h in ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]:
+        html.append(f'<div class="day-head">{h}</div>')
+
+    for idx, day in enumerate(cells):
+        dow = idx % 7
+        dow_cls = "sunday" if dow == 0 else ("saturday" if dow == 6 else "")
+
+        if day == "":
+            html.append('<div class="day-cell blank-cell"></div>')
+            continue
+
+        key = f"{year}-{month:02d}-{int(day):02d}"
+        html.append('<div class="day-cell">')
+        html.append(f'<div class="day-num {dow_cls}">{day}</div>')
+        html.append('<div class="write-lines"></div>')
+
+        for ev in events_by_day.get(key, []):
+            mark = get_category_mark(ev["category"])
+            time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
+            user_part = f'／{ev["user_name"]}' if ev["user_name"] else ""
+            imp_cls = " important" if int(ev["important"] or 0) == 1 else ""
+            text = html_escape(f'{mark}{time_part}{ev["title"]}{user_part}')
+            html.append(f'<div class="event-line{imp_cls}">{text}</div>')
+
+        html.append('</div>')
+
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+    # Streamlitの通常ボタンで詳細表示。HTML内クリックより安定。
+    month_events = []
+    for key in sorted(events_by_day.keys()):
+        for ev in events_by_day[key]:
+            month_events.append(ev)
+
+    if month_events:
+        st.markdown("### 予定詳細を表示")
+        st.caption("下の予定ボタンから選ぶと、詳細が同じページ内に表示されます。")
+        month_df = pd.DataFrame(month_events)
+        render_event_button_list(month_df, empty_message="この月の予定はありません。", include_date=True)
+
+    render_event_detail_panel()
 
 
+# -----------------------------
+# Pages
+# -----------------------------
 def page_calendar():
     today = today_jst()
-    st.subheader("月間カレンダー")
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        year = st.number_input("年", min_value=2020, max_value=2100, value=today.year, step=1, key="calendar_year")
-    with c2:
-        month = st.number_input("月", min_value=1, max_value=12, value=today.month, step=1, key="calendar_month")
-    with c3:
-        st.caption("日付を選ぶと、下にその日の予定詳細と登録フォームが表示されます。")
-
-    default_date = date(int(year), int(month), min(today.day, calendar.monthrange(int(year), int(month))[1]))
-    selected_text = st.session_state.get("selected_calendar_date")
-    try:
-        selected_date = datetime.strptime(selected_text, "%Y-%m-%d").date() if selected_text else default_date
-    except Exception:
-        selected_date = default_date
-    if selected_date.year != int(year) or selected_date.month != int(month):
-        selected_date = default_date
-        st.session_state["selected_calendar_date"] = selected_date.strftime("%Y-%m-%d")
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        year = st.number_input("", min_value=2020, max_value=2100, value=today.year, step=1)
+    with col2:
+        month = st.number_input("", min_value=1, max_value=12, value=today.month, step=1)
+    with col3:
+        st.markdown('<div class="small-note"></div>', unsafe_allow_html=True)
 
     render_calendar(int(year), int(month))
-    st.markdown("---")
-    render_selected_day_events(selected_date)
-    st.markdown("---")
-    render_event_form(selected_date, st.session_state.get("editing_event_id"))
-    render_saved_event_confirmation()
-
-    st.markdown("### PDF/Excel出力")
-    out1, out2 = st.columns(2)
-    with out1:
-        if REPORTLAB_AVAILABLE:
-            try:
-                pdf_bytes = make_calendar_pdf(int(year), int(month), include_detail=True)
-                st.download_button(
-                    "月間カレンダーPDFをダウンロード",
-                    data=pdf_bytes,
-                    file_name=f"hidamari_calendar_{int(year)}_{int(month):02d}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error(f"PDFを作成できませんでした：{e}")
-        else:
-            st.warning("reportlab が未導入のためPDF出力できません。")
-    with out2:
-        month_events = []
-        for day_events in monthly_events(int(year), int(month)).values():
-            for ev in day_events:
-                month_events.append(dict(ev))
-        if month_events:
-            try:
-                from io import BytesIO
-                bio = BytesIO()
-                pd.DataFrame(month_events).to_excel(bio, index=False, sheet_name="予定")
-                st.download_button(
-                    "月間予定Excelをダウンロード",
-                    data=bio.getvalue(),
-                    file_name=f"hidamari_events_{int(year)}_{int(month):02d}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error(f"Excelを作成できませんでした：{e}")
-        else:
-            st.download_button("月間予定Excelをダウンロード", data=b"", file_name="hidamari_events_empty.xlsx", disabled=True, use_container_width=True)
-
 
 
 
@@ -1129,7 +1684,6 @@ def page_event_register():
         ))
         photo_saved, photo_failed = save_uploaded_photos(event_id, uploaded_photos, photo_memo)
         file_saved, file_failed = save_uploaded_files(event_id, uploaded_files, file_memo)
-        clear_event_caches()
 
         st.session_state["selected_calendar_event_id"] = int(event_id)
         st.session_state["last_saved_event_id"] = int(event_id)
@@ -1172,9 +1726,8 @@ def page_event_manage():
 
     keyword = st.text_input("キーワード検索", placeholder="タイトル・メモ・利用者名・職員名")
 
-    query = f"""
-        SELECT {EVENT_TODAY_COLUMNS}
-        FROM events
+    query = """
+        SELECT * FROM events
         WHERE event_date BETWEEN ? AND ?
     """
     params = [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]
@@ -1222,8 +1775,6 @@ def page_event_manage():
                 if st.button(f"この写真を削除 ID:{p['id']}", key=f"delete_photo_{p['id']}"):
                     delete_saved_file(p["file_path"])
                     execute("DELETE FROM event_photos WHERE id=?", (int(p["id"]),))
-                    clear_event_photos_cache()
-                    clear_event_caches()
                     st.success("写真メモを削除しました。画面を再読み込みしてください。")
 
     with st.expander("この予定に写真メモを追加する"):
@@ -1236,8 +1787,6 @@ def page_event_manage():
         add_photo_memo = st.text_input("追加写真メモ", key=f"add_photo_memo_{selected_id}")
         if st.button("写真メモを追加", key=f"add_photo_btn_{selected_id}"):
             saved, failed = save_uploaded_photos(selected_id, add_photos, add_photo_memo)
-            if saved:
-                clear_event_caches()
             if failed:
                 st.warning(f"写真メモ：{saved}件保存、{failed}件失敗しました。")
             else:
@@ -1266,8 +1815,6 @@ def page_event_manage():
                 if st.button(f"削除 ID:{frow['id']}", key=f"delete_file_{frow['id']}"):
                     delete_saved_file(frow["file_path"])
                     execute("DELETE FROM event_files WHERE id=?", (int(frow["id"]),))
-                    clear_event_files_cache()
-                    clear_event_caches()
                     st.success("ファイルを削除しました。画面を再読み込みしてください。")
 
     with st.expander("この予定にExcel・書類ファイルを追加する"):
@@ -1280,8 +1827,6 @@ def page_event_manage():
         add_file_memo = st.text_input("追加ファイルメモ", key=f"add_file_memo_{selected_id}")
         if st.button("Excel・書類ファイルを追加", key=f"add_file_btn_{selected_id}"):
             saved, failed = save_uploaded_files(selected_id, add_files, add_file_memo)
-            if saved:
-                clear_event_caches()
             if failed:
                 st.warning(f"Excel・書類ファイル：{saved}件保存、{failed}件失敗しました。")
             else:
@@ -1359,7 +1904,6 @@ def page_event_manage():
             now_text(),
             int(selected_id),
         ))
-        clear_event_caches()
         st.success("予定を更新しました。画面を再読み込みしてください。")
 
     if delete_btn:
@@ -1372,9 +1916,6 @@ def page_event_manage():
         execute("DELETE FROM event_photos WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM event_files WHERE event_id=?", (int(selected_id),))
         execute("DELETE FROM events WHERE id=?", (int(selected_id),))
-        clear_event_photos_cache()
-        clear_event_files_cache()
-        clear_event_caches()
         st.warning("予定と紐づく写真メモ・Excelファイルを削除しました。画面を再読み込みしてください。")
 
 
@@ -1410,7 +1951,6 @@ def page_category_master():
                     now_text(),
                     now_text(),
                 ))
-                clear_master_caches()
                 st.success("カテゴリを追加しました。")
             except Exception as e:
                 st.error(f"追加できませんでした。同じカテゴリ名がある可能性があります：{e}")
@@ -1470,7 +2010,6 @@ def page_category_master():
                     now_text(),
                     int(selected_id),
                 ))
-                clear_master_caches()
                 st.success("カテゴリを更新しました。画面を再読み込みしてください。")
             except Exception as e:
                 st.error(f"更新できませんでした：{e}")
@@ -1481,11 +2020,9 @@ def page_category_master():
         count = int(used.iloc[0]["cnt"]) if not used.empty else 0
         if count > 0:
             execute("UPDATE categories SET is_active=0, updated_at=? WHERE id=?", (now_text(), int(selected_id)))
-            clear_master_caches()
             st.warning(f"このカテゴリは既存予定で {count} 件使われているため、削除せず非表示にしました。")
         else:
             execute("DELETE FROM categories WHERE id=?", (int(selected_id),))
-            clear_master_caches()
             st.warning("カテゴリを削除しました。画面を再読み込みしてください。")
 
 
@@ -1519,12 +2056,11 @@ def page_master_users():
                     INSERT INTO users (user_id, user_name, kana, room_no, note, is_active, created_at)
                     VALUES (?, ?, ?, ?, ?, 1, ?)
                 """, (user_id_value, user_name.strip(), kana.strip(), room_no.strip(), note.strip(), now_text()))
-                clear_master_caches()
                 st.success("利用者を追加しました。")
             except DB_INTEGRITY_ERROR:
                 st.error("同じ利用者名がすでに登録されています。")
 
-    df = fetch_df(f"SELECT {USER_COLUMNS} FROM users ORDER BY is_active DESC, user_name")
+    df = fetch_df("SELECT * FROM users ORDER BY is_active DESC, user_name")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if not df.empty:
@@ -1533,20 +2069,19 @@ def page_master_users():
         new_active = st.radio("状態", [1, 0], index=0 if target["is_active"] == 1 else 1, format_func=lambda x: "有効" if x == 1 else "無効")
         if st.button("利用者状態を更新"):
             execute("UPDATE users SET is_active=? WHERE id=?", (int(new_active), int(selected)))
-            clear_master_caches()
             st.success("状態を更新しました。")
 
 
 def page_master_staff():
     st.subheader("職員マスタ")
-    st.caption("KING OF TIMEへシフトCSVを出力する場合は、従業員コードを登録しておくとCSVの「従業員コード」に反映されます。未入力でも保存できます。")
+    st.caption("KING OF TIMEへシフトCSVを出力する場合は、従業員コードを登録しておくとCSVの「従業員コード」に反映されます。")
 
     with st.form("staff_add_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
             staff_name = st.text_input("職員名")
         with c2:
-            staff_code = st.text_input("従業員コード（KING OF TIME）", placeholder="例：001（未入力可）")
+            staff_code = st.text_input("従業員コード（KING OF TIME）", placeholder="例：001")
         with c3:
             role = st.text_input("役割", placeholder="例：管理者、日勤、夜勤")
         add = st.form_submit_button("職員を追加")
@@ -1571,7 +2106,6 @@ def page_master_staff():
                         INSERT INTO staff (staff_name, staff_code, role, is_active, created_at)
                         VALUES (?, ?, ?, 1, ?)
                     """, (clean_staff_name, clean_staff_code or None, role.strip(), now_text()))
-                    clear_master_caches()
                     st.success("職員を追加しました。")
                 except DB_INTEGRITY_ERROR:
                     st.error("同じ職員名がすでに登録されています。")
@@ -1633,8 +2167,8 @@ def page_master_staff():
                         int(new_active),
                         int(selected),
                     ))
-                    clear_master_caches()
                     st.success("職員情報を更新しました。")
+                    st.rerun()
 
 
 
@@ -1654,7 +2188,8 @@ def page_photo_notes():
             e.title,
             e.user_id,
             e.user_name,
-            e.staff_name
+            e.staff_name,
+            e.memo
         FROM event_photos p
         JOIN events e ON p.event_id = e.id
         ORDER BY e.event_date DESC, p.id DESC
@@ -1672,7 +2207,8 @@ def page_photo_notes():
             df["user_id"].fillna("").str.contains(kw, case=False, na=False) |
             df["user_name"].fillna("").str.contains(kw, case=False, na=False) |
             df["staff_name"].fillna("").str.contains(kw, case=False, na=False) |
-            df["photo_memo"].fillna("").str.contains(kw, case=False, na=False)
+            df["photo_memo"].fillna("").str.contains(kw, case=False, na=False) |
+            df["memo"].fillna("").str.contains(kw, case=False, na=False)
         )
         df = df[mask]
 
@@ -1680,26 +2216,24 @@ def page_photo_notes():
         st.info("該当する写真メモはありません。")
         return
 
-    show_df = df.drop(columns=["file_path"], errors="ignore")
-    st.dataframe(show_df, use_container_width=True, hide_index=True)
-
-    selected_photo_id = st.selectbox("表示する写真ID", df["photo_id"].tolist())
-    row = df[df["photo_id"] == selected_photo_id].iloc[0]
-    st.markdown("---")
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        render_saved_image(
-            row["file_path"],
-            use_container_width=True,
-        )
-    with c2:
-        st.write(f"**{row['event_date']}｜{row['category']}｜{row['title']}**")
-        if row["user_name"]:
-            st.write(f"利用者：{row['user_name']}（ID:{row['user_id'] or ''}）")
-        if row["staff_name"]:
-            st.write(f"担当：{row['staff_name']}")
-        st.write(f"写真メモ：{row['photo_memo'] or ''}")
-        st.caption(f"写真登録：{row['photo_created_at']}")
+    for _, row in df.iterrows():
+        st.markdown("---")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            render_saved_image(
+                row["file_path"],
+                use_container_width=True,
+            )
+        with c2:
+            st.write(f"**{row['event_date']}｜{row['category']}｜{row['title']}**")
+            if row["user_name"]:
+                st.write(f"利用者：{row['user_name']}（ID:{row['user_id'] or ''}）")
+            if row["staff_name"]:
+                st.write(f"担当：{row['staff_name']}")
+            st.write(f"写真メモ：{row['photo_memo'] or ''}")
+            if row["memo"]:
+                st.caption(f"予定メモ：{row['memo']}")
+            st.caption(f"写真登録：{row['photo_created_at']}")
 
 
 
@@ -1720,7 +2254,8 @@ def page_attached_files():
             e.title,
             e.user_id,
             e.user_name,
-            e.staff_name
+            e.staff_name,
+            e.memo
         FROM event_files f
         JOIN events e ON f.event_id = e.id
         ORDER BY e.event_date DESC, f.id DESC
@@ -1739,7 +2274,8 @@ def page_attached_files():
             df["user_name"].fillna("").str.contains(kw, case=False, na=False) |
             df["staff_name"].fillna("").str.contains(kw, case=False, na=False) |
             df["file_name"].fillna("").str.contains(kw, case=False, na=False) |
-            df["file_memo"].fillna("").str.contains(kw, case=False, na=False)
+            df["file_memo"].fillna("").str.contains(kw, case=False, na=False) |
+            df["memo"].fillna("").str.contains(kw, case=False, na=False)
         )
         df = df[mask]
 
@@ -1747,27 +2283,23 @@ def page_attached_files():
         st.info("該当するファイルはありません。")
         return
 
-    show_df = df.drop(columns=["file_path"], errors="ignore")
-    st.dataframe(show_df, use_container_width=True, hide_index=True)
+    for _, row in df.iterrows():
+        st.markdown("---")
+        st.write(f"📎 **{row['file_name']}**")
+        st.write(f"{row['event_date']}｜{row['category']}｜{row['title']}")
+        if row["user_name"]:
+            st.write(f"利用者：{row['user_name']}")
+        if row["staff_name"]:
+            st.write(f"担当：{row['staff_name']}")
+        st.write(f"ファイルメモ：{row['file_memo'] or ''}")
+        st.caption(f"登録：{row['file_created_at']}")
 
-    selected_file_id = st.selectbox("ダウンロードするファイルID", df["file_id"].tolist())
-    row = df[df["file_id"] == selected_file_id].iloc[0]
-    st.markdown("---")
-    st.write(f"📎 **{row['file_name']}**")
-    st.write(f"{row['event_date']}｜{row['category']}｜{row['title']}")
-    if row["user_name"]:
-        st.write(f"利用者：{row['user_name']}")
-    if row["staff_name"]:
-        st.write(f"担当：{row['staff_name']}")
-    st.write(f"ファイルメモ：{row['file_memo'] or ''}")
-    st.caption(f"登録：{row['file_created_at']}")
-
-    render_saved_download_button(
-        "ダウンロード",
-        row["file_path"],
-        row["file_name"],
-        key=f"file_list_download_{row['file_id']}",
-    )
+        render_saved_download_button(
+            "ダウンロード",
+            row["file_path"],
+            row["file_name"],
+            key=f"file_list_download_{row['file_id']}",
+        )
 
 
 
@@ -2026,7 +2558,6 @@ def ensure_import_category(category_name):
             (category_name, mark, sort_order, is_active, created_at, updated_at)
             VALUES (?, ?, 900, 1, ?, ?)
         """, (category_name, mark, now_text(), now_text()))
-        clear_master_caches()
     except Exception:
         pass
 
@@ -2045,7 +2576,6 @@ def upsert_import_user(user_id, user_name):
             INSERT INTO users (user_id, user_name, kana, room_no, note, is_active, created_at)
             VALUES (?, ?, '', '', '予定データ取込から自動追加', 1, ?)
         """, (user_id, user_name, now_text()))
-        clear_master_caches()
     except Exception:
         pass
 
@@ -2054,7 +2584,7 @@ def insert_import_event(row):
     """正規化済み1行をeventsへ登録。"""
     ensure_import_category(row.get("category", "その他"))
     upsert_import_user(row.get("user_id", ""), row.get("user_name", ""))
-    event_id = execute("""
+    return execute("""
         INSERT INTO events
         (event_date, category, title, user_id, user_name, staff_name, start_time, end_time, memo, important, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2072,8 +2602,6 @@ def insert_import_event(row):
         now_text(),
         now_text(),
     ))
-    clear_event_caches()
-    return event_id
 
 
 def page_schedule_import():
@@ -2205,11 +2733,507 @@ def page_schedule_import():
 # -----------------------------
 # PDFカレンダー出力
 # -----------------------------
+PDF_FONT_GOTHIC = "HeiseiKakuGo-W5"
+PDF_FONT_MINCHO = "HeiseiMin-W3"
+
+
+def init_pdf_fonts():
+    """ReportLabの日本語CIDフォントを登録する。"""
+    if not REPORTLAB_AVAILABLE:
+        return False
+    try:
+        if PDF_FONT_GOTHIC not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont(PDF_FONT_GOTHIC))
+        if PDF_FONT_MINCHO not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont(PDF_FONT_MINCHO))
+        return True
+    except Exception:
+        return False
+
+
+def pdf_text(value):
+    """PDF描画用にNone/nanを空文字へ寄せる。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def text_width(text, font_name, font_size):
+    """ReportLab上の文字幅を取得する。"""
+    try:
+        return pdfmetrics.stringWidth(str(text), font_name, font_size)
+    except Exception:
+        return len(str(text)) * font_size
+
+
+def fit_pdf_text(text, max_width, font_name=PDF_FONT_GOTHIC, font_size=8, ellipsis="…"):
+    """
+    指定幅に収まるよう、1行表示用の文字列へ整える。
+    改行・連続空白を1つの空白へ寄せ、長い場合は末尾を…で省略する。
+    """
+    s = re.sub(r"\s+", " ", pdf_text(text)).strip()
+    if not s:
+        return ""
+    if text_width(s, font_name, font_size) <= max_width:
+        return s
+
+    # 省略記号だけでも幅を超える場合
+    if text_width(ellipsis, font_name, font_size) > max_width:
+        return ""
+
+    low, high = 0, len(s)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = s[:mid] + ellipsis
+        if text_width(candidate, font_name, font_size) <= max_width:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best or ellipsis
+
+
+def wrap_pdf_text(text, max_width, font_name, font_size, max_lines=3):
+    """
+    日本語を含む文字列を、文字単位で指定幅に折り返す。
+    長すぎる場合は最終行を…で省略する。
+    """
+    text = pdf_text(text).replace("\r", "\n")
+    if not text:
+        return []
+
+    lines = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        current = ""
+        for ch in raw:
+            candidate = current + ch
+            if text_width(candidate, font_name, font_size) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = ch
+                if len(lines) >= max_lines:
+                    break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+        if len(lines) >= max_lines:
+            break
+
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+
+    if lines:
+        original_joined = "".join([ln for ln in text.splitlines() if ln.strip()])
+        wrapped_joined = "".join(lines)
+        if len(wrapped_joined) < len(original_joined):
+            last = lines[-1]
+            while last and text_width(last + "…", font_name, font_size) > max_width:
+                last = last[:-1]
+            lines[-1] = (last + "…") if last else "…"
+
+    return lines
+
+
+def draw_wrapped_text(c, text, x, y, max_width, font_name, font_size, leading, max_lines=3, color=None):
+    """折り返しテキストを描画し、描画後のy座標を返す。"""
+    if color is not None:
+        c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    lines = wrap_pdf_text(text, max_width, font_name, font_size, max_lines=max_lines)
+    for line in lines:
+        c.drawString(x, y, line)
+        y -= leading
+    c.setFillColor(colors.black)
+    return y
+
+
+def draw_single_line(c, text, x, y, max_width, font_name=PDF_FONT_GOTHIC, font_size=8, color=None):
+    """
+    PDF上に1行だけ描画する。
+    幅を超える文字列は自動で…省略するため、次の項目と重ならない。
+    """
+    if color is not None:
+        c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    c.drawString(x, y, fit_pdf_text(text, max_width, font_name, font_size))
+    c.setFillColor(colors.black)
+
+
+def calendar_events_df(year, month):
+    """指定月の予定をDataFrameで取得する。"""
+    start = f"{int(year)}-{int(month):02d}-01"
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
+    return fetch_df("""
+        SELECT *
+        FROM events
+        WHERE event_date BETWEEN ? AND ?
+        ORDER BY event_date,
+            CASE WHEN start_time IS NULL OR start_time = '' THEN 1 ELSE 0 END,
+            start_time,
+            category,
+            id
+    """, (start, end))
+
+
+def make_event_summary_for_pdf(ev, compact=True):
+    """カレンダー枠内に表示する予定の短い説明を作る。"""
+    category_name = re.sub(r"\s+", " ", pdf_text(ev.get("category", ""))).strip()
+    time_part = re.sub(r"\s+", " ", pdf_text(ev.get("start_time", ""))).strip()
+    title = re.sub(r"\s+", " ", pdf_text(ev.get("title", ""))).strip()
+    user_name = re.sub(r"\s+", " ", pdf_text(ev.get("user_name", ""))).strip()
+    staff_name = re.sub(r"\s+", " ", pdf_text(ev.get("staff_name", ""))).strip()
+    important = "★" if int(ev.get("important", 0) or 0) == 1 else ""
+
+    if compact:
+        # 月間カレンダー枠内は重なり防止を最優先し、情報量を絞る。
+        # 利用者・担当・長い詳細は次ページの予定詳細一覧で確認する。
+        parts = []
+        if time_part:
+            parts.append(time_part)
+
+        label_core = f"【{category_name}】" if category_name else ""
+        if title:
+            label_core += title
+        elif user_name:
+            label_core += user_name
+
+        if important:
+            label_core = f"{important}{label_core}"
+
+        if label_core:
+            parts.append(label_core)
+
+        return " ".join([p for p in parts if p]).strip()
+
+    parts = []
+    if time_part:
+        parts.append(time_part)
+    label_core = f"【{category_name}】"
+    if important:
+        label_core += important
+    if title:
+        label_core += title
+    parts.append(label_core)
+    if user_name:
+        parts.append(f"利用者:{user_name}")
+    if staff_name:
+        parts.append(f"担当:{staff_name}")
+    return " ".join([p for p in parts if p]).strip()
+
+
+def draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=False):
+    """予定詳細一覧ページのヘッダーを描画する。"""
+    suffix = "（続き）" if continuation else ""
+    c.setFont(PDF_FONT_GOTHIC, 16)
+    c.setFillColor(colors.HexColor("#333333"))
+    c.drawString(margin_x, height - 34, f"予定詳細一覧　{year}年 {month}月{suffix}")
+    c.setFont(PDF_FONT_GOTHIC, 9)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawRightString(width - margin_x, height - 32, f"合計 {total_count} 件")
+    c.setFillColor(colors.black)
+
+
+def draw_pdf_detail_table_header(c, x, y, widths, row_h):
+    """予定詳細一覧の列見出しを描画する。"""
+    headers = ["時間", "分類", "予定", "利用者", "担当", "詳細・メモ"]
+    c.setFillColor(colors.HexColor("#eee7dc"))
+    c.rect(x, y - 4, sum(widths), row_h, fill=1, stroke=0)
+    c.setFillColor(colors.HexColor("#333333"))
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    cur_x = x
+    for header, w in zip(headers, widths):
+        c.drawString(cur_x + 4, y + 1, header)
+        cur_x += w
+    c.setFillColor(colors.black)
+    return y - row_h
+
+
 def make_calendar_pdf(year, month, include_detail=True):
-    return report_make_calendar_pdf(year, month, include_detail=include_detail)
+    """
+    A4横の月間カレンダーPDFを作る。
+    1ページ目: 月間カレンダー
+    2ページ目以降: 予定詳細一覧
+
+    Ver1.3.3相当の修正:
+    ・予定詳細一覧を1予定1行の表形式へ変更
+    ・詳細・メモも1行に収め、長い場合は…で省略
+    ・カレンダー枠内の予定文字が重ならないよう、表示行数・文字量・余白を再調整
+    ・月間カレンダー枠内は要約表示に絞り、あふれる予定は「ほか◯件」で表示
+    """
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab がインストールされていません。requirements.txt に reportlab を追加してください。")
+
+    init_pdf_fonts()
+
+    year = int(year)
+    month = int(month)
+    df = calendar_events_df(year, month)
+
+    events_by_day = {}
+    if not df.empty:
+        for _, row in df.iterrows():
+            events_by_day.setdefault(pdf_text(row["event_date"]), []).append(row.to_dict())
+
+    buffer = BytesIO()
+    page_size = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page_size)
+    width, height = page_size
+
+    margin_x = 24
+    margin_top = 28
+    title_h = 40
+    grid_x = margin_x
+    grid_y_top = height - margin_top - title_h
+    grid_w = width - margin_x * 2
+    grid_h = height - margin_top - title_h - 24
+    day_header_h = 22
+    cell_w = grid_w / 7
+    cell_h = (grid_h - day_header_h) / 6
+
+    # タイトル
+    c.setFont(PDF_FONT_GOTHIC, 18)
+    c.setFillColor(colors.HexColor("#333333"))
+    c.drawString(margin_x, height - 34, f"ひだまり帳 月間カレンダー　{year}年 {month}月")
+    c.setFont(PDF_FONT_GOTHIC, 9)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawRightString(width - margin_x, height - 32, f"出力日: {today_jst().strftime('%Y-%m-%d')}")
+    c.setFillColor(colors.black)
+
+    # 曜日ヘッダ
+    week_labels = ["日", "月", "火", "水", "木", "金", "土"]
+    header_y = grid_y_top - day_header_h
+    for i, label in enumerate(week_labels):
+        x = grid_x + i * cell_w
+        c.setFillColor(colors.HexColor("#f3eee6"))
+        c.rect(x, header_y, cell_w, day_header_h, fill=1, stroke=1)
+        c.setFillColor(colors.HexColor("#333333"))
+        if i == 0:
+            c.setFillColor(colors.HexColor("#c0392b"))
+        elif i == 6:
+            c.setFillColor(colors.HexColor("#1f4e79"))
+        c.setFont(PDF_FONT_GOTHIC, 10)
+        c.drawCentredString(x + cell_w / 2, header_y + 7, label)
+
+    # 月間グリッド
+    weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
+    while len(weeks) < 6:
+        weeks.append([0, 0, 0, 0, 0, 0, 0])
+
+    for r, week in enumerate(weeks[:6]):
+        for col, day in enumerate(week):
+            x = grid_x + col * cell_w
+            y = header_y - (r + 1) * cell_h
+
+            c.setFillColor(colors.HexColor("#fffdf8") if day else colors.HexColor("#fafafa"))
+            c.rect(x, y, cell_w, cell_h, fill=1, stroke=1)
+
+            if not day:
+                continue
+
+            # 日付を少し小さくし、予定表示エリアを広げる
+            date_color = colors.HexColor("#333333")
+            if col == 0:
+                date_color = colors.HexColor("#c0392b")
+            elif col == 6:
+                date_color = colors.HexColor("#1f4e79")
+            c.setFillColor(date_color)
+            c.setFont(PDF_FONT_GOTHIC, 15)
+            c.drawString(x + 6, y + cell_h - 18, str(day))
+
+            key = f"{year}-{month:02d}-{day:02d}"
+            evs = events_by_day.get(key, [])
+            if not evs:
+                continue
+
+            # 枠内で文字が重ならないよう、予定表示エリアを固定管理する
+            left_pad = 5
+            right_pad = 5
+            top_after_date = 28
+            bottom_reserved = 10
+            band_h = 10
+            row_gap = 2
+            row_pitch = band_h + row_gap
+            event_area_top = y + cell_h - top_after_date
+            event_area_bottom = y + bottom_reserved
+            usable_h = max(0, event_area_top - event_area_bottom)
+            max_lines_total = max(1, int(usable_h // row_pitch))
+            max_lines_total = min(max_lines_total, 4)
+
+            visible_events = evs[:max_lines_total]
+            for idx, ev in enumerate(visible_events):
+                summary = make_event_summary_for_pdf(ev, compact=True)
+                important = int(ev.get("important", 0) or 0) == 1
+
+                band_top = event_area_top - idx * row_pitch
+                band_y = band_top - band_h
+                band_w = cell_w - left_pad - right_pad
+
+                c.setFillColor(colors.HexColor("#ffe9e0") if important else colors.HexColor("#f6efe6"))
+                c.roundRect(x + left_pad, band_y, band_w, band_h, 2.5, fill=1, stroke=0)
+
+                text_color = colors.HexColor("#8a2d18") if important else colors.HexColor("#3f3a35")
+                draw_single_line(
+                    c,
+                    summary,
+                    x + left_pad + 2,
+                    band_y + 2.1,
+                    band_w - 4,
+                    PDF_FONT_GOTHIC,
+                    6.0,
+                    color=text_color,
+                )
+
+            remaining = len(evs) - len(visible_events)
+            if remaining > 0:
+                c.setFont(PDF_FONT_GOTHIC, 6.3)
+                c.setFillColor(colors.HexColor("#555555"))
+                c.drawString(x + 7, y + 5, f"ほか {remaining} 件")
+                c.setFillColor(colors.black)
+
+    # 凡例
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawString(margin_x, 12, "※枠内は要約表示です。詳細は次ページ以降の一覧で確認できます。重要予定は薄赤で表示します。")
+    c.setFillColor(colors.black)
+
+    # 詳細一覧
+    if include_detail:
+        c.showPage()
+        c.setPageSize(page_size)
+
+        total_count = 0 if df.empty else len(df)
+        draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=False)
+
+        detail_x = margin_x
+        detail_w = width - margin_x * 2
+        row_h = 17
+        date_h = 18
+        bottom_y = 34
+
+        # 横幅に収まる固定列幅。最後の「詳細・メモ」は残り幅を使う。
+        col_widths = [58, 54, 160, 78, 78]
+        memo_w = detail_w - sum(col_widths)
+        col_widths.append(memo_w)
+
+        y = height - 62
+        y = draw_pdf_detail_table_header(c, detail_x, y, col_widths, row_h)
+
+        if df.empty:
+            c.setFont(PDF_FONT_GOTHIC, 12)
+            c.setFillColor(colors.HexColor("#333333"))
+            c.drawString(detail_x, y - 8, "この月の予定はありません。")
+        else:
+            current_date = ""
+            row_index = 0
+
+            for _, row in df.iterrows():
+                event_date = pdf_text(row["event_date"])
+
+                # 日付見出し＋1行分が入らなければ改ページ
+                if y < bottom_y + date_h + row_h + 8:
+                    c.showPage()
+                    c.setPageSize(page_size)
+                    draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=True)
+                    y = height - 62
+                    y = draw_pdf_detail_table_header(c, detail_x, y, col_widths, row_h)
+                    current_date = ""
+
+                if event_date != current_date:
+                    current_date = event_date
+                    try:
+                        d = datetime.strptime(event_date, "%Y-%m-%d").date()
+                        dow = ["月", "火", "水", "木", "金", "土", "日"][d.weekday()]
+                        date_label = f"{d.month}/{d.day}（{dow}）"
+                    except Exception:
+                        date_label = event_date
+
+                    c.setFillColor(colors.HexColor("#f7f1e8"))
+                    c.rect(detail_x, y - 3, detail_w, date_h, fill=1, stroke=0)
+                    c.setFillColor(colors.HexColor("#333333"))
+                    c.setFont(PDF_FONT_GOTHIC, 9)
+                    c.drawString(detail_x + 6, y + 2, date_label)
+                    c.setFillColor(colors.black)
+                    y -= date_h
+
+                # 1行分が入らなければ改ページ
+                if y < bottom_y + row_h:
+                    c.showPage()
+                    c.setPageSize(page_size)
+                    draw_pdf_detail_page_header(c, width, height, margin_x, year, month, total_count, continuation=True)
+                    y = height - 62
+                    y = draw_pdf_detail_table_header(c, detail_x, y, col_widths, row_h)
+
+                important = int(row.get("important", 0) or 0) == 1
+                category_name = pdf_text(row.get("category", ""))
+
+                start_time = pdf_text(row.get("start_time", ""))
+                end_time = pdf_text(row.get("end_time", ""))
+                if start_time and end_time:
+                    time_text = f"{start_time}〜{end_time}"
+                elif start_time:
+                    time_text = start_time
+                elif end_time:
+                    time_text = f"〜{end_time}"
+                else:
+                    time_text = "時間未定"
+
+                title_text = pdf_text(row.get("title", ""))
+                user_text = pdf_text(row.get("user_name", ""))
+                staff_text = pdf_text(row.get("staff_name", ""))
+                memo_text = pdf_text(row.get("memo", ""))
+                if important:
+                    title_text = "重要 " + title_text
+
+                # 行背景
+                bg = "#fffdf8" if row_index % 2 == 0 else "#faf6ef"
+                if important:
+                    bg = "#fff0e8"
+                c.setFillColor(colors.HexColor(bg))
+                c.rect(detail_x, y - 3, detail_w, row_h, fill=1, stroke=0)
+
+                # 下線
+                c.setStrokeColor(colors.HexColor("#e2d8cc"))
+                c.line(detail_x, y - 3, detail_x + detail_w, y - 3)
+                c.setStrokeColor(colors.black)
+
+                # 各列を1行で描画。幅を超えたら…で省略する。
+                values = [time_text, category_name, title_text, user_text, staff_text, memo_text]
+                cur_x = detail_x
+                text_color = colors.HexColor("#8a2d18") if important else colors.HexColor("#222222")
+                for value, w in zip(values, col_widths):
+                    draw_single_line(
+                        c, value, cur_x + 4, y + 1, max(w - 8, 10),
+                        PDF_FONT_GOTHIC, 8, color=text_color
+                    )
+                    cur_x += w
+
+                y -= row_h
+                row_index += 1
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
 
 
 # -----------------------------
+# シフト管理・AI担当割当
+# -----------------------------
+SHIFT_KINDS = ["日勤", "夜勤", "夜勤明け", "休み", "希望休", "有休", "その他"]
+SHIFT_EDITOR_OPTIONS = ["", "日", "夜", "明", "希", "有", "他"]
 
 
 def default_shift_times(shift_kind):
@@ -2249,12 +3273,11 @@ def shift_kind_from_editor_label(label):
     return mapping.get(value, [])
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_shift_month_status(year, month):
     """指定月のシフト確定状態を取得する。"""
     try:
         df = fetch_df("""
-            SELECT id, shift_year, shift_month, is_confirmed, confirmed_at, confirmed_by, created_at, updated_at
+            SELECT *
             FROM shift_month_status
             WHERE shift_year=? AND shift_month=?
             LIMIT 1
@@ -2291,11 +3314,9 @@ def set_shift_month_status(year, month, is_confirmed, confirmed_by=""):
             now_text(),
             now_text(),
         ))
-        clear_shift_caches()
     except Exception as e:
         st.warning(f"シフト確定状態の保存に失敗しました：{e}")
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_staff_shift_limits():
     """
     職員別の月間勤務回数上限を取得する。
@@ -2356,15 +3377,12 @@ def save_staff_shift_limits_from_editor(limits_df):
             now_text(),
         ))
     if not params:
-        clear_shift_caches()
         return 0
-    saved = execute_many("""
+    return execute_many("""
         INSERT INTO staff_shift_limits
         (staff_name, max_day_shifts, max_night_shifts, max_total_shifts, note, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, params)
-    clear_shift_caches()
-    return saved
 
 
 
@@ -2566,7 +3584,6 @@ def clear_month_staff_shifts(year, month):
     end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
     execute("DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ?", (start, end))
     set_shift_month_status(int(year), int(month), False, current_login_user_for_shift())
-    clear_shift_caches()
     try:
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["shift_editor_reset_counter"] = int(st.session_state.get("shift_editor_reset_counter", 0) or 0) + 1
@@ -2580,8 +3597,8 @@ def shift_month_is_confirmed(year, month):
 
 
 def get_staff_shifts(start_date, end_date, keyword=""):
-    query = f"""
-        SELECT {SHIFT_COLUMNS}
+    query = """
+        SELECT *
         FROM staff_shifts
         WHERE shift_date BETWEEN ? AND ?
     """
@@ -2594,7 +3611,6 @@ def get_staff_shifts(start_date, end_date, keyword=""):
     return fetch_df(query, params)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_staff_shifts_month(year, month, include_prev_day=False):
     last_day = calendar.monthrange(int(year), int(month))[1]
     start_date = date(int(year), int(month), 1)
@@ -2615,7 +3631,7 @@ def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_t
     if start_time is None or end_time is None:
         start_time, end_time, default_next = default_shift_times(shift_kind)
         next_day = default_next
-    shift_id = execute("""
+    return execute("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2630,8 +3646,6 @@ def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_t
         now_text(),
         now_text(),
     ))
-    clear_shift_caches()
-    return shift_id
 
 
 def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo=""):
@@ -2650,13 +3664,11 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
     if night_staff:
         stime, etime, nd = default_shift_times("夜勤")
         params.append((shift_date, night_staff, "夜勤", stime, etime, nd, memo.strip() or None, now_text(), now_text()))
-    saved = execute_many("""
+    return execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
-    clear_shift_caches()
-    return saved
 
 
 def shift_day_labels_for_staff(df, staff_name, target_date):
@@ -2881,16 +3893,13 @@ def save_shift_matrix_from_editor(year, month, edited_df):
                 ))
 
     if not params:
-        clear_shift_caches()
         return 0
 
-    saved = execute_many("""
+    return execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
-    clear_shift_caches()
-    return saved
 
 
 def create_shift_shortage_table(df, year, month):
@@ -3267,12 +4276,6 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
                 return False, f"翌日に休み系（{', '.join(next_off)}）があるため夜勤不可"
             if next_active:
                 return False, f"翌日に勤務系（{', '.join(next_active)}）があるため夜勤不可"
-
-            rest_date = (pd.to_datetime(date_text).date() + timedelta(days=2)).strftime("%Y-%m-%d")
-            rest_kinds = get_staff_day_shift_kinds(df, target_staff, rest_date)
-            rest_active = [k for k in rest_kinds if k in ACTIVE_SHIFT_KINDS]
-            if rest_active:
-                return False, f"明け翌日に勤務系（{', '.join(rest_active)}）があるため夜勤不可"
         except Exception:
             pass
 
@@ -3281,42 +4284,6 @@ def staff_available_for_kind(df, staff_name, target_date, shift_kind, limit_map=
         return False, reason
 
     return True, "候補"
-
-
-def summarize_ai_reject_reasons(reject_reasons):
-    """AI候補から外れた理由を、現場で読みやすいカテゴリ別に要約する。"""
-    buckets = {
-        "上限": 0,
-        "休み系": 0,
-        "夜勤明け": 0,
-        "明け翌日": 0,
-        "重複": 0,
-        "その他": 0,
-    }
-    samples = []
-    for reason in reject_reasons or []:
-        text = str(reason)
-        if len(samples) < 4:
-            samples.append(text)
-        if "上限" in text:
-            buckets["上限"] += 1
-        elif "前日夜勤" in text or "翌日は明け" in text or "夜勤明け" in text:
-            buckets["夜勤明け"] += 1
-        elif "前日明け" in text or "明け翌日" in text:
-            buckets["明け翌日"] += 1
-        elif "休み系" in text or "希望休" in text or "有休" in text or "休み" in text:
-            buckets["休み系"] += 1
-        elif "既に" in text or "重複" in text or "勤務系" in text:
-            buckets["重複"] += 1
-        else:
-            buckets["その他"] += 1
-
-    parts = [f"{name}{count}名" for name, count in buckets.items() if count]
-    summary = "、".join(parts) if parts else "候補理由なし"
-    if samples:
-        summary += "。例：" + " / ".join(samples)
-    return summary
-
 
 def create_ai_shift_draft(df, staff_names, year, month):
     """
@@ -3417,7 +4384,7 @@ def create_ai_shift_draft(df, staff_names, year, month):
             if not candidates:
                 reason_text = "日勤・夜勤・合計上限、希望休、有休、休み、その他、夜勤翌日の明け重複を考慮した結果、候補なし"
                 if reject_reasons:
-                    reason_text += "（" + summarize_ai_reject_reasons(reject_reasons) + "）"
+                    reason_text += "（" + " / ".join(reject_reasons[:6]) + (" ほか" if len(reject_reasons) > 6 else "") + "）"
                 rows.append({
                     "日付": target_date,
                     "勤務": need_kind,
@@ -3746,183 +4713,418 @@ def save_ai_shift_draft_rows(draft_df):
 
     if not params:
         return 0
-    saved = execute_many("""
+    return execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
-    clear_shift_caches()
-    return saved
 
 def make_staff_shift_pdf(year, month):
-    return report_make_staff_shift_pdf(
-        year,
-        month,
-        get_staff_shifts_month,
-        create_shift_matrix,
-        create_shift_shortage_table,
-        create_shift_quality_check_table,
-        create_shift_limit_check_table,
-        get_shift_month_status,
-    )
+    """掲示・印刷しやすい横長のシフトPDFを作成する。"""
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab がインストールされていません。")
+
+    init_pdf_fonts()
+
+    df = get_staff_shifts_month(int(year), int(month), include_prev_day=True)
+    matrix = create_shift_matrix(df, int(year), int(month))
+    shortage = create_shift_shortage_table(df, int(year), int(month))
+    checks = create_shift_quality_check_table(df, int(year), int(month))
+    limit_checks = create_shift_limit_check_table(matrix)
+    status = get_shift_month_status(int(year), int(month))
+
+    buffer = BytesIO()
+    page_size = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page_size)
+    width, height = page_size
+
+    margin = 16
+    title_y = height - 26
+    c.setFont(PDF_FONT_GOTHIC, 14)
+    c.drawString(margin, title_y, f"従業員勤務表　{int(year)}年{int(month)}月")
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    status_text = "確定" if status.get("is_confirmed") else "作成中"
+    c.drawRightString(width - margin, title_y, f"{status_text}　出力日: {today_jst().strftime('%Y-%m-%d')}")
+
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    table_x = margin
+    table_y_top = height - 46
+    staff_w = 54
+    summary_w = 22
+    day_w = (width - margin * 2 - staff_w - summary_w * 7) / last_day
+    row_h = 15
+
+    def draw_shift_table_vertical_lines(y0, y1):
+        """日付ごとの縦罫線を細く引く。"""
+        old_stroke = getattr(c, "_strokeColorObj", colors.black)
+        old_width = getattr(c, "_lineWidth", 1)
+        c.setStrokeColor(colors.HexColor("#b8b8b8"))
+        c.setLineWidth(0.25)
+
+        # 氏名欄と日付欄の境界
+        x_line = table_x + staff_w
+        c.line(x_line, y0, x_line, y1)
+
+        # 日付欄の縦罫線
+        for d in range(1, last_day + 1):
+            x_line = table_x + staff_w + day_w * d
+            c.line(x_line, y0, x_line, y1)
+
+        # 集計欄の縦罫線
+        summary_start = table_x + staff_w + day_w * last_day
+        for i in range(1, 7):
+            x_line = summary_start + summary_w * i
+            c.line(x_line, y0, x_line, y1)
+
+        c.setStrokeColor(old_stroke)
+        c.setLineWidth(old_width)
+
+    # 凡例
+    c.setFont(PDF_FONT_GOTHIC, 7)
+    c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　※休みは日別セルには表示しません")
+
+    # ヘッダ
+    c.setFillColor(colors.HexColor("#f3eee6"))
+    c.rect(table_x, table_y_top - row_h, width - margin * 2, row_h, fill=1, stroke=1)
+    draw_shift_table_vertical_lines(table_y_top - row_h, table_y_top)
+    c.setFillColor(colors.black)
+    c.setFont(PDF_FONT_GOTHIC, 6.2)
+    c.drawString(table_x + 3, table_y_top - 10, "氏名")
+    x = table_x + staff_w
+    for d in range(1, last_day + 1):
+        c.drawCentredString(x + day_w / 2, table_y_top - 10, str(d))
+        x += day_w
+    for label in ["日", "夜", "明", "休", "希", "有", "計"]:
+        c.drawCentredString(x + summary_w / 2, table_y_top - 10, label)
+        x += summary_w
+
+    y = table_y_top - row_h
+    if matrix.empty:
+        c.setFont(PDF_FONT_GOTHIC, 10)
+        c.drawString(margin, y - 24, "この月のシフトは登録されていません。")
+    else:
+        c.setFont(PDF_FONT_GOTHIC, 5.8)
+        for _, row in matrix.iterrows():
+            if y < 58:
+                c.showPage()
+                c.setPageSize(page_size)
+                y = height - 30
+            y -= row_h
+            c.setFillColor(colors.white)
+            c.rect(table_x, y, width - margin * 2, row_h, fill=1, stroke=1)
+            draw_shift_table_vertical_lines(y, y + row_h)
+            c.setFillColor(colors.black)
+            c.drawString(table_x + 3, y + 4, str(row["職員名"])[:8])
+            x = table_x + staff_w
+            for d in range(1, last_day + 1):
+                val = str(row[str(d)] or "")
+                c.drawCentredString(x + day_w / 2, y + 4, val)
+                x += day_w
+            for key in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計"]:
+                c.drawCentredString(x + summary_w / 2, y + 4, str(row.get(key, "")))
+                x += summary_w
+
+    # 不足・警告を下部表示
+    y -= 18
+    c.setFont(PDF_FONT_GOTHIC, 7)
+    ng = shortage[shortage["状態"] != "OK"]
+    if not ng.empty:
+        c.setFillColor(colors.HexColor("#8a2d18"))
+        c.drawString(margin, y, "不足日: " + " / ".join([f"{str(r['日付'])[-2:]}日 {r['不足']}" for _, r in ng.head(10).iterrows()]))
+        y -= 10
+    if checks is not None and not checks.empty:
+        c.setFillColor(colors.HexColor("#8a2d18"))
+        c.drawString(margin, y, "確認事項: " + " / ".join([f"{r['日付']} {r['職員名']} {r['種類']}" for _, r in checks.head(6).iterrows()]))
+        y -= 10
+    if limit_checks is not None and not limit_checks.empty:
+        c.setFillColor(colors.HexColor("#8a2d18"))
+        c.drawString(margin, y, "上限確認: " + " / ".join([f"{r['職員名']} {r['種類']}" for _, r in limit_checks.head(6).iterrows()]))
+    c.setFillColor(colors.black)
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
+def get_kot_pattern_code(shift_kind):
+    """KING OF TIME用パターンコード。secrets/envで上書き可能。"""
+    key_map = {
+        "日勤": ("KOT_DAY_PATTERN_CODE", "日勤"),
+        "夜勤": ("KOT_NIGHT_PATTERN_CODE", "夜勤"),
+    }
+    key, default = key_map.get(str(shift_kind), ("", str(shift_kind or "")))
+    if key:
+        return get_secret_or_env(key, default=default)
+    return default
+
+
+def kot_time_value(time_text, next_day=False):
+    """KING OF TIMEの対象日HH:mm形式へ変換する。"""
+    value = str(time_text or "").strip()
+    if not value:
+        return ""
+    prefix = "翌日" if next_day else "当日"
+    if value.startswith(("当日", "翌日", "前日")):
+        return value
+    return f"{prefix}{value}"
+
+
+def kot_break_minutes(shift_kind):
+    """KING OF TIME CSV用の休憩予定時間。必要に応じて施設運用に合わせて変更する。"""
+    if str(shift_kind) == "日勤":
+        return 60
+    if str(shift_kind) == "夜勤":
+        return 120
+    return ""
 
 
 def make_king_of_time_shift_csv(year, month):
-    return report_make_king_of_time_shift_csv(
-        year,
-        month,
-        get_staff_shifts,
-        get_staff_code_map,
-        normalize_staff_name,
-        default_shift_times,
-    )
+    """
+    ひだまり帳の月間シフトをKING OF TIMEのスケジュールデータCSV向けに出力する。
+    出力列：勤務日・従業員コード・パターンコード・出勤予定・退勤予定・休憩予定時間・全日休暇・備考
+    """
+    year = int(year)
+    month = int(month)
+    last_day = calendar.monthrange(year, month)[1]
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{last_day:02d}"
+    df = get_staff_shifts(start, end)
+
+    columns = ["勤務日", "従業員コード", "パターンコード", "出勤予定", "退勤予定", "休憩予定時間", "全日休暇", "備考"]
+    if df is None or df.empty:
+        empty_df = pd.DataFrame(columns=columns)
+        return empty_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+    code_map = get_staff_code_map(active_only=False)
+    rows = []
+    df = df.sort_values(["shift_date", "staff_name", "shift_kind", "id"])
+    for _, r in df.iterrows():
+        shift_kind = str(r.get("shift_kind") or "").strip()
+        staff_name = normalize_staff_name(r.get("staff_name", ""))
+        if not staff_name:
+            continue
+
+        # 夜勤明け・休みはKING OF TIMEへ勤務予定として登録しない。
+        # 希望休・その他は備考行として出す。不要な場合はCSV上で削除できる。
+        if shift_kind in ["夜勤明け", "休み"]:
+            continue
+
+        shift_date = str(r.get("shift_date") or "").strip()
+        try:
+            work_date = pd.to_datetime(shift_date).date().strftime("%Y%m%d")
+        except Exception:
+            work_date = shift_date.replace("-", "").replace("/", "")
+
+        staff_code = str(code_map.get(staff_name, "") or "").strip()
+        pattern_code = ""
+        start_plan = ""
+        end_plan = ""
+        break_minutes = ""
+        full_day_leave = ""
+        memo_parts = []
+        original_memo = str(r.get("memo") or "").strip()
+
+        if shift_kind in ["日勤", "夜勤"]:
+            pattern_code = get_kot_pattern_code(shift_kind)
+            stime = str(r.get("start_time") or "").strip()
+            etime = str(r.get("end_time") or "").strip()
+            if not stime or not etime:
+                default_start, default_end, default_next_day = default_shift_times(shift_kind)
+                stime = stime or default_start
+                etime = etime or default_end
+                next_day = bool(default_next_day)
+            else:
+                next_day = bool(int(r.get("next_day") or 0))
+            start_plan = kot_time_value(stime, next_day=False)
+            end_plan = kot_time_value(etime, next_day=next_day)
+            break_minutes = kot_break_minutes(shift_kind)
+        elif shift_kind == "有休":
+            full_day_leave = "有休"
+        elif shift_kind == "希望休":
+            memo_parts.append("希望休（ひだまり帳）")
+        elif shift_kind == "その他":
+            memo_parts.append("その他（ひだまり帳）")
+        else:
+            memo_parts.append(shift_kind)
+
+        if original_memo:
+            memo_parts.append(original_memo)
+
+        rows.append({
+            "勤務日": work_date,
+            "従業員コード": staff_code,
+            "パターンコード": pattern_code,
+            "出勤予定": start_plan,
+            "退勤予定": end_plan,
+            "休憩予定時間": break_minutes,
+            "全日休暇": full_day_leave,
+            "備考": " / ".join([x for x in memo_parts if x]),
+        })
+
+    out_df = pd.DataFrame(rows, columns=columns)
+    return out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
 def make_staff_shift_excel(year, month):
-    return report_make_staff_shift_excel(
-        year,
-        month,
-        get_staff_shifts_month,
-        create_shift_matrix,
-        create_shift_shortage_table,
-        create_shift_quality_check_table,
-        create_shift_limit_check_table,
-        get_shift_month_status,
-    )
+    """
+    確定済みシフトをExcel（xlsx）で出力する。
+    勤務表シートに月間表、別シートに不足・確認事項・上限確認を出す。
+    """
+    if not OPENPYXL_AVAILABLE:
+        raise RuntimeError("openpyxl がインストールされていません。requirements.txt に openpyxl を追加してください。")
 
+    year = int(year)
+    month = int(month)
+    df = get_staff_shifts_month(year, month, include_prev_day=True)
+    matrix = create_shift_matrix(df, year, month)
+    shortage = create_shift_shortage_table(df, year, month)
+    checks = create_shift_quality_check_table(df, year, month)
+    limit_checks = create_shift_limit_check_table(matrix)
+    status = get_shift_month_status(year, month)
+    last_day = calendar.monthrange(year, month)[1]
 
+    wb = OpenpyxlWorkbook()
+    ws = wb.active
+    ws.title = "勤務表"
 
+    title_fill = PatternFill("solid", fgColor="F3EEE6")
+    header_fill = PatternFill("solid", fgColor="E7EEF8")
+    weekend_sun_fill = PatternFill("solid", fgColor="FCE4D6")
+    weekend_sat_fill = PatternFill("solid", fgColor="DDEBF7")
+    summary_fill = PatternFill("solid", fgColor="E2F0D9")
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
 
-def format_shift_label(shift_value):
-    mapping = {
-        "日勤": "日",
-        "夜勤": "夜",
-        "夜勤明け": "明",
-        "休み": "休",
-        "希望休": "希",
-        "有休": "有",
-        "その他": "他",
-    }
-    return mapping.get(str(shift_value or ""), str(shift_value or ""))
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
+    ws.cell(1, 1).value = f"従業員勤務表　{year}年{month}月"
+    ws.cell(1, 1).font = Font(bold=True, size=16)
+    ws.cell(1, 1).fill = title_fill
+    ws.cell(1, 1).alignment = left
 
+    status_text = "確定" if status.get("is_confirmed") else "作成中"
+    ws.cell(2, 1).value = "状態"
+    ws.cell(2, 2).value = status_text
+    ws.cell(2, 3).value = "確定日時"
+    ws.cell(2, 4).value = status.get("confirmed_at", "") or ""
+    ws.cell(2, 5).value = "出力日"
+    ws.cell(2, 6).value = today_jst().strftime("%Y-%m-%d")
 
-def _weekday_column_label(year, month, day):
-    d = date(int(year), int(month), int(day))
-    return f"{day}\n({get_weekday_label(d)})"
+    ws.cell(3, 1).value = "凡例"
+    ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 休みは日別セルには表示しません"
+    ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
 
+    start_row = 5
+    if matrix is None or matrix.empty:
+        ws.cell(start_row, 1).value = "この月のシフトはまだ登録されていません。"
+    else:
+        columns = list(matrix.columns)
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell = ws.cell(start_row, col_idx)
+            cell.value = col_name
+            cell.font = Font(bold=True)
+            cell.alignment = center
+            cell.border = border
+            cell.fill = header_fill
+            if str(col_name).isdigit():
+                d = int(col_name)
+                weekday = date(year, month, d).weekday()  # 月=0 日=6
+                if weekday == 6:
+                    cell.fill = weekend_sun_fill
+                elif weekday == 5:
+                    cell.fill = weekend_sat_fill
+            elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+                cell.fill = summary_fill
 
-def _status_column(df):
-    if df is None or df.empty:
-        return None
-    for col in df.columns:
-        if "状" in str(col) or str(col) in ("状態", "���"):
-            return col
-    return df.columns[-2] if len(df.columns) >= 2 else None
+        for row_idx, (_, row) in enumerate(matrix.iterrows(), start=start_row + 1):
+            for col_idx, col_name in enumerate(columns, start=1):
+                value = row.get(col_name, "")
+                if pd.isna(value):
+                    value = ""
+                cell = ws.cell(row_idx, col_idx)
+                cell.value = value
+                cell.alignment = center if col_name != "職員名" else left
+                cell.border = border
+                if str(col_name).isdigit():
+                    d = int(col_name)
+                    weekday = date(year, month, d).weekday()
+                    if weekday == 6:
+                        cell.fill = PatternFill("solid", fgColor="FFF2CC")
+                    elif weekday == 5:
+                        cell.fill = PatternFill("solid", fgColor="EAF3F8")
+                elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+                    cell.fill = PatternFill("solid", fgColor="F2F8EE")
 
+        ws.freeze_panes = "B6"
+        ws.auto_filter.ref = f"A{start_row}:{get_column_letter(len(columns))}{start_row + len(matrix)}"
 
-def render_shift_calendar(year, month, shift_df):
-    st.markdown("### 月間シフトカレンダー")
-    first_weekday, last_day = calendar.monthrange(int(year), int(month))
-    start_col = (first_weekday + 1) % 7
-    days = [None] * start_col
-    days.extend(date(int(year), int(month), d) for d in range(1, last_day + 1))
-    while len(days) % 7 != 0:
-        days.append(None)
+        # 列幅調整
+        for col_idx, col_name in enumerate(columns, start=1):
+            letter = get_column_letter(col_idx)
+            if col_name == "職員名":
+                ws.column_dimensions[letter].width = 14
+            elif str(col_name).isdigit():
+                ws.column_dimensions[letter].width = 4
+            else:
+                ws.column_dimensions[letter].width = 8
 
-    header_cols = st.columns(7)
-    for idx, label in enumerate(["日", "月", "火", "水", "木", "金", "土"]):
-        cls = "hm-cal-head hm-sunday-text" if idx == 0 else "hm-cal-head hm-saturday-text" if idx == 6 else "hm-cal-head"
-        header_cols[idx].markdown(f'<div class="{cls}">{label}</div>', unsafe_allow_html=True)
+    for row in range(1, 4):
+        for col in range(1, max(8, (len(matrix.columns) if not matrix.empty else 8)) + 1):
+            ws.cell(row, col).alignment = left if col <= 2 else center
 
-    for week_start in range(0, len(days), 7):
-        cols = st.columns(7)
-        for idx, target_date in enumerate(days[week_start:week_start + 7]):
-            with cols[idx]:
-                if target_date is None:
-                    st.markdown('<div class="hm-shift-day hm-blank"></div>', unsafe_allow_html=True)
-                    continue
-                date_text = target_date.strftime("%Y-%m-%d")
-                day_df = shift_df[shift_df["shift_date"].astype(str) == date_text] if shift_df is not None and not shift_df.empty else pd.DataFrame()
-                classes = ["hm-shift-day"]
-                if target_date.weekday() == 6:
-                    classes.append("hm-sunday")
-                if target_date.weekday() == 5:
-                    classes.append("hm-saturday")
-                if target_date == today_jst():
-                    classes.append("hm-today")
-                lines = []
-                if not day_df.empty:
-                    for kind in SHIFT_KINDS:
-                        members = day_df[day_df["shift_kind"].astype(str) == kind]["staff_name"].dropna().astype(str).tolist()
-                        if members:
-                            names = "、".join(members[:3])
-                            if len(members) > 3:
-                                names += f" 他{len(members) - 3}"
-                            lines.append(f'<div class="hm-shift-line"><b>{format_shift_label(kind)}</b> {html_escape(names)}</div>')
-                html = (
-                    f'<div class="{" ".join(classes)}">'
-                    f'<div class="hm-day-top"><span class="hm-day-number">{target_date.day}</span>'
-                    f'<span class="hm-weekday">{get_weekday_label(target_date)}</span></div>'
-                    f'{"".join(lines) if lines else "<div class=\"hm-shift-empty\">未入力</div>"}'
-                    f'</div>'
-                )
-                st.markdown(html, unsafe_allow_html=True)
+    def add_df_sheet(sheet_name, data_df, empty_message):
+        safe_name = sheet_name[:31]
+        s = wb.create_sheet(safe_name)
+        if data_df is None or data_df.empty:
+            s.cell(1, 1).value = empty_message
+            s.cell(1, 1).font = Font(bold=True)
+            s.column_dimensions["A"].width = 60
+            return s
+        cols = list(data_df.columns)
+        for cidx, col in enumerate(cols, start=1):
+            cell = s.cell(1, cidx)
+            cell.value = col
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = center
+            cell.border = border
+            s.column_dimensions[get_column_letter(cidx)].width = 18 if col not in ["内容", "理由"] else 55
+        for ridx, (_, r) in enumerate(data_df.iterrows(), start=2):
+            for cidx, col in enumerate(cols, start=1):
+                value = r.get(col, "")
+                if pd.isna(value):
+                    value = ""
+                cell = s.cell(ridx, cidx)
+                cell.value = value
+                cell.alignment = Alignment(horizontal="left" if col in ["内容", "理由"] else "center", vertical="center", wrap_text=True)
+                cell.border = border
+        s.freeze_panes = "A2"
+        s.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(data_df)+1}"
+        return s
 
+    ng = shortage[shortage["状態"] != "OK"] if shortage is not None and not shortage.empty else pd.DataFrame()
+    add_df_sheet("不足確認", ng, "日勤2名・夜勤1名の不足日はありません。")
+    add_df_sheet("確認事項", checks, "夜勤翌日勤務・明け翌日勤務・5連勤以上・希望休重複などの確認事項はありません。")
+    add_df_sheet("上限確認", limit_checks, "職員別の日勤・夜勤・合計勤務回数は上限内です。")
 
-def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_status=None):
-    st.markdown("### 月間シフト表")
-    staff_names = get_active_staff()
-    if staff_filter and staff_filter != "全職員":
-        staff_names = [staff_filter]
-    editable_matrix = create_editable_shift_matrix(staff_names, shift_df, int(year), int(month))
-    if editable_matrix.empty:
-        st.info("職員マスタに職員が登録されていません。先に職員マスタで登録してください。")
-        return
-
-    last_day = calendar.monthrange(int(year), int(month))[1]
-    first_col = editable_matrix.columns[0]
-    column_config = {
-        first_col: st.column_config.TextColumn("職員名", disabled=True, width="medium"),
-    }
-    for d in range(1, last_day + 1):
-        column_config[str(d)] = st.column_config.SelectboxColumn(
-            _weekday_column_label(year, month, d),
-            options=SHIFT_EDITOR_OPTIONS,
-            required=False,
-            width="small",
-            help="日・夜・明・希・有・他を選択。空欄にすると削除扱いです。",
-        )
-
-    st.caption("各セルをクリックして、日・夜・明・希・有・他を直接入力できます。列見出しには曜日を表示しています。")
-    edited_matrix = st.data_editor(
-        editable_matrix,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config=column_config,
-        key=f"shift_matrix_editor_{int(year)}_{int(month)}_{staff_filter}_{st.session_state.get('shift_editor_reset_counter', 0)}",
-    )
-
-    if month_status and month_status.get("is_confirmed"):
-        st.warning("この月は確定済みです。修正する場合は、先に確定を解除してください。")
-        return
-    if st.button("月間シフト表の入力内容を保存", use_container_width=True, type="primary"):
-        saved = save_shift_matrix_from_editor(int(year), int(month), edited_matrix)
-        clear_shift_caches()
-        st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
-        st.rerun()
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def page_shift_manager():
-    st.subheader("シフト管理・AI割当")
+    st.subheader("職員シフト管理・AI担当割当")
+    st.caption("希望休 → AIシフト案 → 不足・連勤チェック → 人が修正 → 確定 → PDF出力の流れで使えます。")
+
     today = today_jst()
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2 = st.columns(2)
     with c1:
-        shift_year = st.number_input("対象年", min_value=2020, max_value=2100, value=today.year, step=1, key="shift_year")
+        shift_year = st.number_input("表示年", min_value=2020, max_value=2100, value=today.year, step=1)
     with c2:
-        shift_month = st.number_input("対象月", min_value=1, max_value=12, value=today.month, step=1, key="shift_month")
-    with c3:
-        staff_filter = st.selectbox("表示する職員", ["全職員"] + get_active_staff(), key=f"shift_staff_filter_{int(shift_year)}_{int(shift_month)}")
+        shift_month = st.number_input("表示月", min_value=1, max_value=12, value=today.month, step=1)
 
     month_status = get_shift_month_status(int(shift_year), int(shift_month))
     if month_status.get("is_confirmed"):
@@ -3931,53 +5133,43 @@ def page_shift_manager():
         st.info("この月のシフトは作成中です。")
 
     staff_options = [""] + get_active_staff()
-    shift_df = get_staff_shifts_month(int(shift_year), int(shift_month), include_prev_day=True)
-    if staff_filter != "全職員" and not shift_df.empty:
-        shift_df_for_view = shift_df[shift_df["staff_name"].astype(str) == staff_filter].copy()
-    else:
-        shift_df_for_view = shift_df
 
-    render_shift_calendar(int(shift_year), int(shift_month), shift_df_for_view)
-
-    st.markdown("### 入力・編集フォーム")
-    with st.expander("希望休・有休・休みを登録", expanded=True):
-        with st.form("hope_shift_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                hope_date = st.date_input("日付", value=today, key="hope_date")
-            with c2:
-                hope_staff = st.selectbox("職員", staff_options, key="hope_staff")
-            with c3:
-                hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind")
-            hope_memo = st.text_input("メモ", placeholder="本人希望、通院、家庭都合など")
-            submit_hope = st.form_submit_button("保存")
-        if submit_hope:
-            if not hope_staff:
-                st.error("職員を選択してください。")
-            else:
-                save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
-                clear_shift_caches()
-                st.success(f"{hope_staff} さんの {hope_kind} を保存しました。")
-                st.rerun()
+    st.markdown("### 1. 希望休・基本シフト入力")
+    with st.form("hope_shift_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            hope_date = st.date_input("希望休・休み日", value=today, key="hope_date")
+        with c2:
+            hope_staff = st.selectbox("職員", staff_options, key="hope_staff")
+        with c3:
+            hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind")
+        hope_memo = st.text_input("希望休メモ", placeholder="例：本人希望、通院、家庭都合など")
+        submit_hope = st.form_submit_button("希望休・休みを保存")
+    if submit_hope:
+        if not hope_staff:
+            st.error("職員を選択してください。")
+        else:
+            save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
+            st.success(f"{hope_staff} さんの {hope_kind} を保存しました。")
+            st.rerun()
 
     with st.expander("1日分の基本シフト入力"):
         with st.form("basic_shift_form", clear_on_submit=True):
             shift_date = st.date_input("シフト日", value=today)
             c1, c2, c3 = st.columns(3)
             with c1:
-                day_staff_1 = st.selectbox("日勤1", staff_options, key="day_staff_1")
+                day_staff_1 = st.selectbox("日勤1（8:30〜17:30）", staff_options, key="day_staff_1")
             with c2:
-                day_staff_2 = st.selectbox("日勤2", staff_options, key="day_staff_2")
+                day_staff_2 = st.selectbox("日勤2（8:30〜17:30）", staff_options, key="day_staff_2")
             with c3:
-                night_staff = st.selectbox("夜勤", staff_options, key="night_staff")
-            shift_memo = st.text_input("シフトメモ")
+                night_staff = st.selectbox("夜勤（16:30〜翌9:30）", staff_options, key="night_staff")
+            shift_memo = st.text_input("シフトメモ", placeholder="例：研修、応援、希望休調整など")
             submit_basic = st.form_submit_button("この日の基本シフトを保存")
         if submit_basic:
             if not day_staff_1 and not day_staff_2 and not night_staff:
-                st.error("少なくとも1名を選択してください。")
+                st.error("少なくとも1名は選択してください。")
             else:
                 saved = save_basic_day_shift(shift_date.strftime("%Y-%m-%d"), day_staff_1, day_staff_2, night_staff, shift_memo)
-                clear_shift_caches()
                 st.success(f"{shift_date.strftime('%Y-%m-%d')} の基本シフトを {saved} 件保存しました。")
                 st.rerun()
 
@@ -4002,25 +5194,72 @@ def page_shift_manager():
                 st.error("職員を選択してください。")
             else:
                 save_single_shift(s_date.strftime("%Y-%m-%d"), s_staff, s_kind, s_start, s_end, 1 if s_next else 0, s_memo)
-                clear_shift_caches()
                 st.success("個別シフトを追加しました。")
                 st.rerun()
 
-    with st.expander("月間シフトを全部クリアして再入力する"):
-        st.warning("表示中の月のシフト入力内容をすべて削除します。職員別勤務回数上限は残ります。")
-        clear_confirm = st.checkbox(
-            f"{int(shift_year)}年{int(shift_month)}月のシフトを全クリアすることを確認しました",
-            key=f"clear_month_shift_confirm_{int(shift_year)}_{int(shift_month)}",
+    st.markdown("---")
+    st.markdown("### 2. 月間シフト直接入力・表示")
+
+    shift_df = get_staff_shifts_month(int(shift_year), int(shift_month), include_prev_day=True)
+    matrix = create_shift_matrix(shift_df, int(shift_year), int(shift_month))
+    shortage = create_shift_shortage_table(shift_df, int(shift_year), int(shift_month))
+    checks = create_shift_quality_check_table(shift_df, int(shift_year), int(shift_month))
+
+    staff_names_for_editor = get_active_staff()
+    editable_matrix = create_editable_shift_matrix(
+        staff_names_for_editor,
+        shift_df,
+        int(shift_year),
+        int(shift_month),
+    )
+
+    if editable_matrix.empty:
+        st.info("職員マスタに職員が登録されていません。先に職員マスタで職員を登録してください。")
+    else:
+        st.caption("各セルをクリックして、プルダウンから「日」「夜」「明」「希」「有」を直接入力できます。休みはシフト表には表示せず、空欄として扱います。空欄にすると削除扱いになります。")
+
+        with st.expander("月間シフトを全部クリアして再入力する"):
+            st.warning("この操作を行うと、表示中の月のシフト入力内容（日勤・夜勤・休み・希望休・有休など）をすべて削除します。職員別勤務回数上限は残ります。")
+            clear_confirm = st.checkbox(
+                f"{int(shift_year)}年{int(shift_month)}月のシフトを全クリアすることを確認しました",
+                key=f"clear_month_shift_confirm_{int(shift_year)}_{int(shift_month)}",
+            )
+            if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm):
+                clear_month_staff_shifts(int(shift_year), int(shift_month))
+                st.success("この月のシフトを全クリアしました。空の月間表から再入力できます。")
+                st.rerun()
+
+        last_day_for_editor = calendar.monthrange(int(shift_year), int(shift_month))[1]
+        column_config = {
+            "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium")
+        }
+        for d in range(1, last_day_for_editor + 1):
+            column_config[str(d)] = st.column_config.SelectboxColumn(
+                str(d),
+                options=SHIFT_EDITOR_OPTIONS,
+                required=False,
+                width="small",
+            )
+
+        edited_matrix = st.data_editor(
+            editable_matrix,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config=column_config,
+            key=f"shift_matrix_editor_{int(shift_year)}_{int(shift_month)}_{st.session_state.get('shift_editor_reset_counter', 0)}",
         )
-        if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm):
-            clear_month_staff_shifts(int(shift_year), int(shift_month))
-            clear_shift_caches()
-            st.success("この月のシフトを全クリアしました。")
-            st.rerun()
 
-    render_shift_editor(int(shift_year), int(shift_month), shift_df, staff_filter, month_status)
+        if month_status.get("is_confirmed"):
+            st.warning("確定済みの月です。修正する場合は、先に「確定を解除」してください。")
+        else:
+            if st.button("月間シフト表の直接入力内容を保存", use_container_width=True):
+                saved = save_shift_matrix_from_editor(int(shift_year), int(shift_month), edited_matrix)
+                st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
+                st.rerun()
 
-    st.markdown("### 職員別勤務回数上限")
+    st.markdown("### 3. 職員別勤務回数上限")
+    st.caption("職員ごとに、この月に入れる日勤・夜勤・合計勤務の上限を設定できます。AIシフト案はこの上限を超えない範囲で候補を出します。0回指定も有効です。")
     limits_df = get_staff_shift_limits()
     if limits_df.empty:
         st.info("職員マスタに職員が登録されていません。")
@@ -4030,20 +5269,32 @@ def page_shift_manager():
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
+            column_config={
+                "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium"),
+                "日勤上限": st.column_config.NumberColumn("日勤上限", min_value=0, max_value=31, step=1),
+                "夜勤上限": st.column_config.NumberColumn("夜勤上限", min_value=0, max_value=31, step=1),
+                "合計上限": st.column_config.NumberColumn("合計上限", min_value=0, max_value=31, step=1),
+                "メモ": st.column_config.TextColumn("メモ", width="medium"),
+            },
             key=f"shift_limit_editor_{int(shift_year)}_{int(shift_month)}",
         )
         if st.button("職員別勤務回数上限を保存", use_container_width=True):
             saved = save_staff_shift_limits_from_editor(edited_limits)
-            clear_shift_caches()
             st.success(f"職員別勤務回数上限を保存しました。登録件数：{saved}件")
             st.rerun()
 
-    st.markdown("### AIシフト案作成")
+    st.markdown("### 4. AIシフト案作成")
+    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日の明け・明け翌日休み・職員別上限を超えない範囲で下書きを作ります。保存前に仮シフト表で確認できます。")
+
+    # AIが実際に参照している上限を表示する。0回指定が反映されているか確認できます。
     with st.expander("AIが参照する職員別上限を確認"):
         st.dataframe(debug_shift_limit_summary_for_ai(), use_container_width=True, hide_index=True)
+
+    # 古いAI案がブラウザ側に残っている場合は破棄する。
     if st.session_state.get("ai_shift_rule_version") != AI_SHIFT_RULE_VERSION:
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["ai_shift_rule_version"] = AI_SHIFT_RULE_VERSION
+
     if st.button("不足分のAIシフト案を作成", use_container_width=True):
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["ai_shift_rule_version"] = AI_SHIFT_RULE_VERSION
@@ -4053,19 +5304,52 @@ def page_shift_manager():
             int(shift_year),
             int(shift_month),
         )
+
     draft = st.session_state.get("ai_shift_draft")
     if isinstance(draft, pd.DataFrame) and not draft.empty:
         draft = sanitize_ai_shift_draft_by_limits(draft, shift_df, int(shift_year), int(shift_month))
         st.session_state["ai_shift_draft"] = draft
+        st.markdown("#### AIシフト案一覧（まだ保存されていません）")
         st.dataframe(draft, use_container_width=True, hide_index=True)
+
+        warning_rows = draft[draft["勤務"].astype(str) == "注意"] if "勤務" in draft.columns else pd.DataFrame()
+        if not warning_rows.empty:
+            st.warning("明け翌日の休みなど、AIが自動で入れられなかった注意事項があります。保存前に確認してください。")
+            for _, wr in warning_rows.iterrows():
+                st.caption(f"⚠️ {wr.get('日付', '')}｜{wr.get('候補職員', '')}｜{wr.get('理由', '')}")
+
         preview_shift_df = apply_ai_shift_draft_to_df(shift_df, draft)
         st.markdown("#### AI案を反映した仮シフト表")
-        st.dataframe(create_shift_matrix(preview_shift_df, int(shift_year), int(shift_month)), use_container_width=True, hide_index=True)
+        st.caption("ここで内容を確認してから、下の保存ボタンでDBに反映します。")
+        preview_matrix = create_shift_matrix(preview_shift_df, int(shift_year), int(shift_month))
+        st.dataframe(preview_matrix, use_container_width=True, hide_index=True)
+
+        preview_shortage = create_shift_shortage_table(preview_shift_df, int(shift_year), int(shift_month))
+        preview_checks = create_shift_quality_check_table(preview_shift_df, int(shift_year), int(shift_month))
+        preview_limit_checks = create_shift_limit_check_table(preview_matrix)
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            st.metric("仮不足日", len(preview_shortage[preview_shortage["状態"] != "OK"]))
+        with p2:
+            st.metric("仮確認事項", 0 if preview_checks.empty else len(preview_checks))
+        with p3:
+            st.metric("仮上限超過", 0 if preview_limit_checks.empty else len(preview_limit_checks))
+
+        if not preview_shortage[preview_shortage["状態"] != "OK"].empty:
+            st.warning("AI案反映後も人員不足の日があります。")
+            st.dataframe(preview_shortage[preview_shortage["状態"] != "OK"], use_container_width=True, hide_index=True)
+        if not preview_checks.empty:
+            st.warning("AI案反映後の確認事項があります。")
+            st.dataframe(preview_checks, use_container_width=True, hide_index=True)
+        if not preview_limit_checks.empty:
+            st.warning("AI案反映後、職員別上限を超えている箇所があります。")
+            st.dataframe(preview_limit_checks, use_container_width=True, hide_index=True)
+
         c_save, c_clear = st.columns(2)
         with c_save:
             if st.button("確認したAIシフト案を保存する", use_container_width=True):
                 saved = save_ai_shift_draft_rows(draft)
-                clear_shift_caches()
                 st.success(f"AIシフト案を {saved} 件保存しました。")
                 st.session_state.pop("ai_shift_draft", None)
                 st.rerun()
@@ -4075,88 +5359,122 @@ def page_shift_manager():
                 st.warning("AIシフト案を破棄しました。")
                 st.rerun()
 
-    st.markdown("### チェック結果・警告")
-    matrix = create_shift_matrix(shift_df, int(shift_year), int(shift_month))
-    shortage = create_shift_shortage_table(shift_df, int(shift_year), int(shift_month))
-    checks = create_shift_quality_check_table(shift_df, int(shift_year), int(shift_month))
+    st.markdown("---")
+    st.markdown("### 5. シフトチェック・集計")
+
     limit_checks = create_shift_limit_check_table(matrix)
-    status_col = _status_column(shortage)
-    shortage_ng = shortage[shortage[status_col].astype(str) != "OK"] if status_col and not shortage.empty else pd.DataFrame()
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("人員不足日", len(shortage_ng))
+        ng = shortage[shortage["状態"] != "OK"]
+        st.metric("人員不足日", len(ng))
     with c2:
-        st.metric("重複・連勤警告", 0 if checks is None or checks.empty else len(checks))
+        high_checks = checks[checks["重要度"] == "高"] if checks is not None and not checks.empty else pd.DataFrame()
+        st.metric("高重要度確認", len(high_checks))
     with c3:
         st.metric("上限超過", 0 if limit_checks.empty else len(limit_checks))
     with c4:
         st.metric("状態", "確定" if month_status.get("is_confirmed") else "作成中")
-    if not matrix.empty:
+
+    if matrix.empty:
+        st.info("この月のシフトはまだ登録されていません。")
+    else:
         st.dataframe(matrix, use_container_width=True, hide_index=True)
-    if shortage_ng.empty:
-        st.success("日勤・夜勤の必要人数チェックはOKです。")
+
+    ng = shortage[shortage["状態"] != "OK"]
+    if ng.empty:
+        st.success("日勤2名・夜勤1名の基準を満たしています。")
     else:
-        st.warning("人員不足の日があります。")
-        st.dataframe(shortage_ng, use_container_width=True, hide_index=True)
+        st.warning("日勤2名・夜勤1名の基準に満たない日があります。")
+        st.dataframe(ng, use_container_width=True, hide_index=True)
+
     if checks is None or checks.empty:
-        st.success("夜勤明け、希望休、有休、休みとの大きな重複警告はありません。")
+        st.success("夜勤翌日勤務・明け翌日勤務・5連勤以上・希望休重複などの大きな確認事項はありません。")
     else:
-        st.warning("シフト確認事項があります。")
+        st.warning("シフト確認事項があります。赤・黄色相当のチェックとして確認してください。")
         st.dataframe(checks, use_container_width=True, hide_index=True)
+
     if limit_checks.empty:
-        st.success("職員別の勤務回数上限内です。")
+        st.success("職員別の日勤・夜勤・合計勤務回数の上限内です。")
     else:
         st.warning("職員別の勤務回数上限を超えている箇所があります。")
         st.dataframe(limit_checks, use_container_width=True, hide_index=True)
 
-    st.markdown("### PDF/Excel/KING OF TIME CSV出力")
+    st.markdown("### 6. 確定・PDF・Excel出力")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
             if st.button("この月のシフトを確定する", use_container_width=True):
-                if not checks.empty or not shortage_ng.empty:
+                if not checks.empty or not shortage[shortage["状態"] != "OK"].empty:
                     st.warning("確認事項または不足日があります。内容を確認したうえで、必要ならもう一度確定してください。")
                 set_shift_month_status(int(shift_year), int(shift_month), True, current_login_user_for_shift())
-                clear_shift_caches()
                 st.success("この月のシフトを確定しました。")
                 st.rerun()
         else:
             if st.button("確定を解除する", use_container_width=True):
                 set_shift_month_status(int(shift_year), int(shift_month), False, current_login_user_for_shift())
-                clear_shift_caches()
                 st.warning("この月のシフト確定を解除しました。")
                 st.rerun()
+
     with c2:
         if REPORTLAB_AVAILABLE:
             try:
                 pdf_bytes = make_staff_shift_pdf(int(shift_year), int(shift_month))
-                st.download_button("勤務表PDF", data=pdf_bytes, file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.pdf", mime="application/pdf", use_container_width=True)
+                st.download_button(
+                    "勤務表PDFをダウンロード",
+                    data=pdf_bytes,
+                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
             except Exception as e:
                 st.error(f"シフトPDFを作成できませんでした：{e}")
     with c3:
         if OPENPYXL_AVAILABLE:
-            try:
-                excel_bytes = make_staff_shift_excel(int(shift_year), int(shift_month))
+            if month_status.get("is_confirmed"):
+                try:
+                    excel_bytes = make_staff_shift_excel(int(shift_year), int(shift_month))
+                    st.download_button(
+                        "確定勤務表Excelをダウンロード",
+                        data=excel_bytes,
+                        file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}_confirmed.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"シフトExcelを作成できませんでした：{e}")
+            else:
                 st.download_button(
-                    "勤務表Excel",
-                    data=excel_bytes,
-                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.xlsx",
+                    "確定勤務表Excelをダウンロード",
+                    data=b"",
+                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}_confirmed.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
+                    disabled=True,
+                    help="この月のシフトを確定するとExcel出力できます。",
                 )
-            except Exception as e:
-                st.error(f"シフトExcelを作成できませんでした：{e}")
+        else:
+            st.warning("openpyxl が未導入のためExcel出力できません。")
     with c4:
         missing_codes = get_missing_staff_code_names(get_active_staff())
         if missing_codes:
-            st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("..." if len(missing_codes) > 8 else ""))
+            st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("…" if len(missing_codes) > 8 else ""))
         try:
             kot_csv_bytes = make_king_of_time_shift_csv(int(shift_year), int(shift_month))
-            st.download_button("KING OF TIME CSV", data=kot_csv_bytes, file_name=f"king_of_time_shift_{int(shift_year)}_{int(shift_month):02d}.csv", mime="text/csv", use_container_width=True)
+            st.download_button(
+                "KING OF TIME用CSVをダウンロード",
+                data=kot_csv_bytes,
+                file_name=f"king_of_time_shift_{int(shift_year)}_{int(shift_month):02d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="出力項目：勤務日・従業員コード・パターンコード・出勤予定・退勤予定・休憩予定時間・全日休暇・備考",
+            )
+            st.caption("KING OF TIME取込前に、パターンコードと従業員コードが施設側の設定と一致しているか確認してください。")
         except Exception as e:
             st.error(f"KING OF TIME用CSVを作成できませんでした：{e}")
 
-    st.markdown("### 過去シフト検索・更新・削除")
+    st.markdown("---")
+    st.markdown("### 7. 過去シフト検索・更新・削除")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         search_start = st.date_input("検索開始", value=date(int(shift_year), int(shift_month), 1))
@@ -4172,17 +5490,19 @@ def page_shift_manager():
         st.dataframe(search_df[["id", "shift_date", "staff_name", "shift_kind", "start_time", "end_time", "next_day", "memo"]], use_container_width=True, hide_index=True)
         selected_shift_id = st.selectbox("更新・削除するシフトID", search_df["id"].tolist())
         target = search_df[search_df["id"] == selected_shift_id].iloc[0]
+
         with st.form("shift_update_form"):
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 u_date = st.date_input("日付", value=datetime.strptime(target["shift_date"], "%Y-%m-%d").date())
             with c2:
+                staff_list_for_edit = staff_options
                 current_staff = target["staff_name"] if target["staff_name"] in staff_options else ""
-                u_staff = st.selectbox("職員", staff_options, index=staff_options.index(current_staff) if current_staff in staff_options else 0)
+                u_staff = st.selectbox("職員", staff_list_for_edit, index=staff_list_for_edit.index(current_staff) if current_staff in staff_list_for_edit else 0)
             with c3:
                 u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(target["shift_kind"]) if target["shift_kind"] in SHIFT_KINDS else 0)
             with c4:
-                u_next = st.checkbox("終了は翌日", value=bool(target["next_day"]))
+                u_next = st.checkbox("翌日終了", value=bool(target["next_day"]))
             u_start = st.text_input("開始時刻", value=target["start_time"] or "")
             u_end = st.text_input("終了時刻", value=target["end_time"] or "")
             u_memo = st.text_input("メモ", value=target["memo"] or "")
@@ -4200,39 +5520,71 @@ def page_shift_manager():
                     SET shift_date=?, staff_name=?, shift_kind=?, start_time=?, end_time=?, next_day=?, memo=?, updated_at=?
                     WHERE id=?
                 """, (u_date.strftime("%Y-%m-%d"), u_staff, u_kind, u_start or None, u_end or None, 1 if u_next else 0, u_memo or None, now_text(), int(selected_shift_id)))
-                clear_shift_caches()
                 st.success("シフトを更新しました。")
                 st.rerun()
         if delete_shift:
             execute("DELETE FROM staff_shifts WHERE id=?", (int(selected_shift_id),))
-            clear_shift_caches()
             st.warning("シフトを削除しました。")
             st.rerun()
 
-    st.markdown("### カレンダー予定へのAI担当割当")
-    events = monthly_events(int(shift_year), int(shift_month))
-    event_rows = []
-    for items in events.values():
-        for ev in items:
-            event_rows.append(dict(ev))
-    events_df = pd.DataFrame(event_rows)
+    st.markdown("---")
+    st.markdown("### 8. カレンダー予定へのAI担当割当")
+
+    month_start = f"{int(shift_year)}-{int(shift_month):02d}-01"
+    month_end = f"{int(shift_year)}-{int(shift_month):02d}-{calendar.monthrange(int(shift_year), int(shift_month))[1]:02d}"
+    events_df = fetch_df("""
+        SELECT *
+        FROM events
+        WHERE event_date BETWEEN ? AND ?
+        ORDER BY event_date, start_time, id
+    """, (month_start, month_end))
+
     if events_df.empty:
         st.info("この月の予定はありません。")
         return
-    preview_df = build_event_assignment_preview(events_df, shift_df, only_unassigned=True)
-    if preview_df.empty:
+
+    options = {}
+    for _, ev in events_df.iterrows():
+        current_staff = ev["staff_name"] if ev["staff_name"] else "未担当"
+        label = f"ID:{ev['id']}｜{ev['event_date']}｜{ev['start_time'] or ''}｜{ev['title']}｜担当:{current_staff}"
+        options[label] = int(ev["id"])
+
+    selected_event_label = st.selectbox("担当候補を見る予定", list(options.keys()))
+    selected_event_id = options[selected_event_label]
+    event_row = events_df[events_df["id"] == selected_event_id].iloc[0]
+
+    candidates = get_shift_candidates_for_event(event_row, shift_df)
+    if candidates.empty:
+        st.warning("勤務表から担当候補が見つかりません。")
+    else:
+        st.dataframe(candidates, use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            ai_staff = st.selectbox("AI候補から選ぶ", candidates["職員名"].tolist())
+            if st.button("AI候補を担当に反映", use_container_width=True):
+                execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (ai_staff, now_text(), int(selected_event_id)))
+                st.success(f"予定ID:{selected_event_id} の担当を {ai_staff} さんにしました。")
+                st.rerun()
+        with c2:
+            manual_staff = st.selectbox("自分で担当を選ぶ", staff_options, key="manual_assign_staff")
+            if st.button("自分で選んだ担当を反映", use_container_width=True):
+                execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (manual_staff or None, now_text(), int(selected_event_id)))
+                st.success("担当を更新しました。")
+                st.rerun()
+
+    st.markdown("#### 未担当予定の一括AI割当")
+    preview = build_event_assignment_preview(events_df, shift_df, only_unassigned=True)
+    if preview.empty:
         st.info("未担当予定はありません。")
     else:
-        st.dataframe(preview_df, use_container_width=True, hide_index=True)
-        assignable = preview_df[preview_df["AI候補"].astype(str) != ""]
-        if not assignable.empty and st.button("未担当予定へ第1候補を一括反映", use_container_width=True):
-            params = [(r["AI候補"], now_text(), int(r["予定ID"])) for _, r in assignable.iterrows()]
-            updated = execute_many("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", params)
-            clear_event_caches()
-            st.success(f"{updated}件の予定へ担当候補を反映しました。")
-            st.rerun()
-
-
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        assignable = preview[preview["AI候補"].fillna("") != ""]
+        if not assignable.empty:
+            if st.button("未担当予定へ第1候補を一括反映", use_container_width=True):
+                params = [(r["AI候補"], now_text(), int(r["予定ID"])) for _, r in assignable.iterrows()]
+                updated = execute_many("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", params)
+                st.success(f"{updated}件の予定へ担当候補を反映しました。")
+                st.rerun()
 
 
 def current_login_user_for_shift():
@@ -4266,7 +5618,7 @@ def page_storage_check():
     with c3:
         st.metric("Storageバケット", "OK" if bucket_ok else "要確認")
     with c4:
-        st.metric("requests", "OK" if REQUESTS_AVAILABLE else "未導入")
+        st.metric("requests", "OK" if requests is not None else "未導入")
 
     st.write(f"**SUPABASE_URL**：`{get_supabase_url() or '未設定'}`")
     st.write(f"**SUPABASE_STORAGE_BUCKET**：`{get_supabase_storage_bucket() or '未設定'}`")
@@ -4447,14 +5799,12 @@ def page_export():
     st.subheader("Excel・PDF出力")
 
     st.markdown("### Excel出力")
-    started = time.perf_counter()
-    events = fetch_df(f"SELECT {EVENT_DETAIL_COLUMNS} FROM events ORDER BY event_date, start_time, id")
-    photos = fetch_df("SELECT id, event_id, file_name, file_path, photo_memo, created_at FROM event_photos ORDER BY event_id, id")
-    files = fetch_df("SELECT id, event_id, file_name, file_path, file_type, file_memo, created_at FROM event_files ORDER BY event_id, id")
-    categories = fetch_df(f"SELECT {CATEGORY_COLUMNS} FROM categories ORDER BY sort_order, category_name")
-    users = fetch_df(f"SELECT {USER_COLUMNS} FROM users ORDER BY user_name")
-    staff = fetch_df(f"SELECT {STAFF_COLUMNS} FROM staff ORDER BY staff_name")
-    note_perf("Excel出力データ取得", started)
+    events = fetch_df("SELECT * FROM events ORDER BY event_date, start_time, id")
+    photos = fetch_df("SELECT * FROM event_photos ORDER BY event_id, id")
+    files = fetch_df("SELECT * FROM event_files ORDER BY event_id, id")
+    categories = fetch_df("SELECT * FROM categories ORDER BY sort_order, category_name")
+    users = fetch_df("SELECT * FROM users ORDER BY user_name")
+    staff = fetch_df("SELECT * FROM staff ORDER BY staff_name")
 
     output = Path("hidamari_calendar_export.xlsx")
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -4532,7 +5882,6 @@ def main():
         ],
     )
 
-    page_started = time.perf_counter()
     if menu == "月間カレンダー":
         page_calendar()
     elif menu == "今日は何ある":
@@ -4559,9 +5908,6 @@ def main():
         page_master_staff()
     elif menu == "Excel・PDF出力":
         page_export()
-
-    note_perf(menu, page_started)
-    show_perf_log()
 
 
 if __name__ == "__main__":
