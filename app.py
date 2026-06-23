@@ -22,6 +22,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import report_service
 
 from config import (
     AI_SHIFT_RULE_VERSION,
@@ -47,7 +48,6 @@ from report_service import (
     REPORTLAB_AVAILABLE,
     make_calendar_pdf as report_make_calendar_pdf,
     make_king_of_time_shift_csv as report_make_king_of_time_shift_csv,
-    make_shift_calendar_pdf as report_make_shift_calendar_pdf,
     make_staff_shift_excel as report_make_staff_shift_excel,
     make_staff_shift_pdf as report_make_staff_shift_pdf,
 )
@@ -3913,7 +3913,9 @@ def make_staff_shift_pdf(year, month):
 
 
 def make_shift_calendar_pdf(year, month, shift_df, staff_list, selected_staff_names=None, finalized=False):
-    return report_make_shift_calendar_pdf(
+    if not hasattr(report_service, "make_shift_calendar_pdf"):
+        raise RuntimeError("月間シフトカレンダーPDF関数が report_service.py に見つかりません。")
+    return report_service.make_shift_calendar_pdf(
         year,
         month,
         shift_df,
