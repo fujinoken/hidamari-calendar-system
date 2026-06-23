@@ -115,6 +115,11 @@ SHIFT_COLUMNS = """
     next_day, memo, created_at, updated_at
 """
 
+DAY_STAFFING_SHIFT_KINDS = ["日勤"]
+DAY_LIMIT_SHIFT_KINDS = ["日勤"]
+NIGHT_LIMIT_SHIFT_KINDS = ["夜勤"]
+WORKDAY_SHIFT_KINDS = ["日勤", "管理業務", "夜勤", "夜勤明け"]
+
 
 def note_perf(label, started_at):
     elapsed = time.perf_counter() - started_at
@@ -2214,7 +2219,7 @@ def make_calendar_pdf(year, month, include_detail=True):
 
 def default_shift_times(shift_kind):
     """基本勤務時間。日勤2名、夜勤1名の運用を想定。"""
-    if shift_kind == "日勤":
+    if shift_kind in ["日勤", "管理業務"]:
         return "08:30", "17:30", 0
     if shift_kind == "夜勤":
         return "16:30", "09:30", 1
@@ -2226,6 +2231,7 @@ def default_shift_times(shift_kind):
 def shift_short_label(shift_kind):
     return {
         "日勤": "日",
+        "管理業務": "管",
         "夜勤": "夜",
         "夜勤明け": "明",
         "休み": "",
@@ -2240,6 +2246,7 @@ def shift_kind_from_editor_label(label):
     value = str(label or "").strip()
     mapping = {
         "日": ["日勤"],
+        "管": ["管理業務"],
         "夜": ["夜勤"],
         "明": ["夜勤明け"],
         "希": ["希望休"],
@@ -2456,9 +2463,9 @@ def staff_month_work_counts(df, staff_name, year, month):
     work = work[work["shift_date"].astype(str).str.startswith(ym)]
     if work.empty:
         return 0, 0, 0
-    day_count = int(len(work[work["shift_kind"].astype(str) == "日勤"]))
-    night_count = int(len(work[work["shift_kind"].astype(str) == "夜勤"]))
-    total_count = int(len(work[work["shift_kind"].astype(str).isin(["日勤", "夜勤"])]))
+    day_count = int(len(work[work["shift_kind"].astype(str).isin(DAY_LIMIT_SHIFT_KINDS)]))
+    night_count = int(len(work[work["shift_kind"].astype(str).isin(NIGHT_LIMIT_SHIFT_KINDS)]))
+    total_count = int(len(work[work["shift_kind"].astype(str).isin(WORKDAY_SHIFT_KINDS)]))
     return day_count, night_count, total_count
 
 def would_exceed_staff_shift_limit(df, staff_name, target_date, shift_kind, limit_map=None):
@@ -2466,14 +2473,14 @@ def would_exceed_staff_shift_limit(df, staff_name, target_date, shift_kind, limi
     その勤務を1件追加した場合に、職員別の日勤・夜勤・合計上限を超えるか判定する。
     AIシフト案作成時の最終ガードとして使う。
     """
-    if shift_kind not in ["日勤", "夜勤"]:
+    if shift_kind not in WORKDAY_SHIFT_KINDS:
         return False, ""
     target = pd.to_datetime(str(target_date)).date()
     limits = normalize_shift_limits_for_staff(limit_map or get_staff_shift_limit_map(), staff_name)
     day_count, night_count, total_count = staff_month_work_counts(df, staff_name, target.year, target.month)
 
-    add_day = 1 if shift_kind == "日勤" else 0
-    add_night = 1 if shift_kind == "夜勤" else 0
+    add_day = 1 if shift_kind in DAY_LIMIT_SHIFT_KINDS else 0
+    add_night = 1 if shift_kind in NIGHT_LIMIT_SHIFT_KINDS else 0
 
     if day_count + add_day > limits["day"]:
         return True, f"日勤上限{limits['day']}回を超えるため候補外"
@@ -2710,11 +2717,11 @@ def labels_to_cell_value(labels):
         if off_label in labels:
             return off_label
 
-    # 日/夜の同日入力は禁止。既存データで重なっている場合は日を優先表示し、チェックで警告する。
-    if "日" in labels and "夜" in labels:
-        return "日"
+    # 勤務系の同日入力は禁止。既存データで重なっている場合は日、管、夜の順に優先表示し、チェックで警告する。
+    priority = ["日", "管", "夜", "明", "休", "希", "有", "他"]
+    if sum(1 for x in ["日", "管", "夜"] if x in labels) >= 2:
+        return next(x for x in priority if x in labels)
 
-    priority = ["日", "夜", "明", "休", "希", "有", "他"]
     ordered = [x for x in priority if x in labels]
     if len(ordered) == 1:
         return ordered[0]
@@ -2726,12 +2733,12 @@ def create_shift_matrix(df, year, month):
     staff_names = []
     if df is not None and not df.empty:
         staff_names = sorted(set([normalize_staff_name(x) for x in df["staff_name"].dropna().astype(str).tolist() if normalize_staff_name(x)]))
-    columns = ["職員名"] + [str(d) for d in range(1, last_day + 1)] + ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]
+    columns = ["職員名"] + [str(d) for d in range(1, last_day + 1)] + ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]
     rows = []
 
     for staff_name in staff_names:
         row = {"職員名": staff_name}
-        day_count = night_count = ake_count = rest_count = hope_count = paid_count = total_count = 0
+        day_count = management_count = night_count = ake_count = rest_count = hope_count = paid_count = other_count = total_count = 0
         work_flags = []
         for d in range(1, last_day + 1):
             target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
@@ -2740,25 +2747,33 @@ def create_shift_matrix(df, year, month):
             if "日" in labels:
                 day_count += 1
                 total_count += 1
+            if "管" in labels:
+                management_count += 1
+                total_count += 1
             if "夜" in labels:
                 night_count += 1
                 total_count += 1
             if "明" in labels:
                 ake_count += 1
+                total_count += 1
             if "休" in labels:
                 rest_count += 1
             if "希" in labels:
                 hope_count += 1
             if "有" in labels:
                 paid_count += 1
-            work_flags.append(1 if ("日" in labels or "夜" in labels) else 0)
+            if "他" in labels:
+                other_count += 1
+            work_flags.append(1 if any(label in labels for label in ["日", "管", "夜", "明"]) else 0)
 
         row["日勤"] = day_count
+        row["管"] = management_count
         row["夜勤"] = night_count
         row["明"] = ake_count
         row["休み"] = rest_count
         row["希望休"] = hope_count
         row["有休"] = paid_count
+        row["他"] = other_count
         row["合計"] = total_count
         row["最大連勤"] = max_consecutive_ones(work_flags)
         rows.append(row)
@@ -2902,7 +2917,7 @@ def create_shift_shortage_table(df, year, month):
         day_df = df[df["shift_date"].astype(str) == target_date] if df is not None and not df.empty else pd.DataFrame()
         day_count = night_count = 0
         if not day_df.empty:
-            day_count = len(day_df[day_df["shift_kind"] == "日勤"])
+            day_count = len(day_df[day_df["shift_kind"].isin(DAY_STAFFING_SHIFT_KINDS)])
             night_count = len(day_df[day_df["shift_kind"] == "夜勤"])
         status = "OK" if day_count >= 2 and night_count >= 1 else "要確認"
         rows.append({
@@ -2957,7 +2972,7 @@ def create_shift_quality_check_table(df, year, month):
                 prev_kinds = prev_df["shift_kind"].astype(str).tolist() if not prev_df.empty else []
 
                 if "夜勤" in prev_kinds:
-                    if "日勤" in kinds or "夜勤" in kinds:
+                    if any(k in WORKDAY_SHIFT_KINDS for k in kinds):
                         rows.append({
                             "重要度": "高",
                             "種類": "夜勤翌日勤務",
@@ -2975,7 +2990,7 @@ def create_shift_quality_check_table(df, year, month):
                         })
 
                 if "夜勤明け" in prev_kinds:
-                    if "日勤" in kinds or "夜勤" in kinds:
+                    if any(k in WORKDAY_SHIFT_KINDS for k in kinds):
                         rows.append({
                             "重要度": "高",
                             "種類": "明け翌日勤務",
@@ -2994,7 +3009,7 @@ def create_shift_quality_check_table(df, year, month):
             except Exception:
                 pass
 
-            work_flags.append(1 if ("日勤" in kinds or "夜勤" in kinds) else 0)
+            work_flags.append(1 if any(k in WORKDAY_SHIFT_KINDS for k in kinds) else 0)
 
         # 5連勤・6連勤以上
         cur = 0
@@ -3160,7 +3175,7 @@ def build_event_assignment_preview(events_df, shift_df, only_unassigned=True):
 
 
 OFF_OR_BLOCKING_SHIFT_KINDS = ["休み", "希望休", "有休", "その他"]
-ACTIVE_SHIFT_KINDS = ["日勤", "夜勤", "夜勤明け"]
+ACTIVE_SHIFT_KINDS = WORKDAY_SHIFT_KINDS
 
 
 def get_staff_day_shift_kinds(df, staff_name, target_date):
@@ -3403,7 +3418,7 @@ def create_ai_shift_draft(df, staff_names, year, month):
                             (working_df["staff_name"].apply(normalize_staff_name) == s) &
                             (working_df["shift_date"].astype(str) == prev_date)
                         ] if not working_df.empty else pd.DataFrame()
-                        if not p_df.empty and any(k in p_df["shift_kind"].astype(str).tolist() for k in ["日勤", "夜勤"]):
+                        if not p_df.empty and any(k in p_df["shift_kind"].astype(str).tolist() for k in WORKDAY_SHIFT_KINDS):
                             consecutive_before += 1
                         else:
                             break
@@ -3796,6 +3811,7 @@ def make_staff_shift_excel(year, month):
 def format_shift_label(shift_value):
     mapping = {
         "日勤": "日",
+        "管理業務": "管",
         "夜勤": "夜",
         "夜勤明け": "明",
         "休み": "休",
