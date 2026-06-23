@@ -643,81 +643,385 @@ def render_saved_event_confirmation(event_id=None):
 
 
 
-def render_calendar(year, month):
-    """
-    紙の壁カレンダー風レイアウト。
-    カレンダーはHTMLで表示し、予定詳細は下部の予定ボタンから同じページ内に表示する。
-    """
-    events_by_day = monthly_events(year, month)
-    first_weekday, last_day = calendar.monthrange(year, month)  # Monday=0, Sunday=6
+
+def get_weekday_label(target_date):
+    labels = ["月", "火", "水", "木", "金", "土", "日"]
+    return labels[target_date.weekday()]
+
+
+def format_event_for_calendar(event):
+    mark = get_category_mark(event.get("category", ""))
+    time_text = str(event.get("start_time") or "").strip()
+    title = str(event.get("title") or "").strip()
+    category = str(event.get("category") or "").strip()
+    important = "!" if int(event.get("important") or 0) == 1 else ""
+    head = f"{time_text} " if time_text else ""
+    cat = f"［{category}］" if category else ""
+    return f"{important}{mark} {head}{cat}{title}".strip()
+
+
+def render_day_cell(target_date, day_events):
+    date_key = target_date.strftime("%Y-%m-%d")
+    is_selected = st.session_state.get("selected_calendar_date") == date_key
+    is_today = target_date == today_jst()
+    weekday = target_date.weekday()
+    classes = ["hm-day-card"]
+    if weekday == 6:
+        classes.append("hm-sunday")
+    if weekday == 5:
+        classes.append("hm-saturday")
+    if is_today:
+        classes.append("hm-today")
+    if is_selected:
+        classes.append("hm-selected")
+    if day_events:
+        classes.append("hm-has-events")
+
+    event_lines = []
+    for ev in day_events[:3]:
+        event_lines.append(
+            f'<div class="hm-event-pill">{html_escape(format_event_for_calendar(ev))}</div>'
+        )
+    if len(day_events) > 3:
+        event_lines.append(f'<div class="hm-more-events">ほか {len(day_events) - 3} 件</div>')
+
+    count_badge = f'<span class="hm-event-count">{len(day_events)}件</span>' if day_events else ""
+    html = (
+        f'<div class="{" ".join(classes)}">'
+        f'<div class="hm-day-top"><span class="hm-day-number">{target_date.day}</span>'
+        f'<span class="hm-weekday">{get_weekday_label(target_date)}</span>{count_badge}</div>'
+        f'<div class="hm-day-events">{"".join(event_lines)}</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+    if st.button("この日を選択", key=f"select_day_{date_key}", use_container_width=True):
+        st.session_state["selected_calendar_date"] = date_key
+        st.session_state["editing_event_id"] = None
+        st.session_state["pending_delete_event_id"] = None
+        st.rerun()
+
+
+def render_month_calendar(year, month, events=None):
+    events = events if events is not None else monthly_events(year, month)
+    first_weekday, last_day = calendar.monthrange(year, month)
     start_col = (first_weekday + 1) % 7
+    days = [None] * start_col
+    days.extend(date(year, month, day) for day in range(1, last_day + 1))
+    while len(days) % 7 != 0:
+        days.append(None)
 
-    cells = [""] * 42
-    for day in range(1, last_day + 1):
-        cells[start_col + day - 1] = day
+    st.markdown(f'<div class="hm-calendar-title">{year}年 {month}月</div>', unsafe_allow_html=True)
+    header_cols = st.columns(7)
+    for idx, label in enumerate(["日", "月", "火", "水", "木", "金", "土"]):
+        cls = "hm-cal-head hm-sunday-text" if idx == 0 else "hm-cal-head hm-saturday-text" if idx == 6 else "hm-cal-head"
+        header_cols[idx].markdown(f'<div class="{cls}">{label}</div>', unsafe_allow_html=True)
 
-    html = []
-    html.append(f'<div class="calendar-title">{year}年 {month}月</div>')
-    html.append('<div class="calendar-grid">')
-
-    for h in ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]:
-        html.append(f'<div class="day-head">{h}</div>')
-
-    for idx, day in enumerate(cells):
-        dow = idx % 7
-        dow_cls = "sunday" if dow == 0 else ("saturday" if dow == 6 else "")
-
-        if day == "":
-            html.append('<div class="day-cell blank-cell"></div>')
-            continue
-
-        key = f"{year}-{month:02d}-{int(day):02d}"
-        html.append('<div class="day-cell">')
-        html.append(f'<div class="day-num {dow_cls}">{day}</div>')
-        html.append('<div class="write-lines"></div>')
-
-        for ev in events_by_day.get(key, []):
-            mark = get_category_mark(ev["category"])
-            time_part = f'{ev["start_time"]} ' if ev["start_time"] else ""
-            user_part = f'／{ev["user_name"]}' if ev["user_name"] else ""
-            imp_cls = " important" if int(ev["important"] or 0) == 1 else ""
-            text = html_escape(f'{mark}{time_part}{ev["title"]}{user_part}')
-            html.append(f'<div class="event-line{imp_cls}">{text}</div>')
-
-        html.append('</div>')
-
-    html.append('</div>')
-    st.markdown("".join(html), unsafe_allow_html=True)
-
-    # Streamlitの通常ボタンで詳細表示。HTML内クリックより安定。
-    month_events = []
-    for key in sorted(events_by_day.keys()):
-        for ev in events_by_day[key]:
-            month_events.append(ev)
-
-    if month_events:
-        st.markdown("### 予定詳細を表示")
-        st.caption("下の予定ボタンから選ぶと、詳細が同じページ内に表示されます。")
-        month_df = pd.DataFrame(month_events)
-        render_event_button_list(month_df, empty_message="この月の予定はありません。", include_date=True)
-
-    render_event_detail_panel()
+    for week_start in range(0, len(days), 7):
+        cols = st.columns(7)
+        for idx, target_date in enumerate(days[week_start:week_start + 7]):
+            with cols[idx]:
+                if target_date is None:
+                    st.markdown('<div class="hm-day-card hm-blank"></div>', unsafe_allow_html=True)
+                else:
+                    key = target_date.strftime("%Y-%m-%d")
+                    render_day_cell(target_date, events.get(key, []))
 
 
-# -----------------------------
-# Pages
-# -----------------------------
+def _event_user_label(user_map, event_row):
+    user_id = str(event_row.get("user_id") or "")
+    user_name = str(event_row.get("user_name") or "")
+    if user_id and user_name:
+        expected = f"{user_name}（ID:{user_id}）"
+        if expected in user_map:
+            return expected
+    for label, pair in user_map.items():
+        if pair[0] == user_id or pair[1] == user_name:
+            return label
+    return ""
+
+
+def _event_date_value(value, fallback_date):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except Exception:
+        return fallback_date
+
+
+def render_selected_day_events(selected_date):
+    st.markdown("### 選択日の予定詳細")
+    date_text = selected_date.strftime("%Y-%m-%d")
+    st.caption(f"{date_text}（{get_weekday_label(selected_date)}）")
+    df = events_by_date(date_text)
+    if df.empty:
+        st.info("この日の予定はまだありません。下のフォームから登録できます。")
+        return
+
+    for _, ev in df.iterrows():
+        event_id = int(ev["id"])
+        important = "重要 " if int(ev.get("important") or 0) == 1 else ""
+        time_text = " - ".join([x for x in [ev.get("start_time"), ev.get("end_time")] if x]) or "時刻未設定"
+        title = html_escape(ev.get("title") or "")
+        category = html_escape(ev.get("category") or "")
+        memo = html_escape(ev.get("memo") or "")
+        staff = html_escape(ev.get("staff_name") or "")
+        user = html_escape(ev.get("user_name") or "")
+        mark = get_category_mark(ev.get("category"))
+
+        st.markdown(
+            f'<div class="hm-detail-card">'
+            f'<div class="hm-detail-title">{important}{mark} {title}</div>'
+            f'<div class="hm-detail-meta">{time_text}　{category}'
+            f'{"　利用者: " + user if user else ""}'
+            f'{"　担当: " + staff if staff else ""}</div>'
+            f'<div class="hm-detail-memo">{memo if memo else "メモなし"}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        c1, c2, c3 = st.columns([1, 1, 4])
+        with c1:
+            if st.button("編集", key=f"edit_event_{event_id}", use_container_width=True):
+                st.session_state["editing_event_id"] = event_id
+                st.session_state["pending_delete_event_id"] = None
+                st.rerun()
+        with c2:
+            if st.button("削除", key=f"ask_delete_event_{event_id}", use_container_width=True):
+                st.session_state["pending_delete_event_id"] = event_id
+                st.rerun()
+        if st.session_state.get("pending_delete_event_id") == event_id:
+            st.warning(f"予定ID {event_id} を削除します。写真メモ・添付ファイルも一緒に削除されます。")
+            d1, d2 = st.columns(2)
+            with d1:
+                if st.button("削除を確定", key=f"confirm_delete_event_{event_id}", type="primary", use_container_width=True):
+                    photos = get_event_photos(event_id)
+                    for _, photo in photos.iterrows():
+                        delete_saved_file(photo["file_path"])
+                    files = get_event_files(event_id)
+                    for _, file_row in files.iterrows():
+                        delete_saved_file(file_row["file_path"])
+                    execute("DELETE FROM event_photos WHERE event_id=?", (event_id,))
+                    execute("DELETE FROM event_files WHERE event_id=?", (event_id,))
+                    execute("DELETE FROM events WHERE id=?", (event_id,))
+                    clear_event_photos_cache()
+                    clear_event_files_cache()
+                    clear_event_caches()
+                    st.session_state["pending_delete_event_id"] = None
+                    st.session_state["editing_event_id"] = None
+                    st.success("予定を削除しました。")
+                    st.rerun()
+            with d2:
+                if st.button("キャンセル", key=f"cancel_delete_event_{event_id}", use_container_width=True):
+                    st.session_state["pending_delete_event_id"] = None
+                    st.rerun()
+
+
+def render_event_form(selected_date, editing_event_id=None):
+    editing_event = None
+    if editing_event_id:
+        edit_df = get_event_by_id(editing_event_id)
+        if not edit_df.empty:
+            editing_event = edit_df.iloc[0]
+        else:
+            st.session_state["editing_event_id"] = None
+            st.warning("編集中の予定が見つかりません。")
+
+    st.markdown("### 選択日の予定登録・編集フォーム")
+    if editing_event is not None:
+        st.info(f"予定ID {int(editing_event['id'])} を編集中です。")
+
+    user_map = user_display_map()
+    users = list(user_map.keys())
+    staff = [""] + get_active_staff()
+    category_options = get_categories()
+    if editing_event is not None and editing_event.get("category") and editing_event["category"] not in category_options:
+        category_options = [editing_event["category"]] + category_options
+
+    default_date = _event_date_value(editing_event.get("event_date"), selected_date) if editing_event is not None else selected_date
+    default_category = editing_event.get("category") if editing_event is not None else (category_options[0] if category_options else "")
+    default_staff = editing_event.get("staff_name") if editing_event is not None else ""
+    staff_index = staff.index(default_staff) if default_staff in staff else 0
+    user_label = _event_user_label(user_map, editing_event) if editing_event is not None else ""
+    user_index = users.index(user_label) if user_label in users else 0
+    form_key = f"selected_day_event_form_{selected_date.strftime('%Y%m%d')}_{editing_event_id or 'new'}"
+
+    with st.form(form_key, clear_on_submit=editing_event is None):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            event_date = st.date_input("日付", value=default_date, key=f"{form_key}_date")
+            category = st.selectbox(
+                "種別",
+                category_options,
+                index=category_options.index(default_category) if default_category in category_options else 0,
+                key=f"{form_key}_category",
+            )
+        with c2:
+            start_time = st.text_input("開始時刻", value=str(editing_event.get("start_time") or "") if editing_event is not None else "", placeholder="例：10:00")
+            end_time = st.text_input("終了時刻", value=str(editing_event.get("end_time") or "") if editing_event is not None else "", placeholder="例：11:00")
+        with c3:
+            user_name = st.selectbox("利用者", users, index=user_index, key=f"{form_key}_user")
+            staff_name = st.selectbox("担当職員", staff, index=staff_index, key=f"{form_key}_staff")
+
+        title = st.text_input("予定タイトル", value=str(editing_event.get("title") or "") if editing_event is not None else "", placeholder="例：内科受診、家族面会、外出支援")
+        memo = st.text_area("メモ", value=str(editing_event.get("memo") or "") if editing_event is not None else "", placeholder="持ち物、注意点、申し送りなど")
+        important = st.checkbox("重要マーク", value=bool(editing_event.get("important")) if editing_event is not None else False)
+
+        uploaded_photos = uploaded_files = []
+        photo_memo = file_memo = ""
+        if editing_event is None:
+            uploaded_photos = st.file_uploader("写真メモ（複数可）", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key=f"{form_key}_photos")
+            photo_memo = st.text_input("写真メモ補足", key=f"{form_key}_photo_memo")
+            uploaded_files = st.file_uploader("Excel・書類ファイル（複数可）", type=["xlsx", "xls", "csv"], accept_multiple_files=True, key=f"{form_key}_files")
+            file_memo = st.text_input("Excel・書類メモ補足", key=f"{form_key}_file_memo")
+        else:
+            st.caption("写真メモ・添付ファイルの追加や削除は、従来の予定検索・更新・削除画面でも行えます。")
+
+        submit_label = "予定を更新" if editing_event is not None else "予定を登録"
+        submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
+
+    if not submitted:
+        if editing_event is not None and st.button("編集をやめる", key=f"cancel_edit_{editing_event_id}", use_container_width=True):
+            st.session_state["editing_event_id"] = None
+            st.rerun()
+        return
+
+    if not title.strip():
+        st.error("予定タイトルを入力してください。")
+        return
+
+    selected_user_id, selected_user_name = user_map.get(user_name, ("", ""))
+    if editing_event is not None:
+        execute("""
+            UPDATE events
+            SET event_date=?, category=?, title=?, user_id=?, user_name=?, staff_name=?,
+                start_time=?, end_time=?, memo=?, important=?, updated_at=?
+            WHERE id=?
+        """, (
+            event_date.strftime("%Y-%m-%d"),
+            category,
+            title.strip(),
+            selected_user_id or None,
+            selected_user_name or None,
+            staff_name or None,
+            start_time.strip() or None,
+            end_time.strip() or None,
+            memo.strip() or None,
+            1 if important else 0,
+            now_text(),
+            int(editing_event_id),
+        ))
+        clear_event_caches()
+        st.session_state["selected_calendar_date"] = event_date.strftime("%Y-%m-%d")
+        st.session_state["editing_event_id"] = None
+        st.success("予定を更新しました。")
+        st.rerun()
+
+    event_id = execute("""
+        INSERT INTO events
+        (event_date, category, title, user_id, user_name, staff_name, start_time, end_time, memo, important, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        event_date.strftime("%Y-%m-%d"),
+        category,
+        title.strip(),
+        selected_user_id or None,
+        selected_user_name or None,
+        staff_name or None,
+        start_time.strip() or None,
+        end_time.strip() or None,
+        memo.strip() or None,
+        1 if important else 0,
+        now_text(),
+        now_text(),
+    ))
+    photo_saved, photo_failed = save_uploaded_photos(event_id, uploaded_photos, photo_memo)
+    file_saved, file_failed = save_uploaded_files(event_id, uploaded_files, file_memo)
+    clear_event_caches()
+    st.session_state["selected_calendar_date"] = event_date.strftime("%Y-%m-%d")
+    st.session_state["selected_calendar_event_id"] = int(event_id)
+    st.session_state["last_saved_event_id"] = int(event_id)
+    st.session_state["last_saved_photo_saved"] = int(photo_saved)
+    st.session_state["last_saved_photo_failed"] = int(photo_failed)
+    st.session_state["last_saved_file_saved"] = int(file_saved)
+    st.session_state["last_saved_file_failed"] = int(file_failed)
+    st.session_state["last_saved_had_photos"] = bool(uploaded_photos)
+    st.session_state["last_saved_had_files"] = bool(uploaded_files)
+    if photo_failed or file_failed:
+        st.warning("予定は保存しましたが、一部の写真メモまたは添付ファイルの保存に失敗しました。")
+    else:
+        st.success("予定を保存しました。")
+    st.rerun()
+
+
+def render_calendar(year, month):
+    render_month_calendar(year, month, monthly_events(year, month))
+
+
 def page_calendar():
     today = today_jst()
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        year = st.number_input("", min_value=2020, max_value=2100, value=today.year, step=1)
-    with col2:
-        month = st.number_input("", min_value=1, max_value=12, value=today.month, step=1)
-    with col3:
-        st.markdown('<div class="small-note"></div>', unsafe_allow_html=True)
+    st.subheader("月間カレンダー")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        year = st.number_input("年", min_value=2020, max_value=2100, value=today.year, step=1, key="calendar_year")
+    with c2:
+        month = st.number_input("月", min_value=1, max_value=12, value=today.month, step=1, key="calendar_month")
+    with c3:
+        st.caption("日付を選ぶと、下にその日の予定詳細と登録フォームが表示されます。")
+
+    default_date = date(int(year), int(month), min(today.day, calendar.monthrange(int(year), int(month))[1]))
+    selected_text = st.session_state.get("selected_calendar_date")
+    try:
+        selected_date = datetime.strptime(selected_text, "%Y-%m-%d").date() if selected_text else default_date
+    except Exception:
+        selected_date = default_date
+    if selected_date.year != int(year) or selected_date.month != int(month):
+        selected_date = default_date
+        st.session_state["selected_calendar_date"] = selected_date.strftime("%Y-%m-%d")
 
     render_calendar(int(year), int(month))
+    st.markdown("---")
+    render_selected_day_events(selected_date)
+    st.markdown("---")
+    render_event_form(selected_date, st.session_state.get("editing_event_id"))
+    render_saved_event_confirmation()
+
+    st.markdown("### PDF/Excel出力")
+    out1, out2 = st.columns(2)
+    with out1:
+        if REPORTLAB_AVAILABLE:
+            try:
+                pdf_bytes = make_calendar_pdf(int(year), int(month), include_detail=True)
+                st.download_button(
+                    "月間カレンダーPDFをダウンロード",
+                    data=pdf_bytes,
+                    file_name=f"hidamari_calendar_{int(year)}_{int(month):02d}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"PDFを作成できませんでした：{e}")
+        else:
+            st.warning("reportlab が未導入のためPDF出力できません。")
+    with out2:
+        month_events = []
+        for day_events in monthly_events(int(year), int(month)).values():
+            for ev in day_events:
+                month_events.append(dict(ev))
+        if month_events:
+            try:
+                from io import BytesIO
+                bio = BytesIO()
+                pd.DataFrame(month_events).to_excel(bio, index=False, sheet_name="予定")
+                st.download_button(
+                    "月間予定Excelをダウンロード",
+                    data=bio.getvalue(),
+                    file_name=f"hidamari_events_{int(year)}_{int(month):02d}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Excelを作成できませんでした：{e}")
+        else:
+            st.download_button("月間予定Excelをダウンロード", data=b"", file_name="hidamari_events_empty.xlsx", disabled=True, use_container_width=True)
+
 
 
 
@@ -3488,16 +3792,137 @@ def make_staff_shift_excel(year, month):
 
 
 
-def page_shift_manager():
-    st.subheader("職員シフト管理・AI担当割当")
-    st.caption("希望休 → AIシフト案 → 不足・連勤チェック → 人が修正 → 確定 → PDF出力の流れで使えます。")
 
+def format_shift_label(shift_value):
+    mapping = {
+        "日勤": "日",
+        "夜勤": "夜",
+        "夜勤明け": "明",
+        "休み": "休",
+        "希望休": "希",
+        "有休": "有",
+        "その他": "他",
+    }
+    return mapping.get(str(shift_value or ""), str(shift_value or ""))
+
+
+def _weekday_column_label(year, month, day):
+    d = date(int(year), int(month), int(day))
+    return f"{day}\n({get_weekday_label(d)})"
+
+
+def _status_column(df):
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        if "状" in str(col) or str(col) in ("状態", "���"):
+            return col
+    return df.columns[-2] if len(df.columns) >= 2 else None
+
+
+def render_shift_calendar(year, month, shift_df):
+    st.markdown("### 月間シフトカレンダー")
+    first_weekday, last_day = calendar.monthrange(int(year), int(month))
+    start_col = (first_weekday + 1) % 7
+    days = [None] * start_col
+    days.extend(date(int(year), int(month), d) for d in range(1, last_day + 1))
+    while len(days) % 7 != 0:
+        days.append(None)
+
+    header_cols = st.columns(7)
+    for idx, label in enumerate(["日", "月", "火", "水", "木", "金", "土"]):
+        cls = "hm-cal-head hm-sunday-text" if idx == 0 else "hm-cal-head hm-saturday-text" if idx == 6 else "hm-cal-head"
+        header_cols[idx].markdown(f'<div class="{cls}">{label}</div>', unsafe_allow_html=True)
+
+    for week_start in range(0, len(days), 7):
+        cols = st.columns(7)
+        for idx, target_date in enumerate(days[week_start:week_start + 7]):
+            with cols[idx]:
+                if target_date is None:
+                    st.markdown('<div class="hm-shift-day hm-blank"></div>', unsafe_allow_html=True)
+                    continue
+                date_text = target_date.strftime("%Y-%m-%d")
+                day_df = shift_df[shift_df["shift_date"].astype(str) == date_text] if shift_df is not None and not shift_df.empty else pd.DataFrame()
+                classes = ["hm-shift-day"]
+                if target_date.weekday() == 6:
+                    classes.append("hm-sunday")
+                if target_date.weekday() == 5:
+                    classes.append("hm-saturday")
+                if target_date == today_jst():
+                    classes.append("hm-today")
+                lines = []
+                if not day_df.empty:
+                    for kind in SHIFT_KINDS:
+                        members = day_df[day_df["shift_kind"].astype(str) == kind]["staff_name"].dropna().astype(str).tolist()
+                        if members:
+                            names = "、".join(members[:3])
+                            if len(members) > 3:
+                                names += f" 他{len(members) - 3}"
+                            lines.append(f'<div class="hm-shift-line"><b>{format_shift_label(kind)}</b> {html_escape(names)}</div>')
+                html = (
+                    f'<div class="{" ".join(classes)}">'
+                    f'<div class="hm-day-top"><span class="hm-day-number">{target_date.day}</span>'
+                    f'<span class="hm-weekday">{get_weekday_label(target_date)}</span></div>'
+                    f'{"".join(lines) if lines else "<div class=\"hm-shift-empty\">未入力</div>"}'
+                    f'</div>'
+                )
+                st.markdown(html, unsafe_allow_html=True)
+
+
+def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_status=None):
+    st.markdown("### 月間シフト表")
+    staff_names = get_active_staff()
+    if staff_filter and staff_filter != "全職員":
+        staff_names = [staff_filter]
+    editable_matrix = create_editable_shift_matrix(staff_names, shift_df, int(year), int(month))
+    if editable_matrix.empty:
+        st.info("職員マスタに職員が登録されていません。先に職員マスタで登録してください。")
+        return
+
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    first_col = editable_matrix.columns[0]
+    column_config = {
+        first_col: st.column_config.TextColumn("職員名", disabled=True, width="medium"),
+    }
+    for d in range(1, last_day + 1):
+        column_config[str(d)] = st.column_config.SelectboxColumn(
+            _weekday_column_label(year, month, d),
+            options=SHIFT_EDITOR_OPTIONS,
+            required=False,
+            width="small",
+            help="日・夜・明・希・有・他を選択。空欄にすると削除扱いです。",
+        )
+
+    st.caption("各セルをクリックして、日・夜・明・希・有・他を直接入力できます。列見出しには曜日を表示しています。")
+    edited_matrix = st.data_editor(
+        editable_matrix,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config=column_config,
+        key=f"shift_matrix_editor_{int(year)}_{int(month)}_{staff_filter}_{st.session_state.get('shift_editor_reset_counter', 0)}",
+    )
+
+    if month_status and month_status.get("is_confirmed"):
+        st.warning("この月は確定済みです。修正する場合は、先に確定を解除してください。")
+        return
+    if st.button("月間シフト表の入力内容を保存", use_container_width=True, type="primary"):
+        saved = save_shift_matrix_from_editor(int(year), int(month), edited_matrix)
+        clear_shift_caches()
+        st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
+        st.rerun()
+
+
+def page_shift_manager():
+    st.subheader("シフト管理・AI割当")
     today = today_jst()
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        shift_year = st.number_input("表示年", min_value=2020, max_value=2100, value=today.year, step=1)
+        shift_year = st.number_input("対象年", min_value=2020, max_value=2100, value=today.year, step=1, key="shift_year")
     with c2:
-        shift_month = st.number_input("表示月", min_value=1, max_value=12, value=today.month, step=1)
+        shift_month = st.number_input("対象月", min_value=1, max_value=12, value=today.month, step=1, key="shift_month")
+    with c3:
+        staff_filter = st.selectbox("表示する職員", ["全職員"] + get_active_staff(), key=f"shift_staff_filter_{int(shift_year)}_{int(shift_month)}")
 
     month_status = get_shift_month_status(int(shift_year), int(shift_month))
     if month_status.get("is_confirmed"):
@@ -3506,43 +3931,53 @@ def page_shift_manager():
         st.info("この月のシフトは作成中です。")
 
     staff_options = [""] + get_active_staff()
+    shift_df = get_staff_shifts_month(int(shift_year), int(shift_month), include_prev_day=True)
+    if staff_filter != "全職員" and not shift_df.empty:
+        shift_df_for_view = shift_df[shift_df["staff_name"].astype(str) == staff_filter].copy()
+    else:
+        shift_df_for_view = shift_df
 
-    st.markdown("### 1. 希望休・基本シフト入力")
-    with st.form("hope_shift_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            hope_date = st.date_input("希望休・休み日", value=today, key="hope_date")
-        with c2:
-            hope_staff = st.selectbox("職員", staff_options, key="hope_staff")
-        with c3:
-            hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind")
-        hope_memo = st.text_input("希望休メモ", placeholder="例：本人希望、通院、家庭都合など")
-        submit_hope = st.form_submit_button("希望休・休みを保存")
-    if submit_hope:
-        if not hope_staff:
-            st.error("職員を選択してください。")
-        else:
-            save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
-            st.success(f"{hope_staff} さんの {hope_kind} を保存しました。")
-            st.rerun()
+    render_shift_calendar(int(shift_year), int(shift_month), shift_df_for_view)
+
+    st.markdown("### 入力・編集フォーム")
+    with st.expander("希望休・有休・休みを登録", expanded=True):
+        with st.form("hope_shift_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                hope_date = st.date_input("日付", value=today, key="hope_date")
+            with c2:
+                hope_staff = st.selectbox("職員", staff_options, key="hope_staff")
+            with c3:
+                hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind")
+            hope_memo = st.text_input("メモ", placeholder="本人希望、通院、家庭都合など")
+            submit_hope = st.form_submit_button("保存")
+        if submit_hope:
+            if not hope_staff:
+                st.error("職員を選択してください。")
+            else:
+                save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
+                clear_shift_caches()
+                st.success(f"{hope_staff} さんの {hope_kind} を保存しました。")
+                st.rerun()
 
     with st.expander("1日分の基本シフト入力"):
         with st.form("basic_shift_form", clear_on_submit=True):
             shift_date = st.date_input("シフト日", value=today)
             c1, c2, c3 = st.columns(3)
             with c1:
-                day_staff_1 = st.selectbox("日勤1（8:30〜17:30）", staff_options, key="day_staff_1")
+                day_staff_1 = st.selectbox("日勤1", staff_options, key="day_staff_1")
             with c2:
-                day_staff_2 = st.selectbox("日勤2（8:30〜17:30）", staff_options, key="day_staff_2")
+                day_staff_2 = st.selectbox("日勤2", staff_options, key="day_staff_2")
             with c3:
-                night_staff = st.selectbox("夜勤（16:30〜翌9:30）", staff_options, key="night_staff")
-            shift_memo = st.text_input("シフトメモ", placeholder="例：研修、応援、希望休調整など")
+                night_staff = st.selectbox("夜勤", staff_options, key="night_staff")
+            shift_memo = st.text_input("シフトメモ")
             submit_basic = st.form_submit_button("この日の基本シフトを保存")
         if submit_basic:
             if not day_staff_1 and not day_staff_2 and not night_staff:
-                st.error("少なくとも1名は選択してください。")
+                st.error("少なくとも1名を選択してください。")
             else:
                 saved = save_basic_day_shift(shift_date.strftime("%Y-%m-%d"), day_staff_1, day_staff_2, night_staff, shift_memo)
+                clear_shift_caches()
                 st.success(f"{shift_date.strftime('%Y-%m-%d')} の基本シフトを {saved} 件保存しました。")
                 st.rerun()
 
@@ -3567,72 +4002,25 @@ def page_shift_manager():
                 st.error("職員を選択してください。")
             else:
                 save_single_shift(s_date.strftime("%Y-%m-%d"), s_staff, s_kind, s_start, s_end, 1 if s_next else 0, s_memo)
+                clear_shift_caches()
                 st.success("個別シフトを追加しました。")
                 st.rerun()
 
-    st.markdown("---")
-    st.markdown("### 2. 月間シフト直接入力・表示")
-
-    shift_df = get_staff_shifts_month(int(shift_year), int(shift_month), include_prev_day=True)
-    matrix = create_shift_matrix(shift_df, int(shift_year), int(shift_month))
-    shortage = create_shift_shortage_table(shift_df, int(shift_year), int(shift_month))
-    checks = create_shift_quality_check_table(shift_df, int(shift_year), int(shift_month))
-
-    staff_names_for_editor = get_active_staff()
-    editable_matrix = create_editable_shift_matrix(
-        staff_names_for_editor,
-        shift_df,
-        int(shift_year),
-        int(shift_month),
-    )
-
-    if editable_matrix.empty:
-        st.info("職員マスタに職員が登録されていません。先に職員マスタで職員を登録してください。")
-    else:
-        st.caption("各セルをクリックして、プルダウンから「日」「夜」「明」「希」「有」を直接入力できます。休みはシフト表には表示せず、空欄として扱います。空欄にすると削除扱いになります。")
-
-        with st.expander("月間シフトを全部クリアして再入力する"):
-            st.warning("この操作を行うと、表示中の月のシフト入力内容（日勤・夜勤・休み・希望休・有休など）をすべて削除します。職員別勤務回数上限は残ります。")
-            clear_confirm = st.checkbox(
-                f"{int(shift_year)}年{int(shift_month)}月のシフトを全クリアすることを確認しました",
-                key=f"clear_month_shift_confirm_{int(shift_year)}_{int(shift_month)}",
-            )
-            if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm):
-                clear_month_staff_shifts(int(shift_year), int(shift_month))
-                st.success("この月のシフトを全クリアしました。空の月間表から再入力できます。")
-                st.rerun()
-
-        last_day_for_editor = calendar.monthrange(int(shift_year), int(shift_month))[1]
-        column_config = {
-            "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium")
-        }
-        for d in range(1, last_day_for_editor + 1):
-            column_config[str(d)] = st.column_config.SelectboxColumn(
-                str(d),
-                options=SHIFT_EDITOR_OPTIONS,
-                required=False,
-                width="small",
-            )
-
-        edited_matrix = st.data_editor(
-            editable_matrix,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config=column_config,
-            key=f"shift_matrix_editor_{int(shift_year)}_{int(shift_month)}_{st.session_state.get('shift_editor_reset_counter', 0)}",
+    with st.expander("月間シフトを全部クリアして再入力する"):
+        st.warning("表示中の月のシフト入力内容をすべて削除します。職員別勤務回数上限は残ります。")
+        clear_confirm = st.checkbox(
+            f"{int(shift_year)}年{int(shift_month)}月のシフトを全クリアすることを確認しました",
+            key=f"clear_month_shift_confirm_{int(shift_year)}_{int(shift_month)}",
         )
+        if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm):
+            clear_month_staff_shifts(int(shift_year), int(shift_month))
+            clear_shift_caches()
+            st.success("この月のシフトを全クリアしました。")
+            st.rerun()
 
-        if month_status.get("is_confirmed"):
-            st.warning("確定済みの月です。修正する場合は、先に「確定を解除」してください。")
-        else:
-            if st.button("月間シフト表の直接入力内容を保存", use_container_width=True):
-                saved = save_shift_matrix_from_editor(int(shift_year), int(shift_month), edited_matrix)
-                st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
-                st.rerun()
+    render_shift_editor(int(shift_year), int(shift_month), shift_df, staff_filter, month_status)
 
-    st.markdown("### 3. 職員別勤務回数上限")
-    st.caption("職員ごとに、この月に入れる日勤・夜勤・合計勤務の上限を設定できます。AIシフト案はこの上限を超えない範囲で候補を出します。0回指定も有効です。")
+    st.markdown("### 職員別勤務回数上限")
     limits_df = get_staff_shift_limits()
     if limits_df.empty:
         st.info("職員マスタに職員が登録されていません。")
@@ -3642,32 +4030,20 @@ def page_shift_manager():
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            column_config={
-                "職員名": st.column_config.TextColumn("職員名", disabled=True, width="medium"),
-                "日勤上限": st.column_config.NumberColumn("日勤上限", min_value=0, max_value=31, step=1),
-                "夜勤上限": st.column_config.NumberColumn("夜勤上限", min_value=0, max_value=31, step=1),
-                "合計上限": st.column_config.NumberColumn("合計上限", min_value=0, max_value=31, step=1),
-                "メモ": st.column_config.TextColumn("メモ", width="medium"),
-            },
             key=f"shift_limit_editor_{int(shift_year)}_{int(shift_month)}",
         )
         if st.button("職員別勤務回数上限を保存", use_container_width=True):
             saved = save_staff_shift_limits_from_editor(edited_limits)
+            clear_shift_caches()
             st.success(f"職員別勤務回数上限を保存しました。登録件数：{saved}件")
             st.rerun()
 
-    st.markdown("### 4. AIシフト案作成")
-    st.caption("不足している日勤・夜勤について、希望休・有休・夜勤翌日の明け・明け翌日休み・職員別上限を超えない範囲で下書きを作ります。保存前に仮シフト表で確認できます。")
-
-    # AIが実際に参照している上限を表示する。0回指定が反映されているか確認できます。
+    st.markdown("### AIシフト案作成")
     with st.expander("AIが参照する職員別上限を確認"):
         st.dataframe(debug_shift_limit_summary_for_ai(), use_container_width=True, hide_index=True)
-
-    # 古いAI案がブラウザ側に残っている場合は破棄する。
     if st.session_state.get("ai_shift_rule_version") != AI_SHIFT_RULE_VERSION:
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["ai_shift_rule_version"] = AI_SHIFT_RULE_VERSION
-
     if st.button("不足分のAIシフト案を作成", use_container_width=True):
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["ai_shift_rule_version"] = AI_SHIFT_RULE_VERSION
@@ -3677,52 +4053,19 @@ def page_shift_manager():
             int(shift_year),
             int(shift_month),
         )
-
     draft = st.session_state.get("ai_shift_draft")
     if isinstance(draft, pd.DataFrame) and not draft.empty:
         draft = sanitize_ai_shift_draft_by_limits(draft, shift_df, int(shift_year), int(shift_month))
         st.session_state["ai_shift_draft"] = draft
-        st.markdown("#### AIシフト案一覧（まだ保存されていません）")
         st.dataframe(draft, use_container_width=True, hide_index=True)
-
-        warning_rows = draft[draft["勤務"].astype(str) == "注意"] if "勤務" in draft.columns else pd.DataFrame()
-        if not warning_rows.empty:
-            st.warning("明け翌日の休みなど、AIが自動で入れられなかった注意事項があります。保存前に確認してください。")
-            for _, wr in warning_rows.iterrows():
-                st.caption(f"⚠️ {wr.get('日付', '')}｜{wr.get('候補職員', '')}｜{wr.get('理由', '')}")
-
         preview_shift_df = apply_ai_shift_draft_to_df(shift_df, draft)
         st.markdown("#### AI案を反映した仮シフト表")
-        st.caption("ここで内容を確認してから、下の保存ボタンでDBに反映します。")
-        preview_matrix = create_shift_matrix(preview_shift_df, int(shift_year), int(shift_month))
-        st.dataframe(preview_matrix, use_container_width=True, hide_index=True)
-
-        preview_shortage = create_shift_shortage_table(preview_shift_df, int(shift_year), int(shift_month))
-        preview_checks = create_shift_quality_check_table(preview_shift_df, int(shift_year), int(shift_month))
-        preview_limit_checks = create_shift_limit_check_table(preview_matrix)
-
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            st.metric("仮不足日", len(preview_shortage[preview_shortage["状態"] != "OK"]))
-        with p2:
-            st.metric("仮確認事項", 0 if preview_checks.empty else len(preview_checks))
-        with p3:
-            st.metric("仮上限超過", 0 if preview_limit_checks.empty else len(preview_limit_checks))
-
-        if not preview_shortage[preview_shortage["状態"] != "OK"].empty:
-            st.warning("AI案反映後も人員不足の日があります。")
-            st.dataframe(preview_shortage[preview_shortage["状態"] != "OK"], use_container_width=True, hide_index=True)
-        if not preview_checks.empty:
-            st.warning("AI案反映後の確認事項があります。")
-            st.dataframe(preview_checks, use_container_width=True, hide_index=True)
-        if not preview_limit_checks.empty:
-            st.warning("AI案反映後、職員別上限を超えている箇所があります。")
-            st.dataframe(preview_limit_checks, use_container_width=True, hide_index=True)
-
+        st.dataframe(create_shift_matrix(preview_shift_df, int(shift_year), int(shift_month)), use_container_width=True, hide_index=True)
         c_save, c_clear = st.columns(2)
         with c_save:
             if st.button("確認したAIシフト案を保存する", use_container_width=True):
                 saved = save_ai_shift_draft_rows(draft)
+                clear_shift_caches()
                 st.success(f"AIシフト案を {saved} 件保存しました。")
                 st.session_state.pop("ai_shift_draft", None)
                 st.rerun()
@@ -3732,122 +4075,88 @@ def page_shift_manager():
                 st.warning("AIシフト案を破棄しました。")
                 st.rerun()
 
-    st.markdown("---")
-    st.markdown("### 5. シフトチェック・集計")
-
+    st.markdown("### チェック結果・警告")
+    matrix = create_shift_matrix(shift_df, int(shift_year), int(shift_month))
+    shortage = create_shift_shortage_table(shift_df, int(shift_year), int(shift_month))
+    checks = create_shift_quality_check_table(shift_df, int(shift_year), int(shift_month))
     limit_checks = create_shift_limit_check_table(matrix)
+    status_col = _status_column(shortage)
+    shortage_ng = shortage[shortage[status_col].astype(str) != "OK"] if status_col and not shortage.empty else pd.DataFrame()
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        ng = shortage[shortage["状態"] != "OK"]
-        st.metric("人員不足日", len(ng))
+        st.metric("人員不足日", len(shortage_ng))
     with c2:
-        high_checks = checks[checks["重要度"] == "高"] if checks is not None and not checks.empty else pd.DataFrame()
-        st.metric("高重要度確認", len(high_checks))
+        st.metric("重複・連勤警告", 0 if checks is None or checks.empty else len(checks))
     with c3:
         st.metric("上限超過", 0 if limit_checks.empty else len(limit_checks))
     with c4:
         st.metric("状態", "確定" if month_status.get("is_confirmed") else "作成中")
-
-    if matrix.empty:
-        st.info("この月のシフトはまだ登録されていません。")
-    else:
+    if not matrix.empty:
         st.dataframe(matrix, use_container_width=True, hide_index=True)
-
-    ng = shortage[shortage["状態"] != "OK"]
-    if ng.empty:
-        st.success("日勤2名・夜勤1名の基準を満たしています。")
+    if shortage_ng.empty:
+        st.success("日勤・夜勤の必要人数チェックはOKです。")
     else:
-        st.warning("日勤2名・夜勤1名の基準に満たない日があります。")
-        st.dataframe(ng, use_container_width=True, hide_index=True)
-
+        st.warning("人員不足の日があります。")
+        st.dataframe(shortage_ng, use_container_width=True, hide_index=True)
     if checks is None or checks.empty:
-        st.success("夜勤翌日勤務・明け翌日勤務・5連勤以上・希望休重複などの大きな確認事項はありません。")
+        st.success("夜勤明け、希望休、有休、休みとの大きな重複警告はありません。")
     else:
-        st.warning("シフト確認事項があります。赤・黄色相当のチェックとして確認してください。")
+        st.warning("シフト確認事項があります。")
         st.dataframe(checks, use_container_width=True, hide_index=True)
-
     if limit_checks.empty:
-        st.success("職員別の日勤・夜勤・合計勤務回数の上限内です。")
+        st.success("職員別の勤務回数上限内です。")
     else:
         st.warning("職員別の勤務回数上限を超えている箇所があります。")
         st.dataframe(limit_checks, use_container_width=True, hide_index=True)
 
-    st.markdown("### 6. 確定・PDF・Excel出力")
+    st.markdown("### PDF/Excel/KING OF TIME CSV出力")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
             if st.button("この月のシフトを確定する", use_container_width=True):
-                if not checks.empty or not shortage[shortage["状態"] != "OK"].empty:
+                if not checks.empty or not shortage_ng.empty:
                     st.warning("確認事項または不足日があります。内容を確認したうえで、必要ならもう一度確定してください。")
                 set_shift_month_status(int(shift_year), int(shift_month), True, current_login_user_for_shift())
+                clear_shift_caches()
                 st.success("この月のシフトを確定しました。")
                 st.rerun()
         else:
             if st.button("確定を解除する", use_container_width=True):
                 set_shift_month_status(int(shift_year), int(shift_month), False, current_login_user_for_shift())
+                clear_shift_caches()
                 st.warning("この月のシフト確定を解除しました。")
                 st.rerun()
-
     with c2:
         if REPORTLAB_AVAILABLE:
             try:
                 pdf_bytes = make_staff_shift_pdf(int(shift_year), int(shift_month))
-                st.download_button(
-                    "勤務表PDFをダウンロード",
-                    data=pdf_bytes,
-                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+                st.download_button("勤務表PDF", data=pdf_bytes, file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.pdf", mime="application/pdf", use_container_width=True)
             except Exception as e:
                 st.error(f"シフトPDFを作成できませんでした：{e}")
     with c3:
         if OPENPYXL_AVAILABLE:
-            if month_status.get("is_confirmed"):
-                try:
-                    excel_bytes = make_staff_shift_excel(int(shift_year), int(shift_month))
-                    st.download_button(
-                        "確定勤務表Excelをダウンロード",
-                        data=excel_bytes,
-                        file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}_confirmed.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.error(f"シフトExcelを作成できませんでした：{e}")
-            else:
+            try:
+                excel_bytes = make_staff_shift_excel(int(shift_year), int(shift_month))
                 st.download_button(
-                    "確定勤務表Excelをダウンロード",
-                    data=b"",
-                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}_confirmed.xlsx",
+                    "勤務表Excel",
+                    data=excel_bytes,
+                    file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
-                    disabled=True,
-                    help="この月のシフトを確定するとExcel出力できます。",
                 )
-        else:
-            st.warning("openpyxl が未導入のためExcel出力できません。")
+            except Exception as e:
+                st.error(f"シフトExcelを作成できませんでした：{e}")
     with c4:
         missing_codes = get_missing_staff_code_names(get_active_staff())
         if missing_codes:
-            st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("…" if len(missing_codes) > 8 else ""))
+            st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("..." if len(missing_codes) > 8 else ""))
         try:
             kot_csv_bytes = make_king_of_time_shift_csv(int(shift_year), int(shift_month))
-            st.download_button(
-                "KING OF TIME用CSVをダウンロード",
-                data=kot_csv_bytes,
-                file_name=f"king_of_time_shift_{int(shift_year)}_{int(shift_month):02d}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                help="出力項目：勤務日・従業員コード・パターンコード・出勤予定・退勤予定・休憩予定時間・全日休暇・備考",
-            )
-            st.caption("KING OF TIME取込前に、パターンコードと従業員コードが施設側の設定と一致しているか確認してください。")
+            st.download_button("KING OF TIME CSV", data=kot_csv_bytes, file_name=f"king_of_time_shift_{int(shift_year)}_{int(shift_month):02d}.csv", mime="text/csv", use_container_width=True)
         except Exception as e:
             st.error(f"KING OF TIME用CSVを作成できませんでした：{e}")
 
-    st.markdown("---")
-    st.markdown("### 7. 過去シフト検索・更新・削除")
-
+    st.markdown("### 過去シフト検索・更新・削除")
     c1, c2, c3 = st.columns(3)
     with c1:
         search_start = st.date_input("検索開始", value=date(int(shift_year), int(shift_month), 1))
@@ -3863,19 +4172,17 @@ def page_shift_manager():
         st.dataframe(search_df[["id", "shift_date", "staff_name", "shift_kind", "start_time", "end_time", "next_day", "memo"]], use_container_width=True, hide_index=True)
         selected_shift_id = st.selectbox("更新・削除するシフトID", search_df["id"].tolist())
         target = search_df[search_df["id"] == selected_shift_id].iloc[0]
-
         with st.form("shift_update_form"):
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 u_date = st.date_input("日付", value=datetime.strptime(target["shift_date"], "%Y-%m-%d").date())
             with c2:
-                staff_list_for_edit = staff_options
                 current_staff = target["staff_name"] if target["staff_name"] in staff_options else ""
-                u_staff = st.selectbox("職員", staff_list_for_edit, index=staff_list_for_edit.index(current_staff) if current_staff in staff_list_for_edit else 0)
+                u_staff = st.selectbox("職員", staff_options, index=staff_options.index(current_staff) if current_staff in staff_options else 0)
             with c3:
                 u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(target["shift_kind"]) if target["shift_kind"] in SHIFT_KINDS else 0)
             with c4:
-                u_next = st.checkbox("翌日終了", value=bool(target["next_day"]))
+                u_next = st.checkbox("終了は翌日", value=bool(target["next_day"]))
             u_start = st.text_input("開始時刻", value=target["start_time"] or "")
             u_end = st.text_input("終了時刻", value=target["end_time"] or "")
             u_memo = st.text_input("メモ", value=target["memo"] or "")
@@ -3902,67 +4209,79 @@ def page_shift_manager():
             st.warning("シフトを削除しました。")
             st.rerun()
 
-    st.markdown("---")
-    st.markdown("### 8. カレンダー予定へのAI担当割当")
-
-    month_start = f"{int(shift_year)}-{int(shift_month):02d}-01"
-    month_end = f"{int(shift_year)}-{int(shift_month):02d}-{calendar.monthrange(int(shift_year), int(shift_month))[1]:02d}"
-    events_df = fetch_df(f"""
-        SELECT {EVENT_TODAY_COLUMNS}
-        FROM events
-        WHERE event_date BETWEEN ? AND ?
-        ORDER BY event_date, start_time, id
-    """, (month_start, month_end))
-
+    st.markdown("### カレンダー予定へのAI担当割当")
+    events = monthly_events(int(shift_year), int(shift_month))
+    event_rows = []
+    for items in events.values():
+        for ev in items:
+            event_rows.append(dict(ev))
+    events_df = pd.DataFrame(event_rows)
     if events_df.empty:
         st.info("この月の予定はありません。")
         return
 
     options = {}
     for _, ev in events_df.iterrows():
-        current_staff = ev["staff_name"] if ev["staff_name"] else "未担当"
-        label = f"ID:{ev['id']}｜{ev['event_date']}｜{ev['start_time'] or ''}｜{ev['title']}｜担当:{current_staff}"
+        current_staff = ev["staff_name"] if ev.get("staff_name") else "未担当"
+        label = f"ID:{ev['id']}｜{ev['event_date']}｜{ev.get('start_time') or ''}｜{ev['title']}｜担当:{current_staff}"
         options[label] = int(ev["id"])
 
-    selected_event_label = st.selectbox("担当候補を見る予定", list(options.keys()))
-    selected_event_id = options[selected_event_label]
-    event_row = events_df[events_df["id"] == selected_event_id].iloc[0]
+    if options:
+        selected_event_label = st.selectbox(
+            "担当候補を見る予定",
+            list(options.keys()),
+            key=f"event_assignment_select_{int(shift_year)}_{int(shift_month)}",
+        )
+        selected_event_id = options[selected_event_label]
+        event_row = events_df[events_df["id"] == selected_event_id].iloc[0]
 
-    candidates = get_shift_candidates_for_event(event_row, shift_df)
-    if candidates.empty:
-        st.warning("勤務表から担当候補が見つかりません。")
-    else:
-        st.dataframe(candidates, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            ai_staff = st.selectbox("AI候補から選ぶ", candidates["職員名"].tolist())
-            if st.button("AI候補を担当に反映", use_container_width=True):
-                execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (ai_staff, now_text(), int(selected_event_id)))
-                clear_event_caches()
-                st.success(f"予定ID:{selected_event_id} の担当を {ai_staff} さんにしました。")
-                st.rerun()
-        with c2:
-            manual_staff = st.selectbox("自分で担当を選ぶ", staff_options, key="manual_assign_staff")
-            if st.button("自分で選んだ担当を反映", use_container_width=True):
-                execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (manual_staff or None, now_text(), int(selected_event_id)))
-                clear_event_caches()
-                st.success("担当を更新しました。")
-                st.rerun()
+        candidates = get_shift_candidates_for_event(event_row, shift_df)
+        if candidates.empty:
+            st.warning("勤務表から担当候補が見つかりません。")
+        else:
+            st.dataframe(candidates, use_container_width=True, hide_index=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                ai_staff = st.selectbox(
+                    "AI候補から選ぶ",
+                    candidates["職員名"].tolist(),
+                    key=f"ai_assign_staff_{selected_event_id}",
+                )
+                if st.button("AI候補を担当に反映", use_container_width=True, key=f"apply_ai_staff_{selected_event_id}"):
+                    execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (ai_staff, now_text(), int(selected_event_id)))
+                    clear_event_caches()
+                    st.success(f"予定ID:{selected_event_id} の担当を {ai_staff} さんにしました。")
+                    st.rerun()
+            with c2:
+                manual_staff = st.selectbox(
+                    "自分で担当を選ぶ",
+                    staff_options,
+                    key=f"manual_assign_staff_{selected_event_id}",
+                )
+                if st.button("自分で選んだ担当を反映", use_container_width=True, key=f"apply_manual_staff_{selected_event_id}"):
+                    execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (manual_staff or None, now_text(), int(selected_event_id)))
+                    clear_event_caches()
+                    st.success("担当を更新しました。")
+                    st.rerun()
 
     st.markdown("#### 未担当予定の一括AI割当")
-    preview = build_event_assignment_preview(events_df, shift_df, only_unassigned=True)
-    if preview.empty:
+    preview_df = build_event_assignment_preview(events_df, shift_df, only_unassigned=True)
+    if preview_df.empty:
         st.info("未担当予定はありません。")
     else:
-        st.dataframe(preview, use_container_width=True, hide_index=True)
-        assignable = preview[preview["AI候補"].fillna("") != ""]
-        if not assignable.empty:
-            if st.button("未担当予定へ第1候補を一括反映", use_container_width=True):
-                params = [(r["AI候補"], now_text(), int(r["予定ID"])) for _, r in assignable.iterrows()]
-                updated = execute_many("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", params)
-                clear_event_caches()
-                st.success(f"{updated}件の予定へ担当候補を反映しました。")
-                st.rerun()
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+        assignable = preview_df[preview_df["AI候補"].fillna("").astype(str) != ""]
+        if not assignable.empty and st.button(
+            "未担当予定へ第1候補を一括反映",
+            use_container_width=True,
+            key=f"apply_bulk_ai_staff_{int(shift_year)}_{int(shift_month)}",
+        ):
+            params = [(r["AI候補"], now_text(), int(r["予定ID"])) for _, r in assignable.iterrows()]
+            updated = execute_many("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", params)
+            clear_event_caches()
+            st.success(f"{updated}件の予定へ担当候補を反映しました。")
+            st.rerun()
+
 
 
 def current_login_user_for_shift():
