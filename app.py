@@ -4219,19 +4219,68 @@ def page_shift_manager():
     if events_df.empty:
         st.info("この月の予定はありません。")
         return
+
+    options = {}
+    for _, ev in events_df.iterrows():
+        current_staff = ev["staff_name"] if ev.get("staff_name") else "未担当"
+        label = f"ID:{ev['id']}｜{ev['event_date']}｜{ev.get('start_time') or ''}｜{ev['title']}｜担当:{current_staff}"
+        options[label] = int(ev["id"])
+
+    if options:
+        selected_event_label = st.selectbox(
+            "担当候補を見る予定",
+            list(options.keys()),
+            key=f"event_assignment_select_{int(shift_year)}_{int(shift_month)}",
+        )
+        selected_event_id = options[selected_event_label]
+        event_row = events_df[events_df["id"] == selected_event_id].iloc[0]
+
+        candidates = get_shift_candidates_for_event(event_row, shift_df)
+        if candidates.empty:
+            st.warning("勤務表から担当候補が見つかりません。")
+        else:
+            st.dataframe(candidates, use_container_width=True, hide_index=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                ai_staff = st.selectbox(
+                    "AI候補から選ぶ",
+                    candidates["職員名"].tolist(),
+                    key=f"ai_assign_staff_{selected_event_id}",
+                )
+                if st.button("AI候補を担当に反映", use_container_width=True, key=f"apply_ai_staff_{selected_event_id}"):
+                    execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (ai_staff, now_text(), int(selected_event_id)))
+                    clear_event_caches()
+                    st.success(f"予定ID:{selected_event_id} の担当を {ai_staff} さんにしました。")
+                    st.rerun()
+            with c2:
+                manual_staff = st.selectbox(
+                    "自分で担当を選ぶ",
+                    staff_options,
+                    key=f"manual_assign_staff_{selected_event_id}",
+                )
+                if st.button("自分で選んだ担当を反映", use_container_width=True, key=f"apply_manual_staff_{selected_event_id}"):
+                    execute("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", (manual_staff or None, now_text(), int(selected_event_id)))
+                    clear_event_caches()
+                    st.success("担当を更新しました。")
+                    st.rerun()
+
+    st.markdown("#### 未担当予定の一括AI割当")
     preview_df = build_event_assignment_preview(events_df, shift_df, only_unassigned=True)
     if preview_df.empty:
         st.info("未担当予定はありません。")
     else:
         st.dataframe(preview_df, use_container_width=True, hide_index=True)
-        assignable = preview_df[preview_df["AI候補"].astype(str) != ""]
-        if not assignable.empty and st.button("未担当予定へ第1候補を一括反映", use_container_width=True):
+        assignable = preview_df[preview_df["AI候補"].fillna("").astype(str) != ""]
+        if not assignable.empty and st.button(
+            "未担当予定へ第1候補を一括反映",
+            use_container_width=True,
+            key=f"apply_bulk_ai_staff_{int(shift_year)}_{int(shift_month)}",
+        ):
             params = [(r["AI候補"], now_text(), int(r["予定ID"])) for _, r in assignable.iterrows()]
             updated = execute_many("UPDATE events SET staff_name=?, updated_at=? WHERE id=?", params)
             clear_event_caches()
             st.success(f"{updated}件の予定へ担当候補を反映しました。")
             st.rerun()
-
 
 
 
