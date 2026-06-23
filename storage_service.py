@@ -14,16 +14,34 @@ try:
 except ImportError:
     requests = None
 
-from config import (
-    DEFAULT_SUPABASE_STORAGE_BUCKET,
-    STORAGE_PATH_PREFIX,
-    SUPABASE_STORAGE_BUCKET_KEY,
-    SUPABASE_STORAGE_KEY_KEYS,
-    SUPABASE_URL_KEYS,
-)
+import config as app_config
 from db import JST, execute, fetch_df, now_text
 
 REQUESTS_AVAILABLE = requests is not None
+
+DEFAULT_SUPABASE_STORAGE_BUCKET = getattr(
+    app_config,
+    "DEFAULT_SUPABASE_STORAGE_BUCKET",
+    "hidamari-calendar-files",
+)
+STORAGE_PATH_PREFIX = getattr(app_config, "STORAGE_PATH_PREFIX", "storage://")
+SUPABASE_URL_KEYS = tuple(getattr(app_config, "SUPABASE_URL_KEYS", ("SUPABASE_URL", "SUPABASE_PROJECT_URL")))
+SUPABASE_STORAGE_KEY_KEYS = tuple(dict.fromkeys(
+    tuple(getattr(app_config, "SUPABASE_STORAGE_KEY_KEYS", (
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "SUPABASE_SERVICE_KEY",
+        "SUPABASE_STORAGE_KEY",
+    )))
+    + ("SUPABASE_KEY",)
+))
+SUPABASE_STORAGE_BUCKET_KEYS = tuple(getattr(
+    app_config,
+    "SUPABASE_STORAGE_BUCKET_KEYS",
+    (
+        getattr(app_config, "SUPABASE_STORAGE_BUCKET_KEY", "SUPABASE_STORAGE_BUCKET"),
+        "SUPABASE_BUCKET",
+    ),
+))
 
 
 def get_secret_or_env(*keys, default=None):
@@ -70,7 +88,7 @@ def get_supabase_storage_key():
 @st.cache_data(ttl=60, show_spinner=False)
 def get_supabase_storage_bucket():
     """Storageバケット名。未指定時は hidamari-calendar-files を使う。"""
-    return get_secret_or_env(SUPABASE_STORAGE_BUCKET_KEY, default=DEFAULT_SUPABASE_STORAGE_BUCKET)
+    return get_secret_or_env(*SUPABASE_STORAGE_BUCKET_KEYS, default=DEFAULT_SUPABASE_STORAGE_BUCKET)
 
 
 def storage_is_configured():
