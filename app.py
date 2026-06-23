@@ -261,8 +261,15 @@ def get_categories(active_only=True):
         ORDER BY sort_order, category_name
     """)
     if df.empty and active_only:
-        return DEFAULT_CATEGORIES
-    return df["category_name"].tolist()
+        categories = list(DEFAULT_CATEGORIES)
+    else:
+        categories = df["category_name"].dropna().astype(str).tolist()
+    if active_only:
+        categories = [category for category in categories if category != "夜勤"]
+        if "面接" not in categories:
+            insert_at = categories.index("申し送り") + 1 if "申し送り" in categories else len(categories)
+            categories.insert(insert_at, "面接")
+    return categories
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -865,8 +872,9 @@ def render_event_form(selected_date, editing_event_id=None):
     users = list(user_map.keys())
     staff = [""] + get_active_staff()
     category_options = get_categories()
-    if editing_event is not None and editing_event.get("category") and editing_event["category"] not in category_options:
-        category_options = [editing_event["category"]] + category_options
+    current_category = str(editing_event.get("category") or "") if editing_event is not None else ""
+    if current_category and current_category != "夜勤" and current_category not in category_options:
+        category_options = [current_category] + category_options
 
     default_date = _event_date_value(editing_event.get("event_date"), selected_date) if editing_event is not None else selected_date
     default_category = editing_event.get("category") if editing_event is not None else (category_options[0] if category_options else "")
@@ -1332,8 +1340,9 @@ def page_event_manage():
         with c1:
             new_date = st.date_input("日付", value=datetime.strptime(target["event_date"], "%Y-%m-%d").date())
             category_options = get_categories()
-            if target["category"] and target["category"] not in category_options:
-                category_options = [target["category"]] + category_options
+            current_category = str(target["category"] or "")
+            if current_category and current_category != "夜勤" and current_category not in category_options:
+                category_options = [current_category] + category_options
             new_category = st.selectbox(
                 "カテゴリ",
                 category_options,

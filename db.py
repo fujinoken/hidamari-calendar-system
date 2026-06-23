@@ -170,7 +170,7 @@ def init_db():
             "外出": "🚶",
             "注意": "⚠️",
             "申し送り": "📝",
-            "夜勤": "🌙",
+            "面接": "・",
             "その他": "・",
         }
         for i, name in enumerate(DEFAULT_CATEGORIES, start=1):

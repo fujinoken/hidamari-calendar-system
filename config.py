@@ -8,7 +8,7 @@ AI_SHIFT_RULE_VERSION = "shift_overlap_strict_v6_staff_deduplicate_excel_export"
 UPLOAD_DIR = Path("uploads")
 FILE_DIR = Path("attached_files")
 
-DEFAULT_CATEGORIES = ["通院", "面会", "行事", "外出", "注意", "申し送り", "夜勤", "その他"]
+DEFAULT_CATEGORIES = ["通院", "面会", "行事", "外出", "注意", "申し送り", "面接", "その他"]
 
 CATEGORY_MARK = {
     "通院": "🏥",
@@ -17,7 +17,7 @@ CATEGORY_MARK = {
     "外出": "🚶",
     "注意": "⚠️",
     "申し送り": "📝",
-    "夜勤": "🌙",
+    "面接": "・",
     "その他": "・",
 }
 
