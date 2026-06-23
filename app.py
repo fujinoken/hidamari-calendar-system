@@ -47,6 +47,7 @@ from report_service import (
     REPORTLAB_AVAILABLE,
     make_calendar_pdf as report_make_calendar_pdf,
     make_king_of_time_shift_csv as report_make_king_of_time_shift_csv,
+    make_shift_calendar_pdf as report_make_shift_calendar_pdf,
     make_staff_shift_excel as report_make_staff_shift_excel,
     make_staff_shift_pdf as report_make_staff_shift_pdf,
 )
@@ -3911,6 +3912,17 @@ def make_staff_shift_pdf(year, month):
     )
 
 
+def make_shift_calendar_pdf(year, month, shift_df, staff_list, selected_staff_names=None, finalized=False):
+    return report_make_shift_calendar_pdf(
+        year,
+        month,
+        shift_df,
+        staff_list=staff_list,
+        selected_staff_names=selected_staff_names,
+        finalized=finalized,
+    )
+
+
 def make_king_of_time_shift_csv(year, month):
     return report_make_king_of_time_shift_csv(
         year,
@@ -4331,6 +4343,52 @@ def page_shift_manager():
         st.dataframe(limit_checks, use_container_width=True, hide_index=True)
 
     st.markdown("### PDF/Excel/KING OF TIME CSV出力")
+    st.caption("月間シフトカレンダーPDFは、保存済みの現在データから作成します。未保存の表編集はPDFに反映されません。先に保存してください。")
+
+    if REPORTLAB_AVAILABLE:
+        st.markdown("#### 月間シフトカレンダーPDF出力")
+        pdf_target_mode = st.radio(
+            "出力対象職員",
+            ["全員", "職員を選択"],
+            horizontal=True,
+            key=f"shift_calendar_pdf_target_mode_{int(shift_year)}_{int(shift_month)}",
+        )
+        selected_pdf_staff = []
+        if pdf_target_mode == "職員を選択":
+            selected_pdf_staff = st.multiselect(
+                "PDFに出力する職員",
+                get_active_staff(),
+                key=f"shift_calendar_pdf_staff_{int(shift_year)}_{int(shift_month)}",
+            )
+            if not selected_pdf_staff:
+                st.info("職員を1名以上選択すると、選択した職員だけのシフトカレンダーPDFを作成できます。")
+
+        if pdf_target_mode == "全員" or selected_pdf_staff:
+            try:
+                calendar_pdf_bytes = make_shift_calendar_pdf(
+                    int(shift_year),
+                    int(shift_month),
+                    shift_df,
+                    get_active_staff(),
+                    selected_staff_names=selected_pdf_staff if pdf_target_mode == "職員を選択" else None,
+                    finalized=bool(month_status.get("is_confirmed")),
+                )
+                if pdf_target_mode == "全員":
+                    pdf_suffix = "all"
+                else:
+                    pdf_suffix = "_".join(re.sub(r"[^0-9A-Za-z_-]+", "", name) or f"staff{idx + 1}" for idx, name in enumerate(selected_pdf_staff))
+                st.download_button(
+                    "月間シフトカレンダーPDFをダウンロード",
+                    data=calendar_pdf_bytes,
+                    file_name=f"hidamari_shift_calendar_{int(shift_year)}_{int(shift_month):02d}_{pdf_suffix}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"月間シフトカレンダーPDFを作成できませんでした：{e}")
+    else:
+        st.warning("reportlab が未導入のため、月間シフトカレンダーPDFは出力できません。")
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
