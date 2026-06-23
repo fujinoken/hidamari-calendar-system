@@ -696,6 +696,170 @@ def make_staff_shift_pdf(
     return buffer.getvalue()
 
 
+def make_shift_calendar_pdf(
+    year,
+    month,
+    shift_df,
+    staff_list=None,
+    selected_staff_names=None,
+    finalized=False,
+):
+    """月間シフトカレンダーをA4横PDFで作成する。"""
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab がインストールされていません。")
+
+    init_pdf_fonts()
+
+    year = int(year)
+    month = int(month)
+    staff_list = [str(x) for x in (staff_list or []) if str(x or "").strip()]
+    selected_staff_names = [str(x) for x in (selected_staff_names or []) if str(x or "").strip()]
+    target_names = selected_staff_names or staff_list
+    target_label = "全員" if not selected_staff_names else "、".join(selected_staff_names)
+
+    df = shift_df.copy() if isinstance(shift_df, pd.DataFrame) else pd.DataFrame()
+    if not df.empty:
+        df = df.copy()
+        df["shift_date"] = df["shift_date"].astype(str)
+        df["staff_name"] = df["staff_name"].astype(str)
+        df["shift_kind"] = df["shift_kind"].astype(str)
+        month_prefix = f"{year}-{month:02d}-"
+        df = df[df["shift_date"].str.startswith(month_prefix)]
+        if target_names:
+            df = df[df["staff_name"].isin(target_names)]
+
+    buffer = BytesIO()
+    page_size = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page_size)
+    width, height = page_size
+
+    margin = 18
+    title_y = height - 26
+    status_text = "確定済み" if finalized else "未確定"
+    c.setFont(PDF_FONT_GOTHIC, 15)
+    c.drawString(margin, title_y, f"ひだまり帳 月間シフトカレンダー　{year}年{month}月")
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    c.drawRightString(width - margin, title_y, f"出力日時: {today_jst().strftime('%Y-%m-%d %H:%M')}　確定状態: {status_text}")
+    draw_single_line(c, f"出力対象: {target_label}", margin, title_y - 14, width - margin * 2, PDF_FONT_GOTHIC, 8)
+
+    legend_y = title_y - 28
+    c.setFont(PDF_FONT_GOTHIC, 7.2)
+    c.drawString(margin, legend_y, "凡例：日=日勤　管=管理業務　夜=夜勤　明=夜勤明け　希=希望休　有=有休　休=休み　他=その他")
+
+    cal = calendar.Calendar(firstweekday=6)
+    weeks = cal.monthdatescalendar(year, month)
+    table_x = margin
+    table_top = legend_y - 12
+    table_w = width - margin * 2
+    table_h = table_top - 22
+    header_h = 16
+    cell_w = table_w / 7
+    cell_h = (table_h - header_h) / len(weeks)
+    weekdays = ["日", "月", "火", "水", "木", "金", "土"]
+
+    def short_shift_label(value):
+        mapping = {
+            "日勤": "日",
+            "管": "管",
+            "管理業務": "管",
+            "夜勤": "夜",
+            "夜勤明け": "明",
+            "休み": "休",
+            "希望休": "希",
+            "有休": "有",
+            "その他": "他",
+        }
+        return mapping.get(str(value or "").strip(), str(value or "").strip())
+
+    def grouped_lines_for_day(target_date):
+        if df.empty:
+            return []
+        day_text = target_date.strftime("%Y-%m-%d")
+        day_df = df[df["shift_date"] == day_text]
+        if day_df.empty:
+            return []
+        order = ["日", "管", "夜", "明", "休", "希", "有", "他"]
+        grouped = {key: [] for key in order}
+        for _, row in day_df.iterrows():
+            staff_name = pdf_text(row.get("staff_name"))
+            label = short_shift_label(row.get("shift_kind"))
+            if not staff_name or not label:
+                continue
+            grouped.setdefault(label, []).append(staff_name)
+
+        lines = []
+        for label in order:
+            names = grouped.get(label, [])
+            if names:
+                lines.append(f"{label}: {'、'.join(names)}")
+        for label in sorted(k for k in grouped.keys() if k not in order):
+            names = grouped.get(label, [])
+            if names:
+                lines.append(f"{label}: {'、'.join(names)}")
+        return lines
+
+    c.setFillColor(colors.HexColor("#f3eee6"))
+    c.rect(table_x, table_top - header_h, table_w, header_h, fill=1, stroke=1)
+    c.setFillColor(colors.black)
+    c.setFont(PDF_FONT_GOTHIC, 9)
+    for idx, label in enumerate(weekdays):
+        x = table_x + idx * cell_w
+        if idx == 0:
+            c.setFillColor(colors.HexColor("#b00020"))
+        elif idx == 6:
+            c.setFillColor(colors.HexColor("#1f4e79"))
+        else:
+            c.setFillColor(colors.black)
+        c.drawCentredString(x + cell_w / 2, table_top - 11, label)
+    c.setFillColor(colors.black)
+
+    grid_top = table_top - header_h
+    for week_idx, week in enumerate(weeks):
+        y_top = grid_top - week_idx * cell_h
+        for day_idx, target_date in enumerate(week):
+            x = table_x + day_idx * cell_w
+            y = y_top - cell_h
+            in_month = target_date.month == month
+            if not in_month:
+                fill = colors.HexColor("#f5f5f5")
+            elif day_idx == 0:
+                fill = colors.HexColor("#fff1ee")
+            elif day_idx == 6:
+                fill = colors.HexColor("#eef5ff")
+            else:
+                fill = colors.white
+            c.setFillColor(fill)
+            c.rect(x, y, cell_w, cell_h, fill=1, stroke=1)
+            if not in_month:
+                continue
+
+            if day_idx == 0:
+                c.setFillColor(colors.HexColor("#b00020"))
+            elif day_idx == 6:
+                c.setFillColor(colors.HexColor("#1f4e79"))
+            else:
+                c.setFillColor(colors.black)
+            c.setFont(PDF_FONT_GOTHIC, 8.5)
+            c.drawString(x + 3, y_top - 11, f"{target_date.day}")
+
+            c.setFillColor(colors.black)
+            line_y = y_top - 23
+            for line in grouped_lines_for_day(target_date)[:7]:
+                draw_single_line(c, line, x + 3, line_y, cell_w - 6, PDF_FONT_GOTHIC, 6.4)
+                line_y -= 8
+                if line_y < y + 5:
+                    break
+
+    c.setFont(PDF_FONT_GOTHIC, 7)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawString(margin, 12, "未保存の画面編集はPDFに反映されません。必要に応じて先にシフト表を保存してください。")
+    c.setFillColor(colors.black)
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 
 def get_kot_pattern_code(shift_kind):
     """KING OF TIME用パターンコード。secrets/envで上書き可能。"""
