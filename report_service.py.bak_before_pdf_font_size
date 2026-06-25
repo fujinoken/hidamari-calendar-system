@@ -547,7 +547,6 @@ def make_staff_shift_pdf(
     create_shift_quality_check_table,
     create_shift_limit_check_table,
     get_shift_month_status,
-    font_size=9,
 ):
     """掲示・印刷しやすい横長のシフトPDFを作成する。"""
     if not REPORTLAB_AVAILABLE:
@@ -579,11 +578,11 @@ def make_staff_shift_pdf(
     table_x = margin
     table_y_top = height - 48
     staff_w = 58
-    summary_w = 22
-    day_w = (width - margin * 2 - staff_w - summary_w * 7) / last_day
-    font_size = max(6, min(14, int(font_size or 9)))
-    row_h = max(15.2, font_size + 6)
-    body_text_y_offset = max(4, (row_h - font_size) / 2)
+    summary_labels = ["日", "管", "夜", "明", "休", "希", "有", "他", "計"]
+    summary_keys = ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計"]
+    summary_w = 18
+    day_w = (width - margin * 2 - staff_w - summary_w * len(summary_labels)) / last_day
+    row_h = 15.2
 
     def draw_shift_table_vertical_lines(y0, y1):
         """日付ごとの縦罫線を見やすく引く。週境界と集計欄は少し強調する。"""
@@ -612,7 +611,7 @@ def make_staff_shift_pdf(
         c.setStrokeColor(colors.HexColor("#8f8f8f"))
         c.setLineWidth(0.45)
         c.line(summary_start, y0, summary_start, y1)
-        for i in range(1, 7):
+        for i in range(1, len(summary_labels)):
             x_line = summary_start + summary_w * i
             c.line(x_line, y0, x_line, y1)
 
@@ -621,7 +620,7 @@ def make_staff_shift_pdf(
 
     # 凡例
     c.setFont(PDF_FONT_GOTHIC, 7.2)
-    c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　※休みは日別セルには表示しません")
+    c.drawString(margin, height - 38, "凡例：日=日勤 8:30〜17:30　管=管理業務 8:30〜17:30　夜=夜勤 16:30〜翌9:30　明=夜勤明け　希=希望休　有=有休　他=その他")
 
     # ヘッダ
     c.setFillColor(colors.HexColor("#f3eee6"))
@@ -634,7 +633,7 @@ def make_staff_shift_pdf(
     for d in range(1, last_day + 1):
         c.drawCentredString(x + day_w / 2, table_y_top - 10, str(d))
         x += day_w
-    for label in ["日", "夜", "明", "休", "希", "有", "計"]:
+    for label in summary_labels:
         c.drawCentredString(x + summary_w / 2, table_y_top - 10, label)
         x += summary_w
 
@@ -643,7 +642,7 @@ def make_staff_shift_pdf(
         c.setFont(PDF_FONT_GOTHIC, 10)
         c.drawString(margin, y - 24, "この月のシフトは登録されていません。")
     else:
-        c.setFont(PDF_FONT_GOTHIC, font_size)
+        c.setFont(PDF_FONT_GOTHIC, 6.0)
         for _, row in matrix.iterrows():
             if y < 58:
                 c.showPage()
@@ -654,15 +653,14 @@ def make_staff_shift_pdf(
             c.rect(table_x, y, width - margin * 2, row_h, fill=1, stroke=1)
             draw_shift_table_vertical_lines(y, y + row_h)
             c.setFillColor(colors.black)
-            c.setFont(PDF_FONT_GOTHIC, font_size)
-            c.drawString(table_x + 3, y + body_text_y_offset, str(row["職員名"])[:8])
+            c.drawString(table_x + 3, y + 4, str(row["職員名"])[:8])
             x = table_x + staff_w
             for d in range(1, last_day + 1):
                 val = str(row[str(d)] or "")
-                c.drawCentredString(x + day_w / 2, y + body_text_y_offset, val)
+                c.drawCentredString(x + day_w / 2, y + 4, val)
                 x += day_w
-            for key in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計"]:
-                c.drawCentredString(x + summary_w / 2, y + body_text_y_offset, str(row.get(key, "")))
+            for key in summary_keys:
+                c.drawCentredString(x + summary_w / 2, y + 4, str(row.get(key, "")))
                 x += summary_w
 
     # 不足・警告を下部表示。長い場合は右端で省略して、PDF外にはみ出さないようにする。
@@ -698,11 +696,177 @@ def make_staff_shift_pdf(
     return buffer.getvalue()
 
 
+def make_shift_calendar_pdf(
+    year,
+    month,
+    shift_df,
+    staff_list=None,
+    selected_staff_names=None,
+    finalized=False,
+):
+    """月間シフトカレンダーをA4横PDFで作成する。"""
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab がインストールされていません。")
+
+    init_pdf_fonts()
+
+    year = int(year)
+    month = int(month)
+    staff_list = [str(x) for x in (staff_list or []) if str(x or "").strip()]
+    selected_staff_names = [str(x) for x in (selected_staff_names or []) if str(x or "").strip()]
+    target_names = selected_staff_names or staff_list
+    target_label = "全員" if not selected_staff_names else "、".join(selected_staff_names)
+
+    df = shift_df.copy() if isinstance(shift_df, pd.DataFrame) else pd.DataFrame()
+    if not df.empty:
+        df = df.copy()
+        df["shift_date"] = df["shift_date"].astype(str)
+        df["staff_name"] = df["staff_name"].astype(str)
+        df["shift_kind"] = df["shift_kind"].astype(str)
+        month_prefix = f"{year}-{month:02d}-"
+        df = df[df["shift_date"].str.startswith(month_prefix)]
+        if target_names:
+            df = df[df["staff_name"].isin(target_names)]
+
+    buffer = BytesIO()
+    page_size = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page_size)
+    width, height = page_size
+
+    margin = 18
+    title_y = height - 26
+    status_text = "確定済み" if finalized else "未確定"
+    c.setFont(PDF_FONT_GOTHIC, 15)
+    c.drawString(margin, title_y, f"ひだまり帳 月間シフトカレンダー　{year}年{month}月")
+    c.setFont(PDF_FONT_GOTHIC, 8)
+    c.drawRightString(width - margin, title_y, f"出力日時: {today_jst().strftime('%Y-%m-%d %H:%M')}　確定状態: {status_text}")
+    draw_single_line(c, f"出力対象: {target_label}", margin, title_y - 14, width - margin * 2, PDF_FONT_GOTHIC, 8)
+
+    legend_y = title_y - 28
+    c.setFont(PDF_FONT_GOTHIC, 7.2)
+    c.drawString(margin, legend_y, "凡例：日=日勤　管=管理業務　夜=夜勤　明=夜勤明け　希=希望休　有=有休　休=休み　他=その他")
+
+    cal = calendar.Calendar(firstweekday=6)
+    weeks = cal.monthdatescalendar(year, month)
+    table_x = margin
+    table_top = legend_y - 12
+    table_w = width - margin * 2
+    table_h = table_top - 22
+    header_h = 16
+    cell_w = table_w / 7
+    cell_h = (table_h - header_h) / len(weeks)
+    weekdays = ["日", "月", "火", "水", "木", "金", "土"]
+
+    def short_shift_label(value):
+        mapping = {
+            "日勤": "日",
+            "管": "管",
+            "管理業務": "管",
+            "夜勤": "夜",
+            "夜勤明け": "明",
+            "休み": "休",
+            "希望休": "希",
+            "有休": "有",
+            "その他": "他",
+        }
+        return mapping.get(str(value or "").strip(), str(value or "").strip())
+
+    def grouped_lines_for_day(target_date):
+        if df.empty:
+            return []
+        day_text = target_date.strftime("%Y-%m-%d")
+        day_df = df[df["shift_date"] == day_text]
+        if day_df.empty:
+            return []
+        order = ["日", "管", "夜", "明", "休", "希", "有", "他"]
+        grouped = {key: [] for key in order}
+        for _, row in day_df.iterrows():
+            staff_name = pdf_text(row.get("staff_name"))
+            label = short_shift_label(row.get("shift_kind"))
+            if not staff_name or not label:
+                continue
+            grouped.setdefault(label, []).append(staff_name)
+
+        lines = []
+        for label in order:
+            names = grouped.get(label, [])
+            if names:
+                lines.append(f"{label}: {'、'.join(names)}")
+        for label in sorted(k for k in grouped.keys() if k not in order):
+            names = grouped.get(label, [])
+            if names:
+                lines.append(f"{label}: {'、'.join(names)}")
+        return lines
+
+    c.setFillColor(colors.HexColor("#f3eee6"))
+    c.rect(table_x, table_top - header_h, table_w, header_h, fill=1, stroke=1)
+    c.setFillColor(colors.black)
+    c.setFont(PDF_FONT_GOTHIC, 9)
+    for idx, label in enumerate(weekdays):
+        x = table_x + idx * cell_w
+        if idx == 0:
+            c.setFillColor(colors.HexColor("#b00020"))
+        elif idx == 6:
+            c.setFillColor(colors.HexColor("#1f4e79"))
+        else:
+            c.setFillColor(colors.black)
+        c.drawCentredString(x + cell_w / 2, table_top - 11, label)
+    c.setFillColor(colors.black)
+
+    grid_top = table_top - header_h
+    for week_idx, week in enumerate(weeks):
+        y_top = grid_top - week_idx * cell_h
+        for day_idx, target_date in enumerate(week):
+            x = table_x + day_idx * cell_w
+            y = y_top - cell_h
+            in_month = target_date.month == month
+            if not in_month:
+                fill = colors.HexColor("#f5f5f5")
+            elif day_idx == 0:
+                fill = colors.HexColor("#fff1ee")
+            elif day_idx == 6:
+                fill = colors.HexColor("#eef5ff")
+            else:
+                fill = colors.white
+            c.setFillColor(fill)
+            c.rect(x, y, cell_w, cell_h, fill=1, stroke=1)
+            if not in_month:
+                continue
+
+            if day_idx == 0:
+                c.setFillColor(colors.HexColor("#b00020"))
+            elif day_idx == 6:
+                c.setFillColor(colors.HexColor("#1f4e79"))
+            else:
+                c.setFillColor(colors.black)
+            c.setFont(PDF_FONT_GOTHIC, 8.5)
+            c.drawString(x + 3, y_top - 11, f"{target_date.day}")
+
+            c.setFillColor(colors.black)
+            line_y = y_top - 23
+            for line in grouped_lines_for_day(target_date)[:7]:
+                draw_single_line(c, line, x + 3, line_y, cell_w - 6, PDF_FONT_GOTHIC, 6.4)
+                line_y -= 8
+                if line_y < y + 5:
+                    break
+
+    c.setFont(PDF_FONT_GOTHIC, 7)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawString(margin, 12, "未保存の画面編集はPDFに反映されません。必要に応じて先にシフト表を保存してください。")
+    c.setFillColor(colors.black)
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 
 def get_kot_pattern_code(shift_kind):
     """KING OF TIME用パターンコード。secrets/envで上書き可能。"""
     key_map = {
         "日勤": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
+        "管": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
+        "管理業務": (KOT_DAY_PATTERN_CODE_KEY, "日勤"),
         "夜勤": (KOT_NIGHT_PATTERN_CODE_KEY, "夜勤"),
     }
     key, default = key_map.get(str(shift_kind), ("", str(shift_kind or "")))
@@ -724,7 +888,7 @@ def kot_time_value(time_text, next_day=False):
 
 def kot_break_minutes(shift_kind):
     """KING OF TIME CSV用の休憩予定時間。必要に応じて施設運用に合わせて変更する。"""
-    if str(shift_kind) == "日勤":
+    if str(shift_kind) in ["日勤", "管", "管理業務"]:
         return 60
     if str(shift_kind) == "夜勤":
         return 120
@@ -790,12 +954,12 @@ def make_king_of_time_shift_csv(
         memo_parts = []
         original_memo = str(r.get("memo") or "").strip()
 
-        if shift_kind in ["日勤", "夜勤"]:
+        if shift_kind in ["日勤", "管", "管理業務", "夜勤"]:
             pattern_code = get_kot_pattern_code(shift_kind)
             stime = str(r.get("start_time") or "").strip()
             etime = str(r.get("end_time") or "").strip()
             if not stime or not etime:
-                default_start, default_end, default_next_day = default_shift_times(shift_kind)
+                default_start, default_end, default_next_day = default_shift_times("日勤" if shift_kind in ["管", "管理業務"] else shift_kind)
                 stime = stime or default_start
                 etime = etime or default_end
                 next_day = bool(default_next_day)
@@ -804,6 +968,8 @@ def make_king_of_time_shift_csv(
             start_plan = kot_time_value(stime, next_day=False)
             end_plan = kot_time_value(etime, next_day=next_day)
             break_minutes = kot_break_minutes(shift_kind)
+            if shift_kind in ["管", "管理業務"]:
+                memo_parts.append("管理業務")
         elif shift_kind in ["休み", "有休", "希望休"]:
             full_day_leave = kot_full_day_leave_name(shift_kind)
             memo_parts.append(f"{shift_kind}（ひだまり帳）")
@@ -888,7 +1054,7 @@ def make_staff_shift_excel(
     ws.cell(2, 6).value = today_jst().strftime("%Y-%m-%d")
 
     ws.cell(3, 1).value = "凡例"
-    ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 休みは日別セルには表示しません"
+    ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 管=管理業務 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 他=その他 / 休みは日別セルには表示しません"
     ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
 
     start_row = 5
@@ -910,7 +1076,7 @@ def make_staff_shift_excel(
                     cell.fill = weekend_sun_fill
                 elif weekday == 5:
                     cell.fill = weekend_sat_fill
-            elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+            elif col_name in ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]:
                 cell.fill = summary_fill
 
         for row_idx, (_, row) in enumerate(matrix.iterrows(), start=start_row + 1):
@@ -929,7 +1095,7 @@ def make_staff_shift_excel(
                         cell.fill = PatternFill("solid", fgColor="FFF2CC")
                     elif weekday == 5:
                         cell.fill = PatternFill("solid", fgColor="EAF3F8")
-                elif col_name in ["日勤", "夜勤", "明", "休み", "希望休", "有休", "合計", "最大連勤"]:
+                elif col_name in ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]:
                     cell.fill = PatternFill("solid", fgColor="F2F8EE")
 
         ws.freeze_panes = "B6"
