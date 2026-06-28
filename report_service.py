@@ -712,8 +712,23 @@ def make_shift_calendar_pdf(
 
     year = int(year)
     month = int(month)
-    staff_list = [str(x) for x in (staff_list or []) if str(x or "").strip()]
-    selected_staff_names = [str(x) for x in (selected_staff_names or []) if str(x or "").strip()]
+    def normalize_shift_staff_name(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", "", str(value).replace("\u3000", " ").strip())
+
+    def unique_shift_staff_names(values):
+        names = []
+        seen = set()
+        for value in values or []:
+            name = normalize_shift_staff_name(value)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    staff_list = unique_shift_staff_names(staff_list)
+    selected_staff_names = unique_shift_staff_names(selected_staff_names)
     target_names = selected_staff_names or staff_list
     target_label = "全員" if not selected_staff_names else "、".join(selected_staff_names)
 
@@ -723,10 +738,11 @@ def make_shift_calendar_pdf(
         df["shift_date"] = df["shift_date"].astype(str)
         df["staff_name"] = df["staff_name"].astype(str)
         df["shift_kind"] = df["shift_kind"].astype(str)
+        df["_staff_norm"] = df["staff_name"].apply(normalize_shift_staff_name)
         month_prefix = f"{year}-{month:02d}-"
         df = df[df["shift_date"].str.startswith(month_prefix)]
         if target_names:
-            df = df[df["staff_name"].isin(target_names)]
+            df = df[df["_staff_norm"].isin(set(target_names))]
 
     buffer = BytesIO()
     page_size = landscape(A4)
@@ -785,7 +801,10 @@ def make_shift_calendar_pdf(
             label = short_shift_label(row.get("shift_kind"))
             if not staff_name or not label:
                 continue
-            grouped.setdefault(label, []).append(staff_name)
+            names = grouped.setdefault(label, [])
+            staff_key = normalize_shift_staff_name(staff_name)
+            if staff_key and staff_key not in {normalize_shift_staff_name(x) for x in names}:
+                names.append(normalize_shift_staff_name(staff_name))
 
         lines = []
         for label in order:

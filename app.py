@@ -2436,6 +2436,61 @@ def normalize_staff_name(value):
     return v
 
 
+def shift_duplicate_key(shift_date, shift_kind, staff_name, staff_id=None):
+    staff_key = str(staff_id or "").strip()
+    if staff_key:
+        staff_part = ("id", staff_key)
+    else:
+        staff_part = ("name", normalize_staff_name(staff_name))
+    return (str(shift_date or "").strip(), str(shift_kind or "").strip(), staff_part)
+
+
+def dedupe_shift_insert_params(params):
+    unique = []
+    seen = set()
+    for p in params or []:
+        key = shift_duplicate_key(p[0], p[2], p[1])
+        if not key[0] or not key[1] or not key[2][1] or key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique
+
+
+def dedupe_shift_dataframe(df):
+    if df is None or df.empty:
+        return df
+    rows = []
+    seen = set()
+    for _, row in df.iterrows():
+        staff_id = row.get("staff_id", None) if "staff_id" in df.columns else None
+        key = shift_duplicate_key(row.get("shift_date"), row.get("shift_kind"), row.get("staff_name"), staff_id)
+        if not key[0] or not key[1] or not key[2][1] or key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+    if not rows:
+        return df.iloc[0:0].copy()
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def unique_shift_staff_names(df):
+    if df is None or df.empty:
+        return []
+    names = []
+    seen = set()
+    for _, row in df.iterrows():
+        raw_name = str(row.get("staff_name") or "").strip()
+        display_name = normalize_staff_name(raw_name)
+        staff_id = row.get("staff_id", None) if "staff_id" in df.columns else None
+        staff_key = str(staff_id or "").strip() or display_name
+        if not display_name or staff_key in seen:
+            continue
+        seen.add(staff_key)
+        names.append(display_name)
+    return names
+
+
 def get_duplicate_staff_name_groups():
     """職員マスタ内の空白違い重複を確認するための一覧を作る。"""
     try:
@@ -2633,7 +2688,7 @@ def shift_month_is_confirmed(year, month):
     return bool(get_shift_month_status(year, month).get("is_confirmed"))
 
 
-def get_staff_shifts(start_date, end_date, keyword=""):
+def fetch_staff_shifts_raw(start_date, end_date, keyword=""):
     query = f"""
         SELECT {SHIFT_COLUMNS}
         FROM staff_shifts
@@ -2646,6 +2701,10 @@ def get_staff_shifts(start_date, end_date, keyword=""):
         params.extend([kw, kw, kw])
     query += " ORDER BY shift_date, staff_name, shift_kind, id"
     return fetch_df(query, params)
+
+
+def get_staff_shifts(start_date, end_date, keyword=""):
+    return dedupe_shift_dataframe(fetch_staff_shifts_raw(start_date, end_date, keyword))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2666,6 +2725,12 @@ def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_t
     staff_name = normalize_staff_name(staff_name)
     if not staff_name or not shift_kind:
         return None
+    existing_df = fetch_staff_shifts_raw(shift_date, shift_date)
+    if existing_df is not None and not existing_df.empty:
+        new_key = shift_duplicate_key(shift_date, shift_kind, staff_name)
+        for _, row in existing_df.iterrows():
+            if shift_duplicate_key(row.get("shift_date"), row.get("shift_kind"), row.get("staff_name")) == new_key:
+                return None
     if start_time is None or end_time is None:
         start_time, end_time, default_next = default_shift_times(shift_kind)
         next_day = default_next
@@ -2705,7 +2770,7 @@ def save_day_shift_assignments(shift_date, assignments, memo="日付カードか
     if not staff_names:
         return 0
 
-    existing_day_df = get_staff_shifts(shift_date, shift_date)
+    existing_day_df = fetch_staff_shifts_raw(shift_date, shift_date)
     for staff_name in staff_names:
         aliases = {staff_name}
         if existing_day_df is not None and not existing_day_df.empty:
@@ -2741,6 +2806,7 @@ def save_day_shift_assignments(shift_date, assignments, memo="日付カードか
                 now_text(),
             ))
 
+    params = dedupe_shift_insert_params(params)
     saved = 0
     if params:
         saved = execute_many("""
@@ -2768,6 +2834,10 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
     if night_staff:
         stime, etime, nd = default_shift_times("夜勤")
         params.append((shift_date, night_staff, "夜勤", stime, etime, nd, memo.strip() or None, now_text(), now_text()))
+    params = dedupe_shift_insert_params(params)
+    if not params:
+        clear_shift_caches()
+        return 0
     saved = execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
@@ -2983,7 +3053,7 @@ def save_shift_matrix_from_editor(year, month, edited_df):
 
     # 既存データに「職員 A」「職員A」のような空白違いがあっても、
     # 同じ正規化名としてまとめて削除してから保存する。
-    existing_month_df = get_staff_shifts(start, end)
+    existing_month_df = fetch_staff_shifts_raw(start, end)
     for staff_name in staff_names:
         aliases = {staff_name}
         if existing_month_df is not None and not existing_month_df.empty:
@@ -3025,6 +3095,7 @@ def save_shift_matrix_from_editor(year, month, edited_df):
                     now_text(),
                 ))
 
+    params = dedupe_shift_insert_params(params)
     if not params:
         clear_shift_caches()
         return 0
@@ -3889,6 +3960,7 @@ def save_ai_shift_draft_rows(draft_df):
         }])
         working_df = pd.concat([working_df, add_row], ignore_index=True)
 
+    params = dedupe_shift_insert_params(params)
     if not params:
         return 0
     saved = execute_many("""
@@ -4014,9 +4086,9 @@ def render_shift_calendar(year, month, shift_df):
                 if not day_df.empty:
                     for kind in SHIFT_KINDS:
                         if kind == "管":
-                            members = day_df[day_df["shift_kind"].astype(str).isin(MANAGEMENT_SHIFT_KINDS)]["staff_name"].dropna().astype(str).tolist()
+                            members = unique_shift_staff_names(day_df[day_df["shift_kind"].astype(str).isin(MANAGEMENT_SHIFT_KINDS)])
                         else:
-                            members = day_df[day_df["shift_kind"].astype(str) == kind]["staff_name"].dropna().astype(str).tolist()
+                            members = unique_shift_staff_names(day_df[day_df["shift_kind"].astype(str) == kind])
                         if members:
                             names = "、".join(members[:3])
                             if len(members) > 3:
