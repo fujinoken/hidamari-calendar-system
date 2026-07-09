@@ -1005,7 +1005,7 @@ def build_king_of_time_clock_export(
     preview_rows = []
     error_rows = []
     csv_rows = []
-    export_shift_kinds = {"日勤", "夜勤", "管理", "管理業務"}
+    export_shift_kinds = {"日勤", "夜勤", "管", "管理", "管理業務"}
     skip_shift_kinds = {"夜勤明け", "明け", "休み", "有休", "希望休"}
 
     df = df.sort_values(["shift_date", "staff_name", "shift_kind", "id"])
