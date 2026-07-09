@@ -2,7 +2,7 @@
 """PDF, Excel, and CSV export helpers for ひだまり帳."""
 import calendar
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
@@ -925,6 +925,153 @@ def kot_full_day_leave_name(shift_kind):
     return ""
 
 
+def normalize_kot_employee_code(value):
+    """KING OF TIME employee code for export. Full-width digits are converted."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() == "nan":
+        return ""
+    return text.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def parse_clock_time(value):
+    """Return HH:MM when value is a valid shift clock time; otherwise blank."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    text = text.replace("：", ":")
+    for prefix in ("当日", "翌日", "前日"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return ""
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def make_kot_clock_datetime(work_date, clock_time, next_day=False):
+    base_date = pd.to_datetime(work_date).date()
+    if next_day:
+        base_date = base_date + timedelta(days=1)
+    hour, minute = [int(x) for x in clock_time.split(":")]
+    return datetime(base_date.year, base_date.month, base_date.day, hour, minute).strftime("%Y%m%d%H%M")
+
+
+def build_king_of_time_clock_export(
+    year,
+    month,
+    get_staff_shifts,
+    get_staff_code_map,
+    normalize_staff_name,
+):
+    """
+    Build KING OF TIME clock-import CSV from monthly staff shifts.
+
+    Returns (preview_df, error_df, csv_bytes). csv_bytes is None when any error exists.
+    """
+    year = int(year)
+    month = int(month)
+    last_day = calendar.monthrange(year, month)[1]
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{last_day:02d}"
+    df = get_staff_shifts(start, end)
+
+    preview_columns = ["職員名", "従業員コード", "勤務日", "勤務パターン", "出勤時刻", "退勤時刻", "エラー有無", "エラー内容"]
+    error_columns = ["職員名", "勤務日", "項目", "内容"]
+    csv_columns = ["従業員コード", "名前", "打刻種別", "打刻日時"]
+
+    if df is None or df.empty:
+        csv_bytes = pd.DataFrame(columns=csv_columns).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        return pd.DataFrame(columns=preview_columns), pd.DataFrame(columns=error_columns), csv_bytes
+
+    code_map = get_staff_code_map(active_only=False)
+    preview_rows = []
+    error_rows = []
+    csv_rows = []
+    export_shift_kinds = {"日勤", "夜勤", "管理", "管理業務"}
+    skip_shift_kinds = {"夜勤明け", "明け", "休み", "有休", "希望休"}
+
+    df = df.sort_values(["shift_date", "staff_name", "shift_kind", "id"])
+    for _, r in df.iterrows():
+        staff_name = normalize_staff_name(r.get("staff_name", ""))
+        shift_date = str(r.get("shift_date") or "").strip()
+        shift_kind = str(r.get("shift_kind") or "").strip()
+        if not staff_name:
+            continue
+
+        if shift_kind in skip_shift_kinds:
+            continue
+
+        code = normalize_kot_employee_code(code_map.get(staff_name, ""))
+        start_time = parse_clock_time(r.get("start_time"))
+        end_time = parse_clock_time(r.get("end_time"))
+        next_day = bool(int(r.get("next_day") or 0))
+        row_errors = []
+
+        if not code:
+            row_errors.append("従業員コード未登録")
+            error_rows.append({"職員名": staff_name, "勤務日": shift_date, "項目": "従業員コード", "内容": "未登録・空欄・nan"})
+        if not shift_kind or shift_kind.lower() == "nan" or shift_kind not in export_shift_kinds:
+            row_errors.append("勤務パターン未登録")
+            error_rows.append({"職員名": staff_name, "勤務日": shift_date, "項目": "勤務パターン", "内容": shift_kind or "未登録"})
+        if shift_kind in export_shift_kinds and not start_time:
+            row_errors.append("開始時刻未設定")
+            error_rows.append({"職員名": staff_name, "勤務日": shift_date, "項目": "開始時刻", "内容": "未設定または不正"})
+        if shift_kind in export_shift_kinds and not end_time:
+            row_errors.append("終了時刻未設定")
+            error_rows.append({"職員名": staff_name, "勤務日": shift_date, "項目": "終了時刻", "内容": "未設定または不正"})
+
+        preview_rows.append({
+            "職員名": staff_name,
+            "従業員コード": code,
+            "勤務日": shift_date,
+            "勤務パターン": shift_kind,
+            "出勤時刻": start_time,
+            "退勤時刻": ("翌日" if next_day else "") + end_time if end_time else "",
+            "エラー有無": "あり" if row_errors else "なし",
+            "エラー内容": " / ".join(row_errors),
+        })
+
+        if row_errors:
+            continue
+
+        csv_rows.append({
+            "従業員コード": code,
+            "名前": staff_name,
+            "打刻種別": 1,
+            "打刻日時": make_kot_clock_datetime(shift_date, start_time, next_day=False),
+        })
+        csv_rows.append({
+            "従業員コード": code,
+            "名前": staff_name,
+            "打刻種別": 2,
+            "打刻日時": make_kot_clock_datetime(shift_date, end_time, next_day=next_day),
+        })
+
+    preview_df = pd.DataFrame(preview_rows, columns=preview_columns)
+    error_df = pd.DataFrame(error_rows, columns=error_columns)
+    csv_df = pd.DataFrame(csv_rows, columns=csv_columns)
+    csv_bytes = None if not error_df.empty else csv_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    return preview_df, error_df, csv_bytes
+
+
 def make_king_of_time_shift_csv(
     year,
     month,
@@ -933,6 +1080,17 @@ def make_king_of_time_shift_csv(
     normalize_staff_name,
     default_shift_times,
 ):
+    _, error_df, csv_bytes = build_king_of_time_clock_export(
+        year,
+        month,
+        get_staff_shifts,
+        get_staff_code_map,
+        normalize_staff_name,
+    )
+    if error_df is not None and not error_df.empty:
+        raise ValueError("KING OF TIME打刻CSVに出力できないシフトがあります。プレビューのエラー内容を確認してください。")
+    return csv_bytes
+
     """
     ひだまり帳の月間シフトをKING OF TIMEのスケジュールデータCSV向けに出力する。
     出力列：勤務日・従業員コード・パターンコード・出勤予定・退勤予定・休憩予定時間・全日休暇・備考
