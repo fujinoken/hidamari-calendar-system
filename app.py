@@ -46,6 +46,7 @@ from db import (
 from report_service import (
     OPENPYXL_AVAILABLE,
     REPORTLAB_AVAILABLE,
+    build_king_of_time_clock_export as report_build_king_of_time_clock_export,
     make_calendar_pdf as report_make_calendar_pdf,
     make_king_of_time_shift_csv as report_make_king_of_time_shift_csv,
     make_staff_shift_excel as report_make_staff_shift_excel,
@@ -4008,6 +4009,16 @@ def make_king_of_time_shift_csv(year, month):
     )
 
 
+def build_king_of_time_clock_export(year, month):
+    return report_build_king_of_time_clock_export(
+        year,
+        month,
+        get_staff_shifts,
+        get_staff_code_map,
+        normalize_staff_name,
+    )
+
+
 def make_staff_shift_excel(year, month):
     return report_make_staff_shift_excel(
         year,
@@ -4504,10 +4515,43 @@ def page_shift_manager():
         if missing_codes:
             st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("..." if len(missing_codes) > 8 else ""))
         try:
-            kot_csv_bytes = make_king_of_time_shift_csv(int(shift_year), int(shift_month))
-            st.download_button("KING OF TIME CSV", data=kot_csv_bytes, file_name=f"king_of_time_shift_{int(shift_year)}_{int(shift_month):02d}.csv", mime="text/csv", use_container_width=True)
+            kot_preview_df, kot_error_df, kot_csv_bytes = build_king_of_time_clock_export(int(shift_year), int(shift_month))
+            if not month_status.get("is_confirmed"):
+                st.warning("KING OF TIME打刻CSVは、月間シフト確定後にダウンロードできます。")
+            elif kot_error_df is not None and not kot_error_df.empty:
+                st.error("KING OF TIME打刻CSVは、エラーがあるためダウンロードできません。")
+            else:
+                st.download_button(
+                    "KING OF TIME打刻CSV",
+                    data=kot_csv_bytes,
+                    file_name=f"king_of_time_clock_{int(shift_year)}_{int(shift_month):02d}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
         except Exception as e:
             st.error(f"KING OF TIME用CSVを作成できませんでした：{e}")
+
+    try:
+        kot_preview_df, kot_error_df, _ = build_king_of_time_clock_export(int(shift_year), int(shift_month))
+        st.markdown("#### KING OF TIME打刻CSVプレビュー")
+        if kot_preview_df is None or kot_preview_df.empty:
+            st.info("打刻CSVに出力する日勤・夜勤シフトはありません。")
+        else:
+            def highlight_kot_error(row):
+                if str(row.get("エラー有無", "")) == "あり":
+                    return ["background-color: #fde2e2; color: #8a1f1f"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                kot_preview_df.style.apply(highlight_kot_error, axis=1),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if kot_error_df is not None and not kot_error_df.empty:
+            st.markdown("#### KING OF TIME打刻CSVエラー一覧")
+            st.dataframe(kot_error_df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"KING OF TIME打刻CSVプレビューを作成できませんでした：{e}")
 
     st.markdown("### 過去シフト検索・更新・削除")
     c1, c2, c3 = st.columns(3)
