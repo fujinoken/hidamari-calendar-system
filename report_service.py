@@ -980,6 +980,9 @@ def build_king_of_time_clock_export(
     get_staff_shifts,
     get_staff_code_map,
     normalize_staff_name,
+    selected_staff_keys=None,
+    get_staff_key_map=None,
+    default_shift_times=None,
 ):
     """
     Build KING OF TIME clock-import CSV from monthly staff shifts.
@@ -993,12 +996,23 @@ def build_king_of_time_clock_export(
     end = f"{year}-{month:02d}-{last_day:02d}"
     df = get_staff_shifts(start, end)
 
+    if selected_staff_keys is not None and df is not None and not df.empty:
+        selected_staff_keys = {int(key) for key in selected_staff_keys}
+        staff_key_map = get_staff_key_map(active_only=False) if get_staff_key_map else {}
+        df = df[
+            df["staff_name"].map(
+                lambda name: staff_key_map.get(normalize_staff_name(name)) in selected_staff_keys
+            )
+        ]
+
     preview_columns = ["職員名", "従業員コード", "勤務日", "勤務パターン", "出勤時刻", "退勤時刻", "エラー有無", "エラー内容"]
     error_columns = ["職員名", "勤務日", "項目", "内容"]
     csv_columns = ["従業員コード", "名前", "打刻種別", "打刻日時"]
 
     if df is None or df.empty:
-        csv_bytes = pd.DataFrame(columns=csv_columns).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        csv_bytes = None if selected_staff_keys is not None and not selected_staff_keys else (
+            pd.DataFrame(columns=csv_columns).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        )
         return pd.DataFrame(columns=preview_columns), pd.DataFrame(columns=error_columns), csv_bytes
 
     code_map = get_staff_code_map(active_only=False)
@@ -1020,9 +1034,16 @@ def build_king_of_time_clock_export(
             continue
 
         code = normalize_kot_employee_code(code_map.get(staff_name, ""))
-        start_time = parse_clock_time(r.get("start_time"))
-        end_time = parse_clock_time(r.get("end_time"))
-        next_day = bool(int(r.get("next_day") or 0))
+        if default_shift_times and shift_kind in export_shift_kinds:
+            master_shift_kind = "日勤" if shift_kind in {"管", "管理", "管理業務"} else shift_kind
+            master_start, master_end, master_next_day = default_shift_times(master_shift_kind)
+            start_time = parse_clock_time(master_start)
+            end_time = parse_clock_time(master_end)
+            next_day = bool(int(master_next_day or 0))
+        else:
+            start_time = parse_clock_time(r.get("start_time"))
+            end_time = parse_clock_time(r.get("end_time"))
+            next_day = bool(int(r.get("next_day") or 0))
         row_errors = []
 
         if not code:
@@ -1079,13 +1100,20 @@ def make_king_of_time_shift_csv(
     get_staff_code_map,
     normalize_staff_name,
     default_shift_times,
+    selected_staff_keys=None,
+    get_staff_key_map=None,
 ):
+    if selected_staff_keys is not None and not selected_staff_keys:
+        raise ValueError("KING OF TIME打刻CSVに出力する職員を1名以上選択してください。")
     _, error_df, csv_bytes = build_king_of_time_clock_export(
         year,
         month,
         get_staff_shifts,
         get_staff_code_map,
         normalize_staff_name,
+        default_shift_times=default_shift_times,
+        selected_staff_keys=selected_staff_keys,
+        get_staff_key_map=get_staff_key_map,
     )
     if error_df is not None and not error_df.empty:
         raise ValueError("KING OF TIME打刻CSVに出力できないシフトがあります。プレビューのエラー内容を確認してください。")

@@ -235,6 +235,41 @@ def get_staff_code_map(active_only=True):
     return mapping
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_staff_key_map(active_only=True):
+    """職員名（正規化後）から内部キー staff.id への対応表を返す。"""
+    where = "WHERE is_active=1" if active_only else ""
+    df = fetch_df(f"SELECT id, staff_name, is_active FROM staff {where} ORDER BY is_active DESC, id")
+    mapping = {}
+    if df is None or df.empty:
+        return mapping
+    for _, row in df.iterrows():
+        staff_name = normalize_staff_name(row.get("staff_name", ""))
+        if staff_name and staff_name not in mapping:
+            mapping[staff_name] = int(row["id"])
+    return mapping
+
+
+def get_king_of_time_export_staff(year, month):
+    """対象月の確定済みシフトに存在する職員を staff.id と表示名で返す。"""
+    if not shift_month_is_confirmed(year, month):
+        return []
+    shift_df = get_staff_shifts_month(year, month)
+    if shift_df is None or shift_df.empty:
+        return []
+    staff_key_map = get_staff_key_map(active_only=False)
+    result = []
+    seen = set()
+    for raw_name in shift_df["staff_name"].dropna().astype(str):
+        staff_name = normalize_staff_name(raw_name)
+        staff_id = staff_key_map.get(staff_name)
+        if staff_id is None or staff_id in seen:
+            continue
+        seen.add(staff_id)
+        result.append((staff_id, staff_name))
+    return sorted(result, key=lambda item: item[1])
+
+
 def get_missing_staff_code_names(staff_names):
     """KING OF TIME従業員コードが未登録の職員名一覧を返す。"""
     code_map = get_staff_code_map(active_only=True)
@@ -3998,7 +4033,7 @@ def make_shift_calendar_pdf(year, month, shift_df, staff_list, selected_staff_na
     )
 
 
-def make_king_of_time_shift_csv(year, month):
+def make_king_of_time_shift_csv(year, month, selected_staff_keys=None):
     return report_make_king_of_time_shift_csv(
         year,
         month,
@@ -4006,16 +4041,21 @@ def make_king_of_time_shift_csv(year, month):
         get_staff_code_map,
         normalize_staff_name,
         default_shift_times,
+        selected_staff_keys=selected_staff_keys,
+        get_staff_key_map=get_staff_key_map,
     )
 
 
-def build_king_of_time_clock_export(year, month):
+def build_king_of_time_clock_export(year, month, selected_staff_keys=None):
     return report_build_king_of_time_clock_export(
         year,
         month,
         get_staff_shifts,
         get_staff_code_map,
         normalize_staff_name,
+        default_shift_times=default_shift_times,
+        selected_staff_keys=selected_staff_keys,
+        get_staff_key_map=get_staff_key_map,
     )
 
 
@@ -4474,6 +4514,35 @@ def page_shift_manager():
     else:
         st.warning("reportlab が未導入のため、月間シフトカレンダーPDFは出力できません。")
 
+    kot_staff_options = get_king_of_time_export_staff(int(shift_year), int(shift_month))
+    kot_staff_labels = {staff_id: staff_name for staff_id, staff_name in kot_staff_options}
+    kot_available_staff_keys = list(kot_staff_labels)
+    kot_selection_key = f"king_of_time_selected_staff_{int(shift_year)}_{int(shift_month)}"
+    kot_options_key = f"{kot_selection_key}_options"
+    previous_options = set(st.session_state.get(kot_options_key, []))
+    available_options = set(kot_available_staff_keys)
+    if kot_selection_key not in st.session_state:
+        st.session_state[kot_selection_key] = kot_available_staff_keys.copy()
+    elif previous_options != available_options:
+        current_selection = set(st.session_state.get(kot_selection_key, []))
+        newly_available = available_options - previous_options
+        st.session_state[kot_selection_key] = [
+            staff_id
+            for staff_id in kot_available_staff_keys
+            if staff_id in current_selection or staff_id in newly_available
+        ]
+    st.session_state[kot_options_key] = kot_available_staff_keys.copy()
+
+    selected_kot_staff_keys = st.multiselect(
+        "KING OF TIME打刻CSVに出力する職員",
+        options=kot_available_staff_keys,
+        format_func=lambda staff_id: kot_staff_labels.get(staff_id, str(staff_id)),
+        key=kot_selection_key,
+        disabled=not bool(kot_available_staff_keys),
+    )
+    if month_status.get("is_confirmed") and not selected_kot_staff_keys:
+        st.warning("職員が1名も選択されていません。CSVは生成・ダウンロードできません。")
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
@@ -4511,13 +4580,18 @@ def page_shift_manager():
             except Exception as e:
                 st.error(f"シフトExcelを作成できませんでした：{e}")
     with c4:
-        missing_codes = get_missing_staff_code_names(get_active_staff())
+        selected_kot_staff_names = [kot_staff_labels[key] for key in selected_kot_staff_keys]
+        missing_codes = get_missing_staff_code_names(selected_kot_staff_names)
         if missing_codes:
             st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("..." if len(missing_codes) > 8 else ""))
         try:
-            kot_preview_df, kot_error_df, kot_csv_bytes = build_king_of_time_clock_export(int(shift_year), int(shift_month))
+            kot_preview_df, kot_error_df, kot_csv_bytes = build_king_of_time_clock_export(
+                int(shift_year), int(shift_month), selected_staff_keys=selected_kot_staff_keys
+            )
             if not month_status.get("is_confirmed"):
                 st.warning("KING OF TIME打刻CSVは、月間シフト確定後にダウンロードできます。")
+            elif not selected_kot_staff_keys:
+                st.warning("出力する職員を選択してください。")
             elif kot_error_df is not None and not kot_error_df.empty:
                 st.error("KING OF TIME打刻CSVは、エラーがあるためダウンロードできません。")
             else:
@@ -4532,7 +4606,9 @@ def page_shift_manager():
             st.error(f"KING OF TIME用CSVを作成できませんでした：{e}")
 
     try:
-        kot_preview_df, kot_error_df, _ = build_king_of_time_clock_export(int(shift_year), int(shift_month))
+        kot_preview_df, kot_error_df, _ = build_king_of_time_clock_export(
+            int(shift_year), int(shift_month), selected_staff_keys=selected_kot_staff_keys
+        )
         st.markdown("#### KING OF TIME打刻CSVプレビュー")
         if kot_preview_df is None or kot_preview_df.empty:
             st.info("打刻CSVに出力する日勤・夜勤シフトはありません。")
