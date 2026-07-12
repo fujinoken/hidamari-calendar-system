@@ -1011,7 +1011,7 @@ def build_king_of_time_clock_export(
 
     if df is None or df.empty:
         csv_bytes = None if selected_staff_keys is not None and not selected_staff_keys else (
-            pd.DataFrame(columns=csv_columns).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            pd.DataFrame(columns=csv_columns).to_csv(index=False, header=False, encoding="utf-8-sig").encode("utf-8-sig")
         )
         return pd.DataFrame(columns=preview_columns), pd.DataFrame(columns=error_columns), csv_bytes
 
@@ -1089,7 +1089,11 @@ def build_king_of_time_clock_export(
     preview_df = pd.DataFrame(preview_rows, columns=preview_columns)
     error_df = pd.DataFrame(error_rows, columns=error_columns)
     csv_df = pd.DataFrame(csv_rows, columns=csv_columns)
-    csv_bytes = None if not error_df.empty else csv_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    csv_bytes = None if not error_df.empty else csv_df.to_csv(
+        index=False,
+        header=False,
+        encoding="utf-8-sig",
+    ).encode("utf-8-sig")
     return preview_df, error_df, csv_bytes
 
 
