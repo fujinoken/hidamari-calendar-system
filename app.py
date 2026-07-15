@@ -2889,63 +2889,153 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
     return saved
 
 
-def shift_day_labels_for_staff(df, staff_name, target_date):
+MANAGEMENT_INDEX_KIND = "__management__"
+
+
+def build_shift_read_index(df, report_year=None, report_month=None):
+    """月間シフトを1回走査し、画面表示と帳票署名で共有する読み取り索引を作る。"""
+    kinds_by_staff_date = {}
+    raw_kinds_by_staff_date = {}
+    entries_by_date_kind = {}
+    kind_counts_by_date = {}
+    normalized_by_raw_staff = {}
+    normalized_staff_names = set()
+    raw_staff_names = set()
+    report_month_rows = []
+    report_kot_rows = []
+    report_previous_rows = []
+    month_prefix = None
+    if report_year is not None and report_month is not None:
+        month_prefix = f"{int(report_year)}-{int(report_month):02d}-"
+
+    if df is not None and not df.empty:
+        required = ["shift_date", "staff_name", "shift_kind"]
+        for column in required:
+            if column not in df.columns:
+                raise KeyError(column)
+        report_columns = [column for column in SHIFT_REPORT_SNAPSHOT_COLUMNS if column in df.columns]
+        read_columns = list(dict.fromkeys(required + report_columns))
+        positions = {column: index for index, column in enumerate(read_columns)}
+        report_positions = {column: SHIFT_REPORT_SNAPSHOT_COLUMNS.index(column) for column in report_columns}
+
+        for values in df[read_columns].itertuples(index=False, name=None):
+            shift_date_value = values[positions["shift_date"]]
+            staff_name_value = values[positions["staff_name"]]
+            shift_kind_value = values[positions["shift_kind"]]
+            date_text = str(shift_date_value)
+            kind_text = str(shift_kind_value)
+            staff_name_for_normalization = None if pd.isna(staff_name_value) else staff_name_value
+            raw_staff_name = "" if staff_name_for_normalization is None else str(staff_name_value)
+            normalized_staff_name = normalize_staff_name(staff_name_for_normalization)
+
+            counts = kind_counts_by_date.setdefault(date_text, {})
+            counts[kind_text] = counts.get(kind_text, 0) + 1
+
+            if raw_staff_name:
+                raw_staff_names.add(raw_staff_name)
+                normalized_by_raw_staff[raw_staff_name] = normalized_staff_name
+                raw_dates = raw_kinds_by_staff_date.setdefault(raw_staff_name, {})
+                raw_dates.setdefault(date_text, []).append(kind_text)
+
+            if normalized_staff_name:
+                normalized_staff_names.add(normalized_staff_name)
+                staff_dates = kinds_by_staff_date.setdefault(normalized_staff_name, {})
+                staff_dates.setdefault(date_text, []).append(kind_text)
+                date_entries = entries_by_date_kind.setdefault(date_text, {})
+                entry = (raw_staff_name, normalized_staff_name)
+                date_entries.setdefault(kind_text, []).append(entry)
+                if kind_text in MANAGEMENT_SHIFT_KINDS:
+                    date_entries.setdefault(MANAGEMENT_INDEX_KIND, []).append(entry)
+
+            if month_prefix is not None:
+                report_row = [""] * len(SHIFT_REPORT_SNAPSHOT_COLUMNS)
+                for column, report_position in report_positions.items():
+                    report_row[report_position] = _normalize_shift_snapshot_value(column, values[positions[column]])
+                report_row = tuple(report_row)
+                core_row = report_row[1:4]
+                if report_row[1].startswith(month_prefix):
+                    report_month_rows.append(core_row)
+                    report_kot_rows.append(report_row)
+                else:
+                    report_previous_rows.append(core_row)
+
+    def freeze_nested(source):
+        return {
+            key: {nested_key: tuple(sorted(values)) for nested_key, values in nested.items()}
+            for key, nested in source.items()
+        }
+
+    report_snapshot = None
+    if month_prefix is not None:
+        report_snapshot = _make_shift_report_snapshot(
+            report_month_rows, report_kot_rows, report_previous_rows
+        )
+    return {
+        "kinds_by_staff_date": freeze_nested(kinds_by_staff_date),
+        "raw_kinds_by_staff_date": freeze_nested(raw_kinds_by_staff_date),
+        "entries_by_date_kind": freeze_nested(entries_by_date_kind),
+        "kind_counts_by_date": {key: dict(value) for key, value in kind_counts_by_date.items()},
+        "normalized_by_raw_staff": dict(normalized_by_raw_staff),
+        "normalized_staff_names": tuple(sorted(normalized_staff_names)),
+        "raw_staff_names": tuple(sorted(raw_staff_names)),
+        "report_snapshot": report_snapshot,
+    }
+
+
+def _unique_index_staff_names(entries, staff_filter=None):
+    names = []
+    seen = set()
+    for raw_name, normalized_name in entries or ():
+        if staff_filter and staff_filter != "全職員" and raw_name != staff_filter:
+            continue
+        if normalized_name and normalized_name not in seen:
+            seen.add(normalized_name)
+            names.append(normalized_name)
+    return names
+
+
+def shift_day_labels_for_staff(df, staff_name, target_date, read_index=None):
     """
     指定職員・指定日のラベル一覧。
     前日夜勤があれば明を補完するが、当日に希望休・有休・休み・その他がある場合は明を表示しない。
     """
     labels = []
-    if df is not None and not df.empty:
-        target_staff = normalize_staff_name(staff_name)
-        staff_df = df.copy()
-        staff_df["_staff_norm"] = staff_df["staff_name"].apply(normalize_staff_name)
-        staff_df = staff_df[staff_df["_staff_norm"] == target_staff]
-        day_rows = staff_df[staff_df["shift_date"].astype(str) == str(target_date)]
+    read_index = read_index or build_shift_read_index(df)
+    target_staff = normalize_staff_name(staff_name)
+    staff_dates = read_index["kinds_by_staff_date"].get(target_staff, {})
+    day_shift_kinds = list(staff_dates.get(str(target_date), ()))
+    for kind in day_shift_kinds:
+        label = shift_short_label(kind)
+        if label and label not in labels:
+            labels.append(label)
 
-        day_shift_kinds = []
-        for _, r in day_rows.iterrows():
-            kind = str(r["shift_kind"])
-            day_shift_kinds.append(kind)
-            label = shift_short_label(kind)
-            if label and label not in labels:
-                labels.append(label)
+    # 当日に休み系がある場合、明け表示は重ねない。
+    has_off_label = any(x in labels for x in ["希", "有", "他"]) or any(k in OFF_OR_BLOCKING_SHIFT_KINDS for k in day_shift_kinds)
 
-        # 当日に休み系がある場合、明け表示は重ねない。
-        has_off_label = any(x in labels for x in ["希", "有", "他"]) or any(k in OFF_OR_BLOCKING_SHIFT_KINDS for k in day_shift_kinds)
+    # 前日夜勤の翌日は「明」を自動表示する。ただし希望休・有休・休み・その他がある日は表示しない。
+    try:
+        prev_date = (pd.to_datetime(str(target_date)).date() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        if "夜勤" in staff_dates.get(prev_date, ()) and "明" not in labels and not has_off_label:
+            labels.insert(0, "明")
+    except Exception:
+        pass
 
-        # 前日夜勤の翌日は「明」を自動表示する。ただし希望休・有休・休み・その他がある日は表示しない。
-        try:
-            prev_date = (pd.to_datetime(str(target_date)).date() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            prev_rows = staff_df[
-                (staff_df["shift_date"].astype(str) == str(prev_date)) &
-                (staff_df["shift_kind"].astype(str) == "夜勤")
-            ]
-            if not prev_rows.empty and "明" not in labels and not has_off_label:
-                labels.insert(0, "明")
-        except Exception:
-            pass
-
-        # 既存データで明けと希望休等が既に重なっている場合も、表示上は休み系を優先して明を消す。
-        if has_off_label and "明" in labels:
-            labels = [x for x in labels if x != "明"]
+    # 既存データで明けと希望休等が既に重なっている場合も、表示上は休み系を優先して明を消す。
+    if has_off_label and "明" in labels:
+        labels = [x for x in labels if x != "明"]
     return labels
 
 
-def shift_day_actual_label_for_staff(df, staff_name, target_date):
+def shift_day_actual_label_for_staff(df, staff_name, target_date, read_index=None):
     """指定日のDB登録済みシフトだけを、日付編集フォーム用の短縮ラベルにする。"""
     labels = []
-    if df is not None and not df.empty:
-        target_staff = normalize_staff_name(staff_name)
-        staff_df = df.copy()
-        staff_df["_staff_norm"] = staff_df["staff_name"].apply(normalize_staff_name)
-        day_rows = staff_df[
-            (staff_df["_staff_norm"] == target_staff) &
-            (staff_df["shift_date"].astype(str) == str(target_date))
-        ]
-        for _, r in day_rows.iterrows():
-            label = shift_short_label(str(r.get("shift_kind") or ""))
-            if label and label not in labels:
-                labels.append(label)
+    read_index = read_index or build_shift_read_index(df)
+    target_staff = normalize_staff_name(staff_name)
+    kinds = read_index["kinds_by_staff_date"].get(target_staff, {}).get(str(target_date), ())
+    for kind in kinds:
+        label = shift_short_label(str(kind or ""))
+        if label and label not in labels:
+            labels.append(label)
     return labels_to_cell_value(labels)
 
 
@@ -2969,12 +3059,12 @@ def labels_to_cell_value(labels):
         return ordered[0]
     return "/".join(ordered[:2])
 
-def create_shift_matrix(df, year, month):
+def create_shift_matrix(df, year, month, read_index=None):
     """写真の勤務表イメージに近い、職員×日付の横長表を作る。"""
     last_day = calendar.monthrange(int(year), int(month))[1]
-    staff_names = []
-    if df is not None and not df.empty:
-        staff_names = sorted(set([normalize_staff_name(x) for x in df["staff_name"].dropna().astype(str).tolist() if normalize_staff_name(x)]))
+    if read_index is None:
+        read_index = build_shift_read_index(df)
+    staff_names = list(read_index["normalized_staff_names"])
     columns = ["職員名"] + [str(d) for d in range(1, last_day + 1)] + ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]
     rows = []
 
@@ -2984,7 +3074,7 @@ def create_shift_matrix(df, year, month):
         work_flags = []
         for d in range(1, last_day + 1):
             target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
-            labels = shift_day_labels_for_staff(df, staff_name, target_date)
+            labels = shift_day_labels_for_staff(df, staff_name, target_date, read_index)
             row[str(d)] = labels_to_cell_value(labels)
             if "日" in labels:
                 day_count += 1
@@ -3034,7 +3124,7 @@ def max_consecutive_ones(values):
     return best
 
 
-def create_editable_shift_matrix(staff_names, df, year, month):
+def create_editable_shift_matrix(staff_names, df, year, month, read_index=None):
     """
     st.data_editorで直接入力しやすい月間シフト表を作る。
     各セルは「」「日」「管」「夜」「明」「希」「有」「他」からプルダウン入力する。
@@ -3050,12 +3140,13 @@ def create_editable_shift_matrix(staff_names, df, year, month):
             unique_staff_names.append(ns)
     staff_names = unique_staff_names
 
-    if df is not None and not df.empty:
-        for s in sorted(df["staff_name"].dropna().astype(str).unique().tolist()):
-            ns = normalize_staff_name(s)
-            if ns and ns not in seen_staff_names:
-                seen_staff_names.add(ns)
-                staff_names.append(ns)
+    if read_index is None:
+        read_index = build_shift_read_index(df)
+    for s in read_index["raw_staff_names"]:
+        ns = read_index["normalized_by_raw_staff"].get(s, "")
+        if ns and ns not in seen_staff_names:
+            seen_staff_names.add(ns)
+            staff_names.append(ns)
 
     columns = ["職員名"] + [str(d) for d in range(1, last_day + 1)]
     rows = []
@@ -3064,7 +3155,7 @@ def create_editable_shift_matrix(staff_names, df, year, month):
         row = {"職員名": staff_name}
         for d in range(1, last_day + 1):
             target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
-            labels = shift_day_labels_for_staff(df, staff_name, target_date)
+            labels = shift_day_labels_for_staff(df, staff_name, target_date, read_index)
             row[str(d)] = labels_to_cell_value(labels)
         rows.append(row)
 
@@ -3151,17 +3242,17 @@ def save_shift_matrix_from_editor(year, month, edited_df):
     return saved
 
 
-def create_shift_shortage_table(df, year, month):
+def create_shift_shortage_table(df, year, month, read_index=None):
     """日勤2名・夜勤1名を基準に、不足日を確認する。"""
     last_day = calendar.monthrange(int(year), int(month))[1]
     rows = []
+    if read_index is None:
+        read_index = build_shift_read_index(df)
     for d in range(1, last_day + 1):
         target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
-        day_df = df[df["shift_date"].astype(str) == target_date] if df is not None and not df.empty else pd.DataFrame()
-        day_count = night_count = 0
-        if not day_df.empty:
-            day_count = len(day_df[day_df["shift_kind"].isin(DAY_STAFFING_SHIFT_KINDS)])
-            night_count = len(day_df[day_df["shift_kind"] == "夜勤"])
+        counts = read_index["kind_counts_by_date"].get(target_date, {})
+        day_count = sum(counts.get(kind, 0) for kind in DAY_STAFFING_SHIFT_KINDS)
+        night_count = counts.get("夜勤", 0)
         status = "OK" if day_count >= 2 and night_count >= 1 else "要確認"
         rows.append({
             "日付": target_date,
@@ -3173,20 +3264,23 @@ def create_shift_shortage_table(df, year, month):
     return pd.DataFrame(rows)
 
 
-def create_shift_quality_check_table(df, year, month):
+def create_shift_quality_check_table(df, year, month, read_index=None, matrix=None):
     """夜勤明け・連勤・希望休・勤務偏りを確認する。"""
     rows = []
     last_day = calendar.monthrange(int(year), int(month))[1]
     if df is None or df.empty:
         return pd.DataFrame(columns=["重要度", "種類", "日付", "職員名", "内容"])
 
-    staff_names = sorted(df["staff_name"].dropna().astype(str).unique().tolist())
+    if read_index is None:
+        read_index = build_shift_read_index(df)
+    raw_kinds_by_staff_date = read_index["raw_kinds_by_staff_date"]
+    staff_names = list(read_index["raw_staff_names"])
     for staff_name in staff_names:
         work_flags = []
         for d in range(1, last_day + 1):
             target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
-            day_df = df[(df["staff_name"].astype(str) == staff_name) & (df["shift_date"].astype(str) == target_date)]
-            kinds = day_df["shift_kind"].astype(str).tolist() if not day_df.empty else []
+            staff_dates = raw_kinds_by_staff_date.get(staff_name, {})
+            kinds = list(staff_dates.get(target_date, ()))
 
             # 希望休・有休に勤務が重なっている
             if any(k in kinds for k in OFF_OR_BLOCKING_SHIFT_KINDS) and any(k in kinds for k in ACTIVE_SHIFT_KINDS):
@@ -3211,8 +3305,7 @@ def create_shift_quality_check_table(df, year, month):
             # 夜勤翌日は「明」、明け翌日は「休み」を基本にする
             try:
                 prev_date = (date(int(year), int(month), d) - timedelta(days=1)).strftime("%Y-%m-%d")
-                prev_df = df[(df["staff_name"].astype(str) == staff_name) & (df["shift_date"].astype(str) == prev_date)]
-                prev_kinds = prev_df["shift_kind"].astype(str).tolist() if not prev_df.empty else []
+                prev_kinds = list(staff_dates.get(prev_date, ()))
 
                 if "夜勤" in prev_kinds:
                     if any(k in WORKDAY_SHIFT_KINDS for k in kinds):
@@ -3279,7 +3372,8 @@ def create_shift_quality_check_table(df, year, month):
                 cur = 0
 
     # 夜勤回数の偏り
-    matrix = create_shift_matrix(df, year, month)
+    if matrix is None:
+        matrix = create_shift_matrix(df, year, month, read_index)
     if not matrix.empty and "夜勤" in matrix.columns:
         night_vals = matrix["夜勤"].fillna(0).astype(int)
         if len(night_vals) >= 2:
@@ -4161,26 +4255,7 @@ def _hash_snapshot_rows(rows):
     return digest.hexdigest()
 
 
-def _build_shift_report_snapshot(shift_df, year, month):
-    """shift_dfを1回だけ正規化し、当月帳票で共有するスナップショットを作る。"""
-    month_prefix = f"{int(year)}-{int(month):02d}-"
-    month_rows = []
-    kot_detail_rows = []
-    previous_context_rows = []
-    if shift_df is not None and not shift_df.empty:
-        available = [column for column in SHIFT_REPORT_SNAPSHOT_COLUMNS if column in shift_df.columns]
-        column_indexes = [SHIFT_REPORT_SNAPSHOT_COLUMNS.index(column) for column in available]
-        for values in shift_df[available].itertuples(index=False, name=None):
-            row = [""] * len(SHIFT_REPORT_SNAPSHOT_COLUMNS)
-            for column, column_index, value in zip(available, column_indexes, values):
-                row[column_index] = _normalize_shift_snapshot_value(column, value)
-            normalized = tuple(row)
-            core_row = normalized[1:4]
-            if normalized[1].startswith(month_prefix):
-                month_rows.append(core_row)
-                kot_detail_rows.append(normalized)
-            else:
-                previous_context_rows.append(core_row)
+def _make_shift_report_snapshot(month_rows, kot_detail_rows, previous_context_rows):
     month_rows = tuple(sorted(month_rows))
     kot_detail_rows = tuple(sorted(kot_detail_rows))
     previous_context_rows = tuple(sorted(previous_context_rows))
@@ -4190,6 +4265,11 @@ def _build_shift_report_snapshot(shift_df, year, month):
         "kot_detail_hash": _hash_snapshot_rows(kot_detail_rows),
         "previous_context_hash": _hash_snapshot_rows(previous_context_rows),
     }
+
+
+def _build_shift_report_snapshot(shift_df, year, month):
+    """画面用の読取インデックスと同じ1回の走査で帳票署名も作る。"""
+    return build_shift_read_index(shift_df, year, month)["report_snapshot"]
 
 
 def _stable_rows_for_hash(df, columns):
@@ -4296,8 +4376,10 @@ def _status_column(df):
     return df.columns[-2] if len(df.columns) >= 2 else None
 
 
-def render_shift_calendar(year, month, shift_df):
+def render_shift_calendar(year, month, shift_df, read_index=None, staff_filter="全職員"):
     st.markdown("### 月間シフトカレンダー")
+    if read_index is None:
+        read_index = build_shift_read_index(shift_df)
     first_weekday, last_day = calendar.monthrange(int(year), int(month))
     start_col = (first_weekday + 1) % 7
     days = [None] * start_col
@@ -4318,7 +4400,7 @@ def render_shift_calendar(year, month, shift_df):
                     st.markdown('<div class="hm-shift-day hm-blank"></div>', unsafe_allow_html=True)
                     continue
                 date_text = target_date.strftime("%Y-%m-%d")
-                day_df = shift_df[shift_df["shift_date"].astype(str) == date_text] if shift_df is not None and not shift_df.empty else pd.DataFrame()
+                date_entries = read_index["entries_by_date_kind"].get(date_text, {})
                 classes = ["hm-shift-day"]
                 if target_date.weekday() == 6:
                     classes.append("hm-sunday")
@@ -4327,12 +4409,13 @@ def render_shift_calendar(year, month, shift_df):
                 if target_date == today_jst():
                     classes.append("hm-today")
                 lines = []
-                if not day_df.empty:
+                if date_entries:
                     for kind in SHIFT_KINDS:
                         if kind == "管":
-                            members = unique_shift_staff_names(day_df[day_df["shift_kind"].astype(str).isin(MANAGEMENT_SHIFT_KINDS)])
+                            entries = date_entries.get(MANAGEMENT_INDEX_KIND, ())
                         else:
-                            members = unique_shift_staff_names(day_df[day_df["shift_kind"].astype(str) == kind])
+                            entries = date_entries.get(kind, ())
+                        members = _unique_index_staff_names(entries, staff_filter)
                         if members:
                             names = "、".join(members[:3])
                             if len(members) > 3:
@@ -4350,7 +4433,7 @@ def render_shift_calendar(year, month, shift_df):
                     st.session_state["selected_shift_date"] = target_date.strftime("%Y-%m-%d")
 
 
-def render_selected_shift_day_editor(year, month, shift_df, month_status=None):
+def render_selected_shift_day_editor(year, month, shift_df, month_status=None, read_index=None):
     st.markdown("### 選択日のシフト編集")
     st.caption("カレンダーの日付ごとの編集ボタンから、その日の職員シフトをまとめて修正できます。")
     st.caption("管は管理業務です。日勤人数には含めませんが、本人の勤務日数には含まれます。")
@@ -4390,7 +4473,9 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None):
         assignments = {}
         cols = st.columns(3)
         for idx, staff_name in enumerate(staff_names):
-            current_label = shift_day_actual_label_for_staff(shift_df, staff_name, selected_date.strftime("%Y-%m-%d"))
+            current_label = shift_day_actual_label_for_staff(
+                shift_df, staff_name, selected_date.strftime("%Y-%m-%d"), read_index
+            )
             current_index = SHIFT_EDITOR_OPTIONS.index(current_label) if current_label in SHIFT_EDITOR_OPTIONS else 0
             with cols[idx % 3]:
                 assignments[staff_name] = st.selectbox(
@@ -4418,12 +4503,14 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None):
         st.error(f"この日のシフトを保存できませんでした：{e}")
 
 
-def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_status=None):
+def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_status=None, read_index=None):
     st.markdown("### 月間シフト表")
     staff_names = get_active_staff()
     if staff_filter and staff_filter != "全職員":
         staff_names = [staff_filter]
-    editable_matrix = create_editable_shift_matrix(staff_names, shift_df, int(year), int(month))
+    editable_matrix = create_editable_shift_matrix(
+        staff_names, shift_df, int(year), int(month), read_index
+    )
     if editable_matrix.empty:
         st.info("職員マスタに職員が登録されていません。先に職員マスタで登録してください。")
         return
@@ -4481,13 +4568,16 @@ def page_shift_manager():
 
     staff_options = [""] + get_active_staff()
     shift_df = get_staff_shifts_month(int(shift_year), int(shift_month), include_prev_day=True)
-    if staff_filter != "全職員" and not shift_df.empty:
-        shift_df_for_view = shift_df[shift_df["staff_name"].astype(str) == staff_filter].copy()
-    else:
-        shift_df_for_view = shift_df
+    shift_read_index = build_shift_read_index(
+        shift_df, int(shift_year), int(shift_month)
+    )
 
-    render_shift_calendar(int(shift_year), int(shift_month), shift_df_for_view)
-    render_selected_shift_day_editor(int(shift_year), int(shift_month), shift_df, month_status)
+    render_shift_calendar(
+        int(shift_year), int(shift_month), shift_df, shift_read_index, staff_filter
+    )
+    render_selected_shift_day_editor(
+        int(shift_year), int(shift_month), shift_df, month_status, shift_read_index
+    )
 
     st.markdown("### 入力・編集フォーム")
     with st.expander("希望休・有休・休みを登録", expanded=True):
@@ -4568,7 +4658,10 @@ def page_shift_manager():
             st.success("この月のシフトを全クリアしました。")
             st.rerun()
 
-    render_shift_editor(int(shift_year), int(shift_month), shift_df, staff_filter, month_status)
+    render_shift_editor(
+        int(shift_year), int(shift_month), shift_df, staff_filter, month_status,
+        shift_read_index,
+    )
 
     st.markdown("### 職員別勤務回数上限")
     limits_df = get_staff_shift_limits()
@@ -4626,9 +4719,15 @@ def page_shift_manager():
                 st.rerun()
 
     st.markdown("### チェック結果・警告")
-    matrix = create_shift_matrix(shift_df, int(shift_year), int(shift_month))
-    shortage = create_shift_shortage_table(shift_df, int(shift_year), int(shift_month))
-    checks = create_shift_quality_check_table(shift_df, int(shift_year), int(shift_month))
+    matrix = create_shift_matrix(
+        shift_df, int(shift_year), int(shift_month), shift_read_index
+    )
+    shortage = create_shift_shortage_table(
+        shift_df, int(shift_year), int(shift_month), shift_read_index
+    )
+    checks = create_shift_quality_check_table(
+        shift_df, int(shift_year), int(shift_month), shift_read_index, matrix
+    )
     limit_checks = create_shift_limit_check_table(matrix)
     status_col = _status_column(shortage)
     shortage_ng = shortage[shortage[status_col].astype(str) != "OK"] if status_col and not shortage.empty else pd.DataFrame()
@@ -4662,7 +4761,7 @@ def page_shift_manager():
     st.markdown("### PDF/Excel/KING OF TIME CSV出力")
     st.caption("月間シフトカレンダーPDFは、保存済みの現在データから作成します。未保存の表編集はPDFに反映されません。先に保存してください。")
     # staff_filterは画面カレンダー専用。帳票は従来どおり保存済み全職員データから作る。
-    shift_snapshot = _build_shift_report_snapshot(shift_df, int(shift_year), int(shift_month))
+    shift_snapshot = shift_read_index["report_snapshot"]
     report_signature = _shift_report_signature(shift_snapshot, month_status, limits_df)
 
     if REPORTLAB_AVAILABLE:
