@@ -36,10 +36,162 @@ sys.modules.setdefault("streamlit", fake_streamlit)
 import app  # noqa: E402
 
 
+def _legacy_shift_day_labels(df, staff_name, target_date):
+    labels = []
+    if df is None or df.empty:
+        return labels
+    target_staff = app.normalize_staff_name(staff_name)
+    staff_df = df.copy()
+    staff_df["_staff_norm"] = staff_df["staff_name"].apply(app.normalize_staff_name)
+    staff_df = staff_df[staff_df["_staff_norm"] == target_staff]
+    day_rows = staff_df[staff_df["shift_date"].astype(str) == str(target_date)]
+    day_shift_kinds = []
+    for _, row in day_rows.iterrows():
+        kind = str(row["shift_kind"])
+        day_shift_kinds.append(kind)
+        label = app.shift_short_label(kind)
+        if label and label not in labels:
+            labels.append(label)
+    has_off_label = (
+        any(value in labels for value in ["希", "有", "他"])
+        or any(kind in app.OFF_OR_BLOCKING_SHIFT_KINDS for kind in day_shift_kinds)
+    )
+    try:
+        previous_date = (
+            pd.to_datetime(str(target_date)).date() - pd.Timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        previous_rows = staff_df[
+            (staff_df["shift_date"].astype(str) == previous_date)
+            & (staff_df["shift_kind"].astype(str) == "夜勤")
+        ]
+        if not previous_rows.empty and "明" not in labels and not has_off_label:
+            labels.insert(0, "明")
+    except Exception:
+        pass
+    if has_off_label and "明" in labels:
+        labels = [value for value in labels if value != "明"]
+    return labels
+
+
+def _legacy_shift_day_actual_label(df, staff_name, target_date):
+    labels = []
+    staff_df = df.copy()
+    staff_df["_staff_norm"] = staff_df["staff_name"].apply(app.normalize_staff_name)
+    day_rows = staff_df[
+        (staff_df["_staff_norm"] == app.normalize_staff_name(staff_name))
+        & (staff_df["shift_date"].astype(str) == str(target_date))
+    ]
+    for _, row in day_rows.iterrows():
+        label = app.shift_short_label(str(row.get("shift_kind") or ""))
+        if label and label not in labels:
+            labels.append(label)
+    return app.labels_to_cell_value(labels)
+
+
 class SpeedImprovementTests(unittest.TestCase):
     def test_page_builds_shift_snapshot_once(self):
         source = inspect.getsource(app.page_shift_manager)
-        self.assertEqual(source.count("_build_shift_report_snapshot("), 1)
+        self.assertEqual(source.count("build_shift_read_index("), 1)
+        self.assertNotIn("_build_shift_report_snapshot(", source)
+        self.assertIn('shift_snapshot = shift_read_index["report_snapshot"]', source)
+
+    def test_shift_read_index_handles_empty_and_normalizes_each_row_once(self):
+        empty = app.build_shift_read_index(pd.DataFrame())
+        self.assertEqual(empty["normalized_staff_names"], ())
+        self.assertEqual(empty["kinds_by_staff_date"], {})
+
+        shifts = pd.DataFrame([
+            {"shift_date": "2026-06-30", "staff_name": " 藤野 ", "shift_kind": "夜勤"},
+            {"shift_date": "2026-07-01", "staff_name": "藤野", "shift_kind": "日勤"},
+            {"shift_date": "2026-07-01", "staff_name": "池田", "shift_kind": "日勤"},
+            {"shift_date": pd.NaT, "staff_name": None, "shift_kind": float("nan")},
+        ])
+        with patch.object(app, "normalize_staff_name", wraps=app.normalize_staff_name) as normalize:
+            index = app.build_shift_read_index(shifts)
+        self.assertEqual(normalize.call_count, len(shifts))
+        self.assertEqual(index["normalized_staff_names"], ("池田", "藤野"))
+        self.assertEqual(index["kinds_by_staff_date"]["藤野"]["2026-06-30"], ("夜勤",))
+        self.assertNotIn("nan", index["normalized_staff_names"])
+
+    def test_shift_read_index_is_stable_for_row_order_and_multiple_rows(self):
+        shifts = pd.DataFrame([
+            {"id": 3, "shift_date": "2026-07-02", "staff_name": "藤野", "shift_kind": "希望休"},
+            {"id": 2, "shift_date": "2026-07-01", "staff_name": "池田", "shift_kind": "夜勤"},
+            {"id": 1, "shift_date": "2026-07-01", "staff_name": "藤野", "shift_kind": "日勤"},
+            {"id": 4, "shift_date": "2026-07-02", "staff_name": "藤野", "shift_kind": "その他"},
+        ])
+        first = app.build_shift_read_index(shifts, 2026, 7)
+        second = app.build_shift_read_index(shifts.iloc[::-1].reset_index(drop=True), 2026, 7)
+        self.assertEqual(first, second)
+        self.assertEqual(first["kinds_by_staff_date"]["藤野"]["2026-07-02"], ("その他", "希望休"))
+
+    def test_indexed_day_labels_and_matrices_match_legacy_results(self):
+        shifts = pd.DataFrame([
+            {"shift_date": "2026-06-30", "staff_name": "藤野", "shift_kind": "夜勤"},
+            {"shift_date": "2026-07-01", "staff_name": "藤野", "shift_kind": "日勤"},
+            {"shift_date": "2026-07-01", "staff_name": "池田", "shift_kind": "日勤"},
+            {"shift_date": "2026-07-02", "staff_name": "池田", "shift_kind": "夜勤"},
+            {"shift_date": "2026-07-03", "staff_name": "池田", "shift_kind": "希望休"},
+        ])
+        index = app.build_shift_read_index(shifts)
+        for staff_name in ("藤野", "池田"):
+            for target_date in ("2026-07-01", "2026-07-02", "2026-07-03"):
+                self.assertEqual(
+                    app.shift_day_labels_for_staff(shifts, staff_name, target_date, index),
+                    _legacy_shift_day_labels(shifts, staff_name, target_date),
+                )
+                self.assertEqual(
+                    app.shift_day_actual_label_for_staff(shifts, staff_name, target_date, index),
+                    _legacy_shift_day_actual_label(shifts, staff_name, target_date),
+                )
+        pd.testing.assert_frame_equal(
+            app.create_shift_matrix(shifts, 2026, 7, index),
+            app.create_shift_matrix(shifts, 2026, 7),
+        )
+        pd.testing.assert_frame_equal(
+            app.create_editable_shift_matrix(["藤野", "池田"], shifts, 2026, 7, index),
+            app.create_editable_shift_matrix(["藤野", "池田"], shifts, 2026, 7),
+        )
+        shortage = app.create_shift_shortage_table(shifts, 2026, 7, index)
+        self.assertEqual(shortage.iloc[0]["日勤人数"], 2)
+        self.assertEqual(shortage.iloc[0]["夜勤人数"], 0)
+        self.assertEqual(shortage.iloc[0]["状態"], "要確認")
+
+    def test_quality_check_reuses_supplied_matrix_and_index(self):
+        shifts = pd.DataFrame([
+            {"shift_date": "2026-07-01", "staff_name": "藤野", "shift_kind": "日勤"},
+            {"shift_date": "2026-07-01", "staff_name": "藤野", "shift_kind": "希望休"},
+        ])
+        index = app.build_shift_read_index(shifts)
+        matrix = app.create_shift_matrix(shifts, 2026, 7, index)
+        with patch.object(app, "create_shift_matrix", side_effect=AssertionError("再生成")):
+            result = app.create_shift_quality_check_table(shifts, 2026, 7, index, matrix)
+        expected = pd.DataFrame([{
+            "重要度": "高",
+            "種類": "休み希望と勤務の重複",
+            "日付": "2026-07-01",
+            "職員名": "藤野",
+            "内容": "休み・希望休・有休・その他と、日勤・夜勤・明けが同日に入っています。",
+        }])
+        pd.testing.assert_frame_equal(result, expected)
+
+    def test_staff_filter_and_hot_loops_do_not_rescan_dataframe(self):
+        entries = ((" 藤野 ", "藤野"), ("池田", "池田"), ("藤野", "藤野"))
+        self.assertEqual(app._unique_index_staff_names(entries), ["藤野", "池田"])
+        self.assertEqual(app._unique_index_staff_names(entries, "池田"), ["池田"])
+        for target in (
+            app.shift_day_labels_for_staff,
+            app.shift_day_actual_label_for_staff,
+            app.create_shift_matrix,
+            app.create_editable_shift_matrix,
+            app.render_shift_calendar,
+        ):
+            source = inspect.getsource(target)
+            self.assertNotIn(".copy()", source)
+            self.assertNotIn(".apply(normalize_staff_name)", source)
+        calendar_source = inspect.getsource(app.render_shift_calendar)
+        self.assertNotIn('shift_df[', calendar_source)
+        self.assertNotIn("astype(str)", calendar_source)
 
     def test_edit_button_keeps_selected_date_without_explicit_rerun(self):
         source = inspect.getsource(app.render_shift_calendar)
