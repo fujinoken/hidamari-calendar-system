@@ -123,6 +123,12 @@ NIGHT_LIMIT_SHIFT_KINDS = ["夜勤"]
 MANAGEMENT_SHIFT_KINDS = ["管", "管理業務"]
 WORKDAY_SHIFT_KINDS = ["日勤", "管", "管理業務", "夜勤", "夜勤明け"]
 
+# 帳票生成ロジックやレイアウトを変更した場合は、対応する値を更新する。
+STAFF_SHIFT_PDF_CACHE_VERSION = "1"
+STAFF_SHIFT_EXCEL_CACHE_VERSION = "1"
+SHIFT_CALENDAR_PDF_CACHE_VERSION = "1"
+KING_OF_TIME_CACHE_VERSION = "1"
+
 
 def note_perf(label, started_at):
     elapsed = time.perf_counter() - started_at
@@ -144,7 +150,7 @@ def show_perf_log():
 
 
 def clear_event_caches():
-    for fn in (monthly_events, events_by_date, get_event_by_id, get_attachment_counts):
+    for fn in (monthly_events, events_by_date, get_event_by_id, get_attachment_counts, get_staff_event_counts_month):
         try:
             fn.clear()
         except Exception:
@@ -152,7 +158,7 @@ def clear_event_caches():
 
 
 def clear_master_caches():
-    for fn in (get_active_users, get_active_staff, get_staff_code_map, get_categories, get_category_mark_map):
+    for fn in (get_active_users, get_active_staff, get_staff_code_map, get_staff_key_map, get_categories, get_category_mark_map):
         try:
             fn.clear()
         except Exception:
@@ -3316,15 +3322,38 @@ def get_staff_event_counts_for_date(target_date):
     return {str(r["staff_name"]): int(r["cnt"]) for _, r in df.iterrows()}
 
 
-def get_shift_candidates_for_event(event_row, shift_df):
-    """予定日時に対して担当候補を出す。日中は日勤、夕方以降・早朝は夜勤を優先する。"""
+@st.cache_data(ttl=60, show_spinner=False)
+def get_staff_event_counts_month(year, month):
+    """対象月の予定担当件数を日付・職員別に1回のSQLで取得する。"""
+    year = int(year)
+    month = int(month)
+    start = date(year, month, 1)
+    next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    df = fetch_df("""
+        SELECT event_date, staff_name, COUNT(*) AS event_count
+        FROM events
+        WHERE event_date >= ? AND event_date < ?
+          AND staff_name IS NOT NULL AND staff_name <> ''
+        GROUP BY event_date, staff_name
+    """, (start.strftime("%Y-%m-%d"), next_month.strftime("%Y-%m-%d")))
+    counts_by_date = {}
+    if df is None or df.empty:
+        return counts_by_date
+    for _, row in df.iterrows():
+        event_date = str(row["event_date"])
+        staff_name = str(row["staff_name"])
+        counts_by_date.setdefault(event_date, {})[staff_name] = int(row["event_count"])
+    return counts_by_date
+
+
+def _get_shift_candidates_for_event(event_row, shift_df, counts):
+    """取得済みの日別担当件数を使って予定の担当候補を作る。"""
     if shift_df is None or shift_df.empty:
         return pd.DataFrame()
 
     event_date = str(event_row["event_date"])
     start_hour = parse_hour_from_time_text(event_row.get("start_time", ""))
     night_event = start_hour is not None and (start_hour >= 16 or start_hour <= 9)
-
     day_df = shift_df[shift_df["shift_date"].astype(str) == event_date].copy()
     if day_df.empty:
         return pd.DataFrame()
@@ -3334,7 +3363,6 @@ def get_shift_candidates_for_event(event_row, shift_df):
     if day_df.empty:
         return pd.DataFrame()
 
-    counts = get_staff_event_counts_for_date(event_date)
     rows = []
     for _, r in day_df.iterrows():
         staff_name = str(r["staff_name"])
@@ -3377,7 +3405,33 @@ def get_shift_candidates_for_event(event_row, shift_df):
     return result.sort_values(["スコア", "職員名"], ascending=[False, True]).reset_index(drop=True)
 
 
+def get_shift_candidates_for_event(event_row, shift_df):
+    """予定日時に対して担当候補を出す。日中は日勤、夕方以降・早朝は夜勤を優先する。"""
+    if shift_df is None or shift_df.empty:
+        return pd.DataFrame()
+    event_date = str(event_row["event_date"])
+    counts = get_staff_event_counts_for_date(event_date)
+    return _get_shift_candidates_for_event(event_row, shift_df, counts)
+
+
 def build_event_assignment_preview(events_df, shift_df, only_unassigned=True):
+    if events_df is None or events_df.empty:
+        return pd.DataFrame()
+    counts_by_date = {}
+    loaded_months = set()
+    for raw_event_date in events_df["event_date"].tolist():
+        parsed = pd.to_datetime(raw_event_date, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        year_month = (int(parsed.year), int(parsed.month))
+        if year_month in loaded_months:
+            continue
+        loaded_months.add(year_month)
+        counts_by_date.update(get_staff_event_counts_month(*year_month))
+    return _build_event_assignment_preview(events_df, shift_df, counts_by_date, only_unassigned)
+
+
+def _build_event_assignment_preview(events_df, shift_df, counts_by_date, only_unassigned=True):
     rows = []
     if events_df is None or events_df.empty:
         return pd.DataFrame()
@@ -3385,7 +3439,8 @@ def build_event_assignment_preview(events_df, shift_df, only_unassigned=True):
         current = str(ev["staff_name"] or "")
         if only_unassigned and current:
             continue
-        cand = get_shift_candidates_for_event(ev, shift_df)
+        event_date = str(ev["event_date"])
+        cand = _get_shift_candidates_for_event(ev, shift_df, counts_by_date.get(event_date, {}))
         if cand.empty:
             rows.append({
                 "予定ID": int(ev["id"]),
@@ -4072,6 +4127,144 @@ def make_staff_shift_excel(year, month):
     )
 
 
+SHIFT_REPORT_SNAPSHOT_COLUMNS = (
+    "id", "shift_date", "staff_name", "shift_kind", "start_time", "end_time", "next_day",
+)
+
+
+def _normalize_shift_snapshot_value(column, value):
+    """シフト帳票スナップショットの値を型や欠損表現に依存しない文字列へそろえる。"""
+    if value is None or (not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)):
+        return ""
+    if column == "shift_date":
+        parsed = pd.to_datetime(value, errors="coerce")
+        return parsed.strftime("%Y-%m-%d") if not pd.isna(parsed) else str(value).strip()
+    if column in ("id", "next_day"):
+        try:
+            return str(int(float(value)))
+        except (TypeError, ValueError):
+            return str(value).strip()
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    return str(value)
+
+
+def _hash_snapshot_rows(rows):
+    """行全体の巨大なreprを作らず、境界を含めて安定したSHA-256を計算する。"""
+    digest = hashlib.sha256()
+    for row in rows:
+        for value in row:
+            encoded = str(value).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        digest.update(b"\xff")
+    return digest.hexdigest()
+
+
+def _build_shift_report_snapshot(shift_df, year, month):
+    """shift_dfを1回だけ正規化し、当月帳票で共有するスナップショットを作る。"""
+    month_prefix = f"{int(year)}-{int(month):02d}-"
+    month_rows = []
+    kot_detail_rows = []
+    previous_context_rows = []
+    if shift_df is not None and not shift_df.empty:
+        available = [column for column in SHIFT_REPORT_SNAPSHOT_COLUMNS if column in shift_df.columns]
+        column_indexes = [SHIFT_REPORT_SNAPSHOT_COLUMNS.index(column) for column in available]
+        for values in shift_df[available].itertuples(index=False, name=None):
+            row = [""] * len(SHIFT_REPORT_SNAPSHOT_COLUMNS)
+            for column, column_index, value in zip(available, column_indexes, values):
+                row[column_index] = _normalize_shift_snapshot_value(column, value)
+            normalized = tuple(row)
+            core_row = normalized[1:4]
+            if normalized[1].startswith(month_prefix):
+                month_rows.append(core_row)
+                kot_detail_rows.append(normalized)
+            else:
+                previous_context_rows.append(core_row)
+    month_rows = tuple(sorted(month_rows))
+    kot_detail_rows = tuple(sorted(kot_detail_rows))
+    previous_context_rows = tuple(sorted(previous_context_rows))
+    return {
+        "month_rows": month_rows,
+        "base_hash": _hash_snapshot_rows(month_rows),
+        "kot_detail_hash": _hash_snapshot_rows(kot_detail_rows),
+        "previous_context_hash": _hash_snapshot_rows(previous_context_rows),
+    }
+
+
+def _stable_rows_for_hash(df, columns):
+    if df is None or df.empty:
+        return ()
+    available = [column for column in columns if column in df.columns]
+    rows = [
+        tuple(_normalize_shift_snapshot_value(column, value) for column, value in zip(available, values))
+        for values in df[available].itertuples(index=False, name=None)
+    ]
+    return tuple(sorted(rows))
+
+
+def _hash_cache_parts(*parts):
+    rows = []
+    for index, part in enumerate(parts):
+        if isinstance(part, tuple):
+            rows.extend((str(index),) + tuple(str(value) for value in row) if isinstance(row, tuple) else (str(index), str(row)) for row in part)
+        else:
+            rows.append((str(index), str(part)))
+    return _hash_snapshot_rows(rows)
+
+
+def _shift_report_signature(shift_snapshot, month_status, limits_df):
+    limit_rows = _stable_rows_for_hash(limits_df, ["職員名", "日勤上限", "夜勤上限", "合計上限", "メモ"])
+    status_key = tuple(sorted((str(key), str(value or "")) for key, value in (month_status or {}).items()))
+    staffing_rules = (
+        tuple(DAY_STAFFING_SHIFT_KINDS), tuple(DAY_LIMIT_SHIFT_KINDS),
+        tuple(NIGHT_LIMIT_SHIFT_KINDS), tuple(WORKDAY_SHIFT_KINDS), AI_SHIFT_RULE_VERSION,
+    )
+    return _hash_cache_parts(
+        shift_snapshot["base_hash"], shift_snapshot["previous_context_hash"],
+        _hash_snapshot_rows(limit_rows), status_key, staffing_rules,
+    )
+
+
+def _king_of_time_report_signature(shift_base_hash, kot_detail_hash):
+    code_rows = tuple(sorted((str(key), str(value or "")) for key, value in get_staff_code_map(active_only=False).items()))
+    staff_key_rows = tuple(sorted((str(key), int(value)) for key, value in get_staff_key_map(active_only=False).items()))
+    time_rules = tuple((kind, default_shift_times(kind)) for kind in SHIFT_KINDS)
+    return _hash_cache_parts(shift_base_hash, kot_detail_hash, code_rows, staff_key_rows, time_rules)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_staff_shift_pdf(year, month, report_signature, cache_version):
+    return make_staff_shift_pdf(int(year), int(month))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_staff_shift_excel(year, month, report_signature, cache_version):
+    return make_staff_shift_excel(int(year), int(month))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_shift_calendar_pdf(
+    year, month, shift_base_hash, cache_version, _shift_rows, staff_list, selected_staff_names, finalized
+):
+    shift_df = pd.DataFrame(_shift_rows, columns=["shift_date", "staff_name", "shift_kind"])
+    return make_shift_calendar_pdf(
+        int(year),
+        int(month),
+        shift_df,
+        list(staff_list),
+        selected_staff_names=list(selected_staff_names) or None,
+        finalized=bool(finalized),
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_king_of_time_clock_export(year, month, selected_staff_keys, report_signature, cache_version):
+    return build_king_of_time_clock_export(
+        int(year), int(month), selected_staff_keys=list(selected_staff_keys)
+    )
+
+
 
 
 def format_shift_label(shift_value):
@@ -4155,7 +4348,6 @@ def render_shift_calendar(year, month, shift_df):
                 st.markdown(html, unsafe_allow_html=True)
                 if st.button("編集", key=f"edit_shift_day_{target_date.isoformat()}", use_container_width=True):
                     st.session_state["selected_shift_date"] = target_date.strftime("%Y-%m-%d")
-                    st.rerun()
 
 
 def render_selected_shift_day_editor(year, month, shift_df, month_status=None):
@@ -4469,6 +4661,9 @@ def page_shift_manager():
 
     st.markdown("### PDF/Excel/KING OF TIME CSV出力")
     st.caption("月間シフトカレンダーPDFは、保存済みの現在データから作成します。未保存の表編集はPDFに反映されません。先に保存してください。")
+    # staff_filterは画面カレンダー専用。帳票は従来どおり保存済み全職員データから作る。
+    shift_snapshot = _build_shift_report_snapshot(shift_df, int(shift_year), int(shift_month))
+    report_signature = _shift_report_signature(shift_snapshot, month_status, limits_df)
 
     if REPORTLAB_AVAILABLE:
         st.markdown("#### 月間シフトカレンダーPDF出力")
@@ -4490,12 +4685,14 @@ def page_shift_manager():
 
         if pdf_target_mode == "全員" or selected_pdf_staff:
             try:
-                calendar_pdf_bytes = make_shift_calendar_pdf(
+                calendar_pdf_bytes = _cached_shift_calendar_pdf(
                     int(shift_year),
                     int(shift_month),
-                    shift_df,
-                    get_active_staff(),
-                    selected_staff_names=selected_pdf_staff if pdf_target_mode == "職員を選択" else None,
+                    shift_snapshot["base_hash"],
+                    SHIFT_CALENDAR_PDF_CACHE_VERSION,
+                    _shift_rows=shift_snapshot["month_rows"],
+                    staff_list=tuple(get_active_staff()),
+                    selected_staff_names=tuple(selected_pdf_staff if pdf_target_mode == "職員を選択" else []),
                     finalized=bool(month_status.get("is_confirmed")),
                 )
                 if pdf_target_mode == "全員":
@@ -4543,6 +4740,26 @@ def page_shift_manager():
     if month_status.get("is_confirmed") and not selected_kot_staff_keys:
         st.warning("職員が1名も選択されていません。CSVは生成・ダウンロードできません。")
 
+    selected_kot_staff_names = [kot_staff_labels[key] for key in selected_kot_staff_keys]
+    missing_codes = get_missing_staff_code_names(selected_kot_staff_names)
+    kot_preview_df = pd.DataFrame()
+    kot_error_df = pd.DataFrame()
+    kot_csv_bytes = None
+    kot_generation_error = None
+    try:
+        kot_report_signature = _king_of_time_report_signature(
+            shift_snapshot["base_hash"], shift_snapshot["kot_detail_hash"]
+        )
+        kot_preview_df, kot_error_df, kot_csv_bytes = _cached_king_of_time_clock_export(
+            int(shift_year),
+            int(shift_month),
+            tuple(selected_kot_staff_keys),
+            kot_report_signature,
+            KING_OF_TIME_CACHE_VERSION,
+        )
+    except Exception as e:
+        kot_generation_error = e
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
@@ -4562,14 +4779,18 @@ def page_shift_manager():
     with c2:
         if REPORTLAB_AVAILABLE:
             try:
-                pdf_bytes = make_staff_shift_pdf(int(shift_year), int(shift_month))
+                pdf_bytes = _cached_staff_shift_pdf(
+                    int(shift_year), int(shift_month), report_signature, STAFF_SHIFT_PDF_CACHE_VERSION
+                )
                 st.download_button("勤務表PDF", data=pdf_bytes, file_name=f"hidamari_shift_{int(shift_year)}_{int(shift_month):02d}.pdf", mime="application/pdf", use_container_width=True)
             except Exception as e:
                 st.error(f"シフトPDFを作成できませんでした：{e}")
     with c3:
         if OPENPYXL_AVAILABLE:
             try:
-                excel_bytes = make_staff_shift_excel(int(shift_year), int(shift_month))
+                excel_bytes = _cached_staff_shift_excel(
+                    int(shift_year), int(shift_month), report_signature, STAFF_SHIFT_EXCEL_CACHE_VERSION
+                )
                 st.download_button(
                     "勤務表Excel",
                     data=excel_bytes,
@@ -4580,14 +4801,9 @@ def page_shift_manager():
             except Exception as e:
                 st.error(f"シフトExcelを作成できませんでした：{e}")
     with c4:
-        selected_kot_staff_names = [kot_staff_labels[key] for key in selected_kot_staff_keys]
-        missing_codes = get_missing_staff_code_names(selected_kot_staff_names)
         if missing_codes:
             st.warning("KING OF TIME従業員コード未登録：" + "、".join(missing_codes[:8]) + ("..." if len(missing_codes) > 8 else ""))
-        try:
-            kot_preview_df, kot_error_df, kot_csv_bytes = build_king_of_time_clock_export(
-                int(shift_year), int(shift_month), selected_staff_keys=selected_kot_staff_keys
-            )
+        if kot_generation_error is None:
             if not month_status.get("is_confirmed"):
                 st.warning("KING OF TIME打刻CSVは、月間シフト確定後にダウンロードできます。")
             elif not selected_kot_staff_keys:
@@ -4602,13 +4818,10 @@ def page_shift_manager():
                     mime="text/csv",
                     use_container_width=True,
                 )
-        except Exception as e:
-            st.error(f"KING OF TIME用CSVを作成できませんでした：{e}")
+        else:
+            st.error(f"KING OF TIME用CSVを作成できませんでした：{kot_generation_error}")
 
-    try:
-        kot_preview_df, kot_error_df, _ = build_king_of_time_clock_export(
-            int(shift_year), int(shift_month), selected_staff_keys=selected_kot_staff_keys
-        )
+    if kot_generation_error is None:
         st.markdown("#### KING OF TIME打刻CSVプレビュー")
         if kot_preview_df is None or kot_preview_df.empty:
             st.info("打刻CSVに出力する日勤・夜勤シフトはありません。")
@@ -4626,8 +4839,8 @@ def page_shift_manager():
         if kot_error_df is not None and not kot_error_df.empty:
             st.markdown("#### KING OF TIME打刻CSVエラー一覧")
             st.dataframe(kot_error_df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"KING OF TIME打刻CSVプレビューを作成できませんでした：{e}")
+    else:
+        st.error(f"KING OF TIME打刻CSVプレビューを作成できませんでした：{kot_generation_error}")
 
     st.markdown("### 過去シフト検索・更新・削除")
     c1, c2, c3 = st.columns(3)
@@ -4694,6 +4907,8 @@ def page_shift_manager():
         st.info("この月の予定はありません。")
         return
 
+    event_counts_by_date = get_staff_event_counts_month(int(shift_year), int(shift_month))
+
     options = {}
     for _, ev in events_df.iterrows():
         current_staff = ev["staff_name"] if ev.get("staff_name") else "未担当"
@@ -4710,7 +4925,11 @@ def page_shift_manager():
         selected_event_id = options[selected_event_label]
         event_row = events_df[events_df["id"] == selected_event_id].iloc[0]
 
-        candidates = get_shift_candidates_for_event(event_row, shift_df)
+        candidates = _get_shift_candidates_for_event(
+            event_row,
+            shift_df,
+            event_counts_by_date.get(str(event_row["event_date"]), {}),
+        )
         if candidates.empty:
             st.warning("勤務表から担当候補が見つかりません。")
         else:
@@ -4740,7 +4959,7 @@ def page_shift_manager():
                     st.rerun()
 
     st.markdown("#### 未担当予定の一括AI割当")
-    preview_df = build_event_assignment_preview(events_df, shift_df, only_unassigned=True)
+    preview_df = _build_event_assignment_preview(events_df, shift_df, event_counts_by_date, only_unassigned=True)
     if preview_df.empty:
         st.info("未担当予定はありません。")
     else:
