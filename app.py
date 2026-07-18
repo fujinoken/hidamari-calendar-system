@@ -23,6 +23,7 @@ import pandas as pd
 import streamlit as st
 
 import report_service
+from king_of_time_auto_schedule import build_auto_schedule_export
 
 from config import (
     AI_SHIFT_RULE_VERSION,
@@ -5088,6 +5089,205 @@ def current_login_user_for_shift():
             pass
     return "system"
 
+
+def get_kot_auto_schedule_patterns():
+    df = fetch_df("""
+        SELECT shift_kind, pattern_code, pattern_name, day_type_code,
+               day_type_name, leave_name, is_active
+        FROM kot_auto_schedule_patterns
+        ORDER BY shift_kind
+    """)
+    result = {}
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            result[str(row["shift_kind"])] = {
+                "pattern_code": str(row.get("pattern_code") or ""),
+                "pattern_name": str(row.get("pattern_name") or ""),
+                "day_type_code": str(row.get("day_type_code") or "1"),
+                "day_type_name": str(row.get("day_type_name") or "平日"),
+                "leave_name": str(row.get("leave_name") or ""),
+                "is_active": int(row.get("is_active") or 0),
+            }
+    return result
+
+
+def get_kot_auto_schedule_settings():
+    df = fetch_df("SELECT setting_key, setting_value FROM kot_auto_schedule_settings ORDER BY setting_key")
+    if df is None or df.empty:
+        return {}
+    return {str(row["setting_key"]): str(row.get("setting_value") or "") for _, row in df.iterrows()}
+
+
+def save_kot_auto_schedule_settings(pattern_values, setting_values):
+    for shift_kind, values in pattern_values.items():
+        execute("""
+            UPDATE kot_auto_schedule_patterns
+            SET pattern_code=?, pattern_name=?, day_type_code=?, day_type_name=?,
+                leave_name=?, is_active=1, updated_at=?
+            WHERE shift_kind=?
+        """, (
+            values["pattern_code"].strip(), values["pattern_name"].strip(),
+            values["day_type_code"], values["day_type_name"],
+            values.get("leave_name", "").strip(), now_text(), shift_kind,
+        ))
+    for key, value in setting_values.items():
+        execute("""
+            UPDATE kot_auto_schedule_settings SET setting_value=?, updated_at=?
+            WHERE setting_key=?
+        """, (str(value), now_text(), key))
+
+
+def page_kot_auto_schedule():
+    st.subheader("KING OF TIME 自動スケジュールCSV")
+    st.caption("確定済みの月間シフトから、従業員別自動スケジュールデータCSVを作成します。")
+    st.warning(
+        "このCSVは対象月だけの日別シフトを登録するものではありません。"
+        "KING OF TIMEの従業員別自動スケジュール（第1～第6週の固定ルール）を更新し、"
+        "今後の自動割り当てに利用されます。"
+    )
+
+    today = today_jst()
+    c1, c2 = st.columns(2)
+    with c1:
+        target_year = st.number_input("対象年", min_value=2000, max_value=2099, value=int(today.year), step=1)
+    with c2:
+        target_month = st.selectbox("対象月", list(range(1, 13)), index=int(today.month) - 1)
+
+    shift_df = get_staff_shifts_month(int(target_year), int(target_month))
+    month_staff_names = set()
+    if shift_df is not None and not shift_df.empty:
+        month_staff_names = {
+            normalize_staff_name(value)
+            for value in shift_df["staff_name"].dropna().astype(str).tolist()
+        }
+    staff_df = fetch_df("""
+        SELECT id, staff_name, staff_code, is_active
+        FROM staff ORDER BY is_active DESC, staff_name
+    """)
+    staff_records = []
+    staff_labels = {}
+    if staff_df is not None and not staff_df.empty:
+        for _, row in staff_df.iterrows():
+            record = {
+                "id": int(row["id"]),
+                "staff_name": normalize_staff_name(row.get("staff_name", "")),
+                "staff_code": row.get("staff_code"),
+            }
+            if month_staff_names:
+                if record["staff_name"] not in month_staff_names:
+                    continue
+            elif int(row.get("is_active") or 0) != 1:
+                continue
+            staff_records.append(record)
+            staff_labels[record["id"]] = record["staff_name"]
+    all_staff_ids = list(staff_labels)
+    selected_staff_ids = st.multiselect(
+        "対象職員（複数選択）", all_staff_ids, default=all_staff_ids,
+        format_func=lambda staff_id: staff_labels.get(staff_id, str(staff_id)),
+    )
+    holiday_mode = st.radio(
+        "祝日の曜日番号",
+        ["祝日は「8：祝」として出力", "祝日も通常の曜日番号で出力"],
+        horizontal=True,
+    )
+
+    patterns = get_kot_auto_schedule_patterns()
+    settings = get_kot_auto_schedule_settings()
+    with st.expander("勤務パターン・休日設定", expanded=False):
+        st.caption("パターンコードはKING OF TIME側の設定と同じ3～10文字の半角英数字を入力してください。")
+        with st.form("kot_auto_schedule_settings_form"):
+            pattern_values = {}
+            for shift_kind in ("日勤", "夜勤", "管"):
+                current = patterns.get(shift_kind, {})
+                st.markdown(f"**{shift_kind}**")
+                p1, p2 = st.columns(2)
+                with p1:
+                    pattern_code = st.text_input(
+                        f"{shift_kind} パターンコード", value=current.get("pattern_code", ""),
+                        key=f"kot_auto_pattern_code_{shift_kind}",
+                    )
+                with p2:
+                    pattern_name = st.text_input(
+                        f"{shift_kind} パターン名", value=current.get("pattern_name", ""),
+                        key=f"kot_auto_pattern_name_{shift_kind}",
+                    )
+                pattern_values[shift_kind] = {
+                    "pattern_code": pattern_code, "pattern_name": pattern_name,
+                    "day_type_code": "1", "day_type_name": "平日", "leave_name": "",
+                }
+
+            day_type_options = {"1": "平日", "2": "法定休日", "3": "法定外休日"}
+            s1, s2 = st.columns(2)
+            with s1:
+                rest_code = st.selectbox(
+                    "通常の休みの勤務日種別", list(day_type_options),
+                    index=list(day_type_options).index(settings.get("rest_day_type_code", "3")),
+                    format_func=lambda value: f"{value}：{day_type_options[value]}",
+                )
+                rest_leave = st.text_input("通常の休みの休暇区分名", value=settings.get("rest_leave_name", "公休"))
+                paid_leave = st.text_input("有休の休暇区分名", value=settings.get("paid_leave_name", "有休"))
+            with s2:
+                paid_code = st.selectbox(
+                    "有休日の勤務日種別", list(day_type_options),
+                    index=list(day_type_options).index(settings.get("paid_day_type_code", "1")),
+                    format_func=lambda value: f"{value}：{day_type_options[value]}",
+                )
+                statutory = st.selectbox(
+                    "法定休日として扱う曜日", ["", "1", "2", "3", "4", "5", "6", "7"],
+                    index=["", "1", "2", "3", "4", "5", "6", "7"].index(settings.get("statutory_weekday", "")),
+                    format_func=lambda value: "指定なし" if not value else f"{value}：{['日','月','火','水','木','金','土'][int(value)-1]}",
+                )
+                holiday_code = st.selectbox(
+                    "祝日の勤務日種別", list(day_type_options),
+                    index=list(day_type_options).index(settings.get("holiday_day_type_code", "1")),
+                    format_func=lambda value: f"{value}：{day_type_options[value]}",
+                )
+            save_settings = st.form_submit_button("設定を保存")
+        if save_settings:
+            setting_values = {
+                "rest_day_type_code": rest_code, "rest_day_type_name": day_type_options[rest_code],
+                "rest_leave_name": rest_leave, "paid_day_type_code": paid_code,
+                "paid_day_type_name": day_type_options[paid_code], "paid_leave_name": paid_leave,
+                "statutory_weekday": statutory, "holiday_day_type_code": holiday_code,
+            }
+            save_kot_auto_schedule_settings(pattern_values, setting_values)
+            st.success("勤務パターン・休日設定を保存しました。")
+            st.rerun()
+
+    preview_df, error_df, warning_df, output_bytes = build_auto_schedule_export(
+        int(target_year), int(target_month), shift_df, staff_records, selected_staff_ids,
+        patterns, settings,
+        is_confirmed=shift_month_is_confirmed(int(target_year), int(target_month)),
+        holiday_as_eight=holiday_mode.startswith("祝日は"),
+    )
+    if not selected_staff_ids:
+        st.warning("職員が1名も選択されていません。CSVは生成・ダウンロードできません。")
+    st.markdown("### 出力内容のプレビュー")
+    if preview_df.empty:
+        st.info("出力予定データはありません。")
+    else:
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+    if not error_df.empty:
+        st.markdown("### 重大エラー")
+        st.error("重大エラーがあるためCSVをダウンロードできません。エラーのある職員・日付は出力対象から除外されます。")
+        st.dataframe(error_df, use_container_width=True, hide_index=True)
+    if not warning_df.empty:
+        st.markdown("### 警告")
+        st.warning("警告対象のシフトはCSVへ出力されません。")
+        st.dataframe(warning_df, use_container_width=True, hide_index=True)
+    confirmed_rule_import = st.checkbox(
+        "対象月限定の登録ではなく、KING OF TIMEの自動スケジュールルールを更新するCSVであることを確認しました",
+        value=False,
+    )
+    if output_bytes is not None and confirmed_rule_import:
+        st.download_button(
+            "CSVをダウンロード", data=output_bytes,
+            file_name=f"king_of_time_auto_schedule_{int(target_year)}_{int(target_month):02d}.csv",
+            mime="text/csv", use_container_width=True,
+        )
+    elif output_bytes is not None:
+        st.info("上の確認欄をチェックするとCSVをダウンロードできます。")
+
 def page_storage_check():
     st.subheader("保存状態チェック")
     st.caption("PostgreSQL・Supabase Storage・DB上のファイル紐づけを確認します。")
@@ -5366,6 +5566,7 @@ def main():
             "写真メモ一覧",
             "Excel・書類ファイル一覧",
             "シフト管理・AI割当",
+            "KING OF TIME 自動スケジュールCSV",
             "保存状態チェック",
             "予定カテゴリ設定",
             "利用者マスタ",
@@ -5391,6 +5592,8 @@ def main():
         page_attached_files()
     elif menu == "シフト管理・AI割当":
         page_shift_manager()
+    elif menu == "KING OF TIME 自動スケジュールCSV":
+        page_kot_auto_schedule()
     elif menu == "保存状態チェック":
         page_storage_check()
     elif menu == "予定カテゴリ設定":
