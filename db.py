@@ -222,6 +222,54 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS kot_auto_schedule_patterns (
+        id SERIAL PRIMARY KEY,
+        shift_kind TEXT NOT NULL UNIQUE,
+        pattern_code TEXT,
+        pattern_name TEXT,
+        day_type_code TEXT DEFAULT '1',
+        day_type_name TEXT DEFAULT '平日',
+        leave_name TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS kot_auto_schedule_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    for shift_kind in ("日勤", "夜勤", "管"):
+        cur.execute("""
+            INSERT INTO kot_auto_schedule_patterns
+            (shift_kind, pattern_code, pattern_name, day_type_code, day_type_name, leave_name, is_active, created_at, updated_at)
+            VALUES (%s, '', '', '1', '平日', '', 1, %s, %s)
+            ON CONFLICT (shift_kind) DO NOTHING
+        """, (shift_kind, now_text(), now_text()))
+
+    default_kot_settings = {
+        "rest_day_type_code": "3",
+        "rest_day_type_name": "法定外休日",
+        "rest_leave_name": "公休",
+        "paid_day_type_code": "1",
+        "paid_day_type_name": "平日",
+        "paid_leave_name": "有休",
+        "statutory_weekday": "",
+        "holiday_day_type_code": "1",
+    }
+    for setting_key, setting_value in default_kot_settings.items():
+        cur.execute("""
+            INSERT INTO kot_auto_schedule_settings (setting_key, setting_value, updated_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (setting_key) DO NOTHING
+        """, (setting_key, setting_value, now_text()))
+
     # よく使う検索用インデックス。既存DBにも安全に追加できる。
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event_date ON events(event_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date, start_time)")
@@ -237,6 +285,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shifts_date_kind ON staff_shifts(shift_date, shift_kind)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_shift_month_status_ym ON shift_month_status(shift_year, shift_month)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_staff_shift_limits_staff ON staff_shift_limits(staff_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_kot_auto_patterns_active ON kot_auto_schedule_patterns(is_active, shift_kind)")
 
     conn.commit()
     cur.close()
