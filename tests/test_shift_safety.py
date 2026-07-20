@@ -3,6 +3,7 @@ import inspect
 import sys
 import types
 import unittest
+from datetime import date, datetime
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -249,6 +250,116 @@ class ShiftSafetyTests(unittest.TestCase):
 
         self.assertEqual(result.status, app.SHIFT_SAVE_DUPLICATE)
         execute.assert_not_called()
+
+
+class ShiftManagerUiHelperTests(unittest.TestCase):
+    def test_month_navigation_handles_year_boundaries(self):
+        self.assertEqual(app.calculate_shift_month(2026, 7, -1), (2026, 6))
+        self.assertEqual(app.calculate_shift_month(2026, 7, 1), (2026, 8))
+        self.assertEqual(app.calculate_shift_month(2026, 12, 1), (2027, 1))
+        self.assertEqual(app.calculate_shift_month(2026, 1, -1), (2025, 12))
+
+        state = {"shift_year": 2025, "shift_month": 3}
+        with (
+            patch.object(app.st, "session_state", state),
+            patch.object(app, "today_jst", return_value=date(2026, 7, 20)),
+        ):
+            app.move_shift_month(use_current=True)
+        self.assertEqual((state["shift_year"], state["shift_month"]), (2026, 7))
+
+    def test_month_move_clears_only_transient_state_and_keeps_month_save_times(self):
+        state = {
+            "shift_active_month": (2026, 7),
+            "selected_shift_date": "2026-07-10",
+            "ai_shift_draft": pd.DataFrame([{"value": 1}]),
+            "shift_matrix_editor_2026_7_全職員_0": {"edited_rows": {}},
+            "shift_staff_filter_2026_7": "田中",
+            "clear_month_shift_confirm_2026_7": True,
+            "king_of_time_selected_staff_2026_7": [1],
+            "shift_last_saved_at_2026_7": "2026年7月20日 21:35",
+            "shift_last_saved_at_2026_8": "2026年8月20日 20:00",
+            "unrelated": "keep",
+        }
+
+        app.clear_shift_month_transient_state(state, 2026, 7)
+
+        self.assertNotIn("selected_shift_date", state)
+        self.assertNotIn("ai_shift_draft", state)
+        self.assertFalse(any(key.startswith("shift_matrix_editor_2026_7_") for key in state))
+        self.assertNotIn("shift_staff_filter_2026_7", state)
+        self.assertNotIn("clear_month_shift_confirm_2026_7", state)
+        self.assertNotIn("king_of_time_selected_staff_2026_7", state)
+        self.assertEqual(state["shift_last_saved_at_2026_7"], "2026年7月20日 21:35")
+        self.assertEqual(state["shift_last_saved_at_2026_8"], "2026年8月20日 20:00")
+        self.assertEqual(state["unrelated"], "keep")
+        self.assertEqual(state["shift_editor_reset_counter"], 1)
+
+        state["selected_shift_date"] = "2026-07-11"
+        self.assertTrue(app.sync_shift_month_state(state, 2026, 8))
+        self.assertEqual(state["shift_active_month"], (2026, 8))
+        self.assertNotIn("selected_shift_date", state)
+        self.assertFalse(app.sync_shift_month_state(state, 2026, 8))
+
+    def test_status_display_distinguishes_draft_confirmed_and_lookup_failure(self):
+        self.assertEqual(app.shift_month_status_display(_status()), ("info", "📝", "作成中"))
+        self.assertEqual(
+            app.shift_month_status_display(_status(confirmed=True)),
+            ("success", "🔒", "確定済み"),
+        )
+        self.assertEqual(
+            app.shift_month_status_display(_status(error="db unavailable")),
+            ("error", "⚠️", "状態を確認できません"),
+        )
+
+        state = {"shift_last_saved_at_2026_7": "2026年7月20日 21:35"}
+        with (
+            patch.object(app.st, "session_state", state),
+            patch.object(app.st, "success", create=True) as success,
+            patch.object(app.st, "caption", create=True) as caption,
+        ):
+            app.render_shift_month_status_header(2026, 7, _status(confirmed=True))
+        header_text = success.call_args.args[0]
+        self.assertIn("対象年月：2026年7月", header_text)
+        self.assertIn("状態：確定済み", header_text)
+        self.assertIn("確定日時：2026-07-20", header_text)
+        caption.assert_called_once_with("最終保存：2026年7月20日 21:35")
+
+    def test_shift_legend_matches_editor_symbols_and_configured_shift_kinds(self):
+        legend = dict(app.SHIFT_LEGEND_ITEMS)
+        self.assertEqual(set(legend), set(app.SHIFT_EDITOR_OPTIONS) - {""})
+        self.assertEqual(legend["休"], "通常の休み")
+        self.assertEqual(legend["希"], "希望休")
+        self.assertEqual(legend["有"], "有給休暇")
+        for kind in ("日勤", "管", "夜勤", "夜勤明け", "休み", "希望休", "有休", "その他"):
+            self.assertIn(kind, app.SHIFT_KINDS)
+
+    def test_last_saved_time_updates_only_for_success_and_is_separated_by_month(self):
+        state = {}
+        saved_at = datetime(2026, 7, 20, 21, 35)
+        saved = app.ShiftSaveResult(app.SHIFT_SAVE_SAVED, count=1)
+        self.assertTrue(app.update_shift_last_saved_state(state, saved, 2026, 7, saved_at))
+        self.assertEqual(state["shift_last_saved_at_2026_7"], "2026年7月20日 21:35")
+
+        for status in (
+            app.SHIFT_SAVE_NO_CHANGE,
+            app.SHIFT_SAVE_DUPLICATE,
+            app.SHIFT_SAVE_BLOCKED,
+        ):
+            result = app.ShiftSaveResult(status)
+            self.assertFalse(
+                app.update_shift_last_saved_state(
+                    state, result, 2026, 7, datetime(2026, 7, 20, 22, 0)
+                )
+            )
+        self.assertEqual(state["shift_last_saved_at_2026_7"], "2026年7月20日 21:35")
+
+        self.assertTrue(
+            app.update_shift_last_saved_state(
+                state, saved, 2026, 8, datetime(2026, 8, 1, 9, 5)
+            )
+        )
+        self.assertEqual(state["shift_last_saved_at_2026_8"], "2026年8月1日 09:05")
+        self.assertEqual(state["shift_last_saved_at_2026_7"], "2026年7月20日 21:35")
 
 
 class _TransactionCursor:

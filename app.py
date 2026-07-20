@@ -144,6 +144,133 @@ SHIFT_SAVE_NO_CHANGE = "no_change"
 SHIFT_SAVE_DUPLICATE = "duplicate"
 SHIFT_SAVE_BLOCKED = "blocked"
 
+SHIFT_LEGEND_ITEMS = (
+    ("日", "日勤"),
+    ("管", "管理業務"),
+    ("夜", "夜勤"),
+    ("明", "夜勤明け"),
+    ("休", "通常の休み"),
+    ("希", "希望休"),
+    ("有", "有給休暇"),
+    ("他", "その他"),
+)
+
+
+def calculate_shift_month(year, month, offset):
+    """年月を月単位で移動し、年境界を越えた年月を返す。"""
+    month_index = int(year) * 12 + int(month) - 1 + int(offset)
+    return month_index // 12, month_index % 12 + 1
+
+
+def shift_last_saved_key(year, month):
+    return f"shift_last_saved_at_{int(year)}_{int(month)}"
+
+
+def update_shift_last_saved_state(state, result, year, month, saved_at=None):
+    """保存成功時だけ、対象年月の最終保存時刻をセッションへ記録する。"""
+    if not isinstance(result, ShiftSaveResult) or result.status != SHIFT_SAVE_SAVED:
+        return False
+    if saved_at is None:
+        saved_at = datetime.strptime(now_text(), "%Y-%m-%d %H:%M:%S")
+    elif isinstance(saved_at, str):
+        saved_at = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
+    state[shift_last_saved_key(year, month)] = (
+        f"{saved_at.year}年{saved_at.month}月{saved_at.day}日 {saved_at:%H:%M}"
+    )
+    return True
+
+
+def clear_shift_month_transient_state(state, year, month):
+    """月移動時に、表示中の月に属する未保存・選択途中の状態だけを破棄する。"""
+    year = int(year)
+    month = int(month)
+    exact_keys = {
+        "selected_shift_date",
+        "last_shift_day_save_message",
+        "shift_save_flash",
+        "ai_shift_draft",
+        "hope_date",
+        "hope_staff",
+        "hope_kind",
+        "hope_memo",
+        "basic_shift_date",
+        "day_staff_1",
+        "day_staff_2",
+        "night_staff",
+        "basic_shift_memo",
+        "single_shift_date",
+        "single_shift_staff",
+        "single_shift_kind",
+        "single_shift_start",
+        "single_shift_end",
+        "single_shift_next",
+        "single_shift_memo",
+    }
+    month_prefixes = (
+        f"shift_matrix_editor_{year}_{month}_",
+        f"shift_day_select_{year}{month:02d}",
+        f"shift_staff_filter_{year}_{month}",
+        f"shift_limit_editor_{year}_{month}",
+        f"clear_month_shift_confirm_{year}_{month}",
+        f"shift_calendar_pdf_target_mode_{year}_{month}",
+        f"shift_calendar_pdf_staff_{year}_{month}",
+        f"king_of_time_selected_staff_{year}_{month}",
+        f"event_assignment_select_{year}_{month}",
+    )
+    for key in list(state):
+        if key in exact_keys or any(str(key).startswith(prefix) for prefix in month_prefixes):
+            state.pop(key, None)
+    state["shift_editor_reset_counter"] = int(state.get("shift_editor_reset_counter", 0) or 0) + 1
+
+
+def sync_shift_month_state(state, year, month):
+    """年月入力欄を直接変更した場合も、前月の一時状態を持ち越さない。"""
+    current = (int(year), int(month))
+    previous = state.get("shift_active_month")
+    if previous and tuple(previous) != current:
+        clear_shift_month_transient_state(state, previous[0], previous[1])
+    state["shift_active_month"] = current
+    return bool(previous and tuple(previous) != current)
+
+
+def move_shift_month(offset=None, use_current=False):
+    """年月ボタン用コールバック。ウィジェット生成前に年月と月固有状態を更新する。"""
+    old_year = int(st.session_state.get("shift_year", today_jst().year))
+    old_month = int(st.session_state.get("shift_month", today_jst().month))
+    clear_shift_month_transient_state(st.session_state, old_year, old_month)
+    if use_current:
+        target = today_jst()
+        new_year, new_month = target.year, target.month
+    else:
+        new_year, new_month = calculate_shift_month(old_year, old_month, offset or 0)
+    st.session_state["shift_year"] = new_year
+    st.session_state["shift_month"] = new_month
+    st.session_state["shift_active_month"] = (new_year, new_month)
+
+
+def shift_month_status_display(status):
+    """状態ヘッダーで使う、色に依存しない表示情報を返す。"""
+    if status.get("status_error"):
+        return "error", "⚠️", "状態を確認できません"
+    if status.get("is_confirmed"):
+        return "success", "🔒", "確定済み"
+    return "info", "📝", "作成中"
+
+
+def render_shift_month_status_header(year, month, status):
+    style, icon, label = shift_month_status_display(status)
+    text = f"{icon} 対象年月：{int(year)}年{int(month)}月　｜　状態：{label}"
+    if status.get("is_confirmed") and status.get("confirmed_at"):
+        text += f"　｜　確定日時：{status['confirmed_at']}"
+    getattr(st, style)(text)
+    last_saved = st.session_state.get(shift_last_saved_key(year, month))
+    st.caption(f"最終保存：{last_saved}" if last_saved else "最終保存：この画面を開いてからの保存はありません")
+
+
+def render_shift_legend():
+    st.caption("勤務記号：" + "　".join(f"{symbol}＝{label}" for symbol, label in SHIFT_LEGEND_ITEMS))
+    st.caption("休＝勤務表上の通常の休み、希＝本人が希望した休み、有＝有給休暇です。")
+
 
 def show_shift_save_result(result, success_message=None):
     """保存結果を誤解のない日本語メッセージで表示する。"""
@@ -161,8 +288,10 @@ def show_shift_save_result(result, success_message=None):
         st.info(message or "変更はありませんでした。")
 
 
-def queue_shift_save_result(result):
+def queue_shift_save_result(result, year=None, month=None):
     if isinstance(result, ShiftSaveResult):
+        if year is not None and month is not None:
+            update_shift_last_saved_state(st.session_state, result, year, month)
         st.session_state["shift_save_flash"] = {
             "status": result.status,
             "count": result.count,
@@ -4711,6 +4840,7 @@ def _status_column(df):
 
 def render_shift_calendar(year, month, shift_df, read_index=None, staff_filter="全職員"):
     st.markdown("### 月間シフトカレンダー")
+    render_shift_legend()
     if read_index is None:
         read_index = build_shift_read_index(shift_df)
     first_weekday, last_day = calendar.monthrange(int(year), int(month))
@@ -4795,10 +4925,6 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None, r
     date_label = f"{selected_date.year}年{selected_date.month}月{selected_date.day}日（{get_weekday_label(selected_date)}）"
     st.markdown(f"#### {date_label} のシフト編集")
 
-    message = st.session_state.pop("last_shift_day_save_message", None)
-    if message:
-        st.success(message)
-
     if month_status and month_status.get("status_error"):
         st.error("確定状態を確認できないため、日別編集を停止しています。")
     elif month_status and month_status.get("is_confirmed"):
@@ -4831,10 +4957,13 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None, r
         return
 
     try:
-        result = save_day_shift_assignments(selected_date.strftime("%Y-%m-%d"), assignments)
+        with st.spinner("保存しています…"):
+            result = save_day_shift_assignments(selected_date.strftime("%Y-%m-%d"), assignments)
         st.session_state["shift_editor_reset_counter"] = int(st.session_state.get("shift_editor_reset_counter", 0) or 0) + 1
-        st.session_state["last_shift_day_save_message"] = result.message
-        st.rerun()
+        if result.status == SHIFT_SAVE_SAVED:
+            queue_shift_save_result(result, selected_date.year, selected_date.month)
+            st.rerun()
+        show_shift_save_result(result)
     except ShiftUpdateBlockedError as e:
         st.error(str(e))
     except Exception as e:
@@ -4843,6 +4972,7 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None, r
 
 def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_status=None, read_index=None):
     st.markdown("### 月間シフト表")
+    render_shift_legend()
     staff_names = get_active_staff()
     if staff_filter and staff_filter != "全職員":
         staff_names = [staff_filter]
@@ -4886,9 +5016,10 @@ def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_s
         return
     if st.button("月間シフト表の入力内容を保存", use_container_width=True, type="primary"):
         try:
-            result = save_shift_matrix_from_editor(int(year), int(month), edited_matrix)
+            with st.spinner("保存しています…"):
+                result = save_shift_matrix_from_editor(int(year), int(month), edited_matrix)
             if result.status == SHIFT_SAVE_SAVED:
-                queue_shift_save_result(result)
+                queue_shift_save_result(result, year, month)
                 st.rerun()
             show_shift_save_result(result)
         except ShiftUpdateBlockedError as e:
@@ -4905,17 +5036,24 @@ def page_shift_manager():
         shift_year = st.number_input("対象年", min_value=2020, max_value=2100, value=today.year, step=1, key="shift_year")
     with c2:
         shift_month = st.number_input("対象月", min_value=1, max_value=12, value=today.month, step=1, key="shift_month")
+    sync_shift_month_state(st.session_state, shift_year, shift_month)
     with c3:
         staff_filter = st.selectbox("表示する職員", ["全職員"] + get_active_staff(), key=f"shift_staff_filter_{int(shift_year)}_{int(shift_month)}")
 
+    nav_prev, nav_today, nav_next = st.columns(3)
+    with nav_prev:
+        st.button("← 前月", use_container_width=True, on_click=move_shift_month, args=(-1,))
+    with nav_today:
+        st.button("今月", use_container_width=True, on_click=move_shift_month, kwargs={"use_current": True})
+    with nav_next:
+        st.button("翌月 →", use_container_width=True, on_click=move_shift_month, args=(1,))
+    st.caption("保存していない入力内容は、月を移動すると失われます。")
+
     month_status = get_shift_month_status(int(shift_year), int(shift_month))
     month_read_only = shift_month_is_read_only(month_status)
+    render_shift_month_status_header(shift_year, shift_month, month_status)
     if month_status.get("status_error"):
-        st.error("この月の確定状態を確認できないため、勤務データの更新と確定操作を停止しています。")
-    elif month_status.get("is_confirmed"):
-        st.success(f"この月のシフトは確定済みです。確定日時：{month_status.get('confirmed_at', '')}")
-    else:
-        st.info("この月のシフトは作成中です。")
+        st.error("確定状態を確認できないため、勤務データの更新と確定操作を停止しています。")
     render_queued_shift_save_result()
 
     staff_options = [""] + get_active_staff()
@@ -4941,16 +5079,17 @@ def page_shift_manager():
                 hope_staff = st.selectbox("職員", staff_options, key="hope_staff", disabled=month_read_only)
             with c3:
                 hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind", disabled=month_read_only)
-            hope_memo = st.text_input("メモ", placeholder="本人希望、通院、家庭都合など", disabled=month_read_only)
+            hope_memo = st.text_input("メモ", placeholder="本人希望、通院、家庭都合など", key="hope_memo", disabled=month_read_only)
             submit_hope = st.form_submit_button("保存", disabled=month_read_only)
         if submit_hope:
             if not hope_staff:
                 st.error("職員を選択してください。")
             else:
                 try:
-                    result = save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
+                    with st.spinner("保存しています…"):
+                        result = save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
                     if result.status == SHIFT_SAVE_SAVED:
-                        queue_shift_save_result(result)
+                        queue_shift_save_result(result, hope_date.year, hope_date.month)
                         st.rerun()
                     show_shift_save_result(result)
                 except ShiftUpdateBlockedError as e:
@@ -4960,7 +5099,7 @@ def page_shift_manager():
 
     with st.expander("1日分の基本シフト入力"):
         with st.form("basic_shift_form", clear_on_submit=True):
-            shift_date = st.date_input("シフト日", value=today, disabled=month_read_only)
+            shift_date = st.date_input("シフト日", value=today, key="basic_shift_date", disabled=month_read_only)
             c1, c2, c3 = st.columns(3)
             with c1:
                 day_staff_1 = st.selectbox("日勤1", staff_options, key="day_staff_1", disabled=month_read_only)
@@ -4968,16 +5107,17 @@ def page_shift_manager():
                 day_staff_2 = st.selectbox("日勤2", staff_options, key="day_staff_2", disabled=month_read_only)
             with c3:
                 night_staff = st.selectbox("夜勤", staff_options, key="night_staff", disabled=month_read_only)
-            shift_memo = st.text_input("シフトメモ", disabled=month_read_only)
+            shift_memo = st.text_input("シフトメモ", key="basic_shift_memo", disabled=month_read_only)
             submit_basic = st.form_submit_button("この日の基本シフトを保存", disabled=month_read_only)
         if submit_basic:
             if not day_staff_1 and not day_staff_2 and not night_staff:
                 st.error("少なくとも1名を選択してください。")
             else:
                 try:
-                    result = save_basic_day_shift(shift_date.strftime("%Y-%m-%d"), day_staff_1, day_staff_2, night_staff, shift_memo)
+                    with st.spinner("保存しています…"):
+                        result = save_basic_day_shift(shift_date.strftime("%Y-%m-%d"), day_staff_1, day_staff_2, night_staff, shift_memo)
                     if result.status == SHIFT_SAVE_SAVED:
-                        queue_shift_save_result(result)
+                        queue_shift_save_result(result, shift_date.year, shift_date.month)
                         st.rerun()
                     show_shift_save_result(result)
                 except ShiftUpdateBlockedError as e:
@@ -4998,7 +5138,7 @@ def page_shift_manager():
                 s_start = st.text_input("開始", value=default_start, key="single_shift_start", disabled=month_read_only)
             with c4:
                 s_end = st.text_input("終了", value=default_end, key="single_shift_end", disabled=month_read_only)
-            s_next = st.checkbox("終了は翌日", value=False, disabled=month_read_only)
+            s_next = st.checkbox("終了は翌日", value=False, key="single_shift_next", disabled=month_read_only)
             s_memo = st.text_input("メモ", key="single_shift_memo", disabled=month_read_only)
             add_single = st.form_submit_button("個別シフトを追加", disabled=month_read_only)
         if add_single:
@@ -5006,9 +5146,10 @@ def page_shift_manager():
                 st.error("職員を選択してください。")
             else:
                 try:
-                    result = save_single_shift(s_date.strftime("%Y-%m-%d"), s_staff, s_kind, s_start, s_end, 1 if s_next else 0, s_memo)
+                    with st.spinner("保存しています…"):
+                        result = save_single_shift(s_date.strftime("%Y-%m-%d"), s_staff, s_kind, s_start, s_end, 1 if s_next else 0, s_memo)
                     if result.status == SHIFT_SAVE_SAVED:
-                        queue_shift_save_result(result)
+                        queue_shift_save_result(result, s_date.year, s_date.month)
                         st.rerun()
                     show_shift_save_result(result)
                 except ShiftUpdateBlockedError as e:
@@ -5025,8 +5166,9 @@ def page_shift_manager():
         )
         if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm or month_read_only):
             try:
-                result = clear_month_staff_shifts(int(shift_year), int(shift_month))
-                queue_shift_save_result(result)
+                with st.spinner("削除しています…"):
+                    result = clear_month_staff_shifts(int(shift_year), int(shift_month))
+                queue_shift_save_result(result, shift_year, shift_month)
                 st.rerun()
             except ShiftUpdateBlockedError as e:
                 st.error(str(e))
@@ -5083,10 +5225,11 @@ def page_shift_manager():
         with c_save:
             if st.button("確認したAIシフト案を保存する", use_container_width=True, disabled=month_read_only):
                 try:
-                    result = save_ai_shift_draft_rows(draft)
+                    with st.spinner("保存しています…"):
+                        result = save_ai_shift_draft_rows(draft)
                     if result.status == SHIFT_SAVE_SAVED:
                         st.session_state.pop("ai_shift_draft", None)
-                        queue_shift_save_result(result)
+                        queue_shift_save_result(result, shift_year, shift_month)
                         st.rerun()
                     show_shift_save_result(result)
                 except ShiftUpdateBlockedError as e:
@@ -5126,7 +5269,7 @@ def page_shift_manager():
     with c3:
         st.metric("上限超過", 0 if limit_checks.empty else len(limit_checks))
     with c4:
-        st.metric("状態", "確定" if month_status.get("is_confirmed") else "作成中")
+        st.metric("状態", shift_month_status_display(month_status)[2])
     if not matrix.empty:
         st.dataframe(matrix, use_container_width=True, hide_index=True)
     if shortage_ng.empty:
@@ -5150,6 +5293,9 @@ def page_shift_manager():
 
     st.markdown("### PDF/Excel/KING OF TIME CSV出力")
     st.caption("月間シフトカレンダーPDFは、保存済みの現在データから作成します。未保存の表編集はPDFに反映されません。先に保存してください。")
+    st.caption("勤務表PDF：印刷・掲示用　｜　勤務表Excel：編集・保管用")
+    st.caption("KING OF TIME打刻CSV：勤務実績ではなく、登録済みの予定時刻から打刻データを作成する既存機能です。")
+    st.caption("別メニュー「KING OF TIME 自動スケジュールCSV」：第1～第6週の固定勤務ルールをKING OF TIMEへ取り込むためのデータです。")
     # staff_filterは画面カレンダー専用。帳票は従来どおり保存済み全職員データから作る。
     shift_snapshot = shift_read_index["report_snapshot"]
     report_signature = _shift_report_signature(shift_snapshot, month_status, limits_df)
@@ -5283,12 +5429,13 @@ def page_shift_manager():
                 disabled=bool(month_status.get("status_error") or not confirmation_errors.empty),
             ):
                 try:
-                    result = confirm_shift_month_if_valid(
-                        int(shift_year), int(shift_month), confirmation_errors,
-                        current_login_user_for_shift(),
-                    )
+                    with st.spinner("確定しています…"):
+                        result = confirm_shift_month_if_valid(
+                            int(shift_year), int(shift_month), confirmation_errors,
+                            current_login_user_for_shift(),
+                        )
                     if result.status == SHIFT_SAVE_SAVED:
-                        queue_shift_save_result(result)
+                        queue_shift_save_result(result, shift_year, shift_month)
                         st.rerun()
                     show_shift_save_result(result)
                 except ShiftUpdateBlockedError as e:
@@ -5298,8 +5445,9 @@ def page_shift_manager():
         else:
             if st.button("確定を解除する", use_container_width=True):
                 try:
-                    result = set_shift_month_status(int(shift_year), int(shift_month), False, current_login_user_for_shift())
-                    queue_shift_save_result(result)
+                    with st.spinner("確定を解除しています…"):
+                        result = set_shift_month_status(int(shift_year), int(shift_month), False, current_login_user_for_shift())
+                    queue_shift_save_result(result, shift_year, shift_month)
                     st.rerun()
                 except Exception as e:
                     st.error(f"確定を解除できませんでした：{e}")
@@ -5421,12 +5569,13 @@ def page_shift_manager():
                 st.error("職員を選択してください。")
             else:
                 try:
-                    result = update_staff_shift(
-                        int(selected_shift_id), u_date.strftime("%Y-%m-%d"), u_staff, u_kind,
-                        u_start, u_end, 1 if u_next else 0, u_memo,
-                    )
+                    with st.spinner("保存しています…"):
+                        result = update_staff_shift(
+                            int(selected_shift_id), u_date.strftime("%Y-%m-%d"), u_staff, u_kind,
+                            u_start, u_end, 1 if u_next else 0, u_memo,
+                        )
                     if result.status == SHIFT_SAVE_SAVED:
-                        queue_shift_save_result(result)
+                        queue_shift_save_result(result, u_date.year, u_date.month)
                         st.rerun()
                     show_shift_save_result(result)
                 except ShiftUpdateBlockedError as e:
@@ -5435,9 +5584,12 @@ def page_shift_manager():
                     st.error(f"シフトを更新できませんでした：{e}")
         if delete_shift:
             try:
-                result = delete_staff_shift(int(selected_shift_id))
+                with st.spinner("削除しています…"):
+                    result = delete_staff_shift(int(selected_shift_id))
                 if result.status == SHIFT_SAVE_SAVED:
-                    queue_shift_save_result(result)
+                    queue_shift_save_result(
+                        result, target_date_for_status.year, target_date_for_status.month
+                    )
                     st.rerun()
                 show_shift_save_result(result)
             except ShiftUpdateBlockedError as e:
