@@ -22,7 +22,7 @@ CATEGORY_MARK = {
 }
 
 SHIFT_KINDS = ["日勤", "管", "夜勤", "夜勤明け", "休み", "希望休", "有休", "その他"]
-SHIFT_EDITOR_OPTIONS = ["", "日", "管", "夜", "明", "希", "有", "他"]
+SHIFT_EDITOR_OPTIONS = ["", "日", "管", "夜", "明", "休", "希", "有", "他"]
 
 PDF_FONT_GOTHIC = "HeiseiKakuGo-W5"
 PDF_FONT_MINCHO = "HeiseiMin-W3"

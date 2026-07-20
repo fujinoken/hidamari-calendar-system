@@ -395,6 +395,44 @@ def execute_many(query, params_list):
         conn.close()
 
 
+def execute_transaction(operations):
+    """複数の更新SQLを同一トランザクションで実行する。
+
+    operations は (query, params) または
+    (query, params_or_params_list, use_executemany) の配列を受け取る。
+    """
+    if not operations:
+        return 0
+    conn = get_conn()
+    cur = conn.cursor()
+    executed = 0
+    try:
+        for operation in operations:
+            if len(operation) == 2:
+                query, params = operation
+                use_executemany = False
+            else:
+                query, params, use_executemany = operation
+            q = to_pg_query(query).strip()
+            if use_executemany:
+                normalized_rows = [normalize_query_params(row) for row in params]
+                if normalized_rows:
+                    cur.executemany(q, normalized_rows)
+                    executed += len(normalized_rows)
+            else:
+                cur.execute(q, normalize_query_params(params))
+                executed += 1
+        conn.commit()
+        clear_read_cache()
+        return executed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def init_db_once():
     """
     init_dbはALTER TABLEや初期投入を含むため、毎回実行せずセッション内で1回だけ実行する。
