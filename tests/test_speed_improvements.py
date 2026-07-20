@@ -171,7 +171,7 @@ class SpeedImprovementTests(unittest.TestCase):
             "種類": "休み希望と勤務の重複",
             "日付": "2026-07-01",
             "職員名": "藤野",
-            "内容": "休み・希望休・有休・その他と、日勤・夜勤・明けが同日に入っています。",
+            "内容": "休み・希望休・有休と、実勤務・夜勤・明けが同日に入っています。",
         }])
         pd.testing.assert_frame_equal(result, expected)
 
