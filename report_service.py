@@ -1266,29 +1266,51 @@ def make_staff_shift_excel(
     ws.cell(3, 2).value = "日=日勤 8:30〜17:30 / 管=管理業務 8:30〜17:30 / 夜=夜勤 16:30〜翌9:30 / 明=夜勤明け / 希=希望休 / 有=有休 / 他=その他 / 休みは日別セルには表示しません"
     ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=max(8, len(matrix.columns) if not matrix.empty else 8))
 
-    start_row = 5
+    date_header_row = 5
+    weekday_header_row = date_header_row + 1
+    data_start_row = weekday_header_row + 1
+    weekday_labels = "月火水木金土日"
     if matrix is None or matrix.empty:
-        ws.cell(start_row, 1).value = "この月のシフトはまだ登録されていません。"
+        ws.cell(date_header_row, 1).value = "この月のシフトはまだ登録されていません。"
     else:
         columns = list(matrix.columns)
         for col_idx, col_name in enumerate(columns, start=1):
-            cell = ws.cell(start_row, col_idx)
-            cell.value = col_name
-            cell.font = Font(bold=True)
-            cell.alignment = center
-            cell.border = border
-            cell.fill = header_fill
+            date_cell = ws.cell(date_header_row, col_idx)
+            weekday_cell = ws.cell(weekday_header_row, col_idx)
+            date_cell.value = col_name
+            for cell in (date_cell, weekday_cell):
+                cell.font = Font(bold=True)
+                cell.alignment = center
+                cell.border = border
+                cell.fill = header_fill
             if str(col_name).isdigit():
                 d = int(col_name)
                 weekday = date(year, month, d).weekday()  # 月=0 日=6
+                weekday_cell.value = weekday_labels[weekday]
                 if weekday == 6:
-                    cell.fill = weekend_sun_fill
+                    date_cell.fill = weekend_sun_fill
+                    weekday_cell.fill = weekend_sun_fill
                 elif weekday == 5:
-                    cell.fill = weekend_sat_fill
+                    date_cell.fill = weekend_sat_fill
+                    weekday_cell.fill = weekend_sat_fill
             elif col_name in ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]:
-                cell.fill = summary_fill
+                date_cell.fill = summary_fill
+                weekday_cell.fill = summary_fill
+                ws.merge_cells(
+                    start_row=date_header_row,
+                    start_column=col_idx,
+                    end_row=weekday_header_row,
+                    end_column=col_idx,
+                )
+            else:
+                ws.merge_cells(
+                    start_row=date_header_row,
+                    start_column=col_idx,
+                    end_row=weekday_header_row,
+                    end_column=col_idx,
+                )
 
-        for row_idx, (_, row) in enumerate(matrix.iterrows(), start=start_row + 1):
+        for row_idx, (_, row) in enumerate(matrix.iterrows(), start=data_start_row):
             for col_idx, col_name in enumerate(columns, start=1):
                 value = row.get(col_name, "")
                 if pd.isna(value):
@@ -1307,8 +1329,13 @@ def make_staff_shift_excel(
                 elif col_name in ["日勤", "管", "夜勤", "明", "休み", "希望休", "有休", "他", "合計", "最大連勤"]:
                     cell.fill = PatternFill("solid", fgColor="F2F8EE")
 
-        ws.freeze_panes = "B6"
-        ws.auto_filter.ref = f"A{start_row}:{get_column_letter(len(columns))}{start_row + len(matrix)}"
+        ws.row_dimensions[date_header_row].height = 20
+        ws.row_dimensions[weekday_header_row].height = 20
+        ws.freeze_panes = f"B{data_start_row}"
+        ws.auto_filter.ref = (
+            f"A{date_header_row}:"
+            f"{get_column_letter(len(columns))}{data_start_row + len(matrix) - 1}"
+        )
 
         # 列幅調整
         for col_idx, col_name in enumerate(columns, start=1):
