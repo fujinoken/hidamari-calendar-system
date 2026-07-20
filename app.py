@@ -16,6 +16,7 @@ import calendar
 import re
 import hashlib
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from db import (
     DB_INTEGRITY_ERROR,
     execute,
     execute_many,
+    execute_transaction,
     fetch_df,
     init_db_once,
     now_text,
@@ -123,6 +125,57 @@ DAY_LIMIT_SHIFT_KINDS = ["日勤"]
 NIGHT_LIMIT_SHIFT_KINDS = ["夜勤"]
 MANAGEMENT_SHIFT_KINDS = ["管", "管理業務"]
 WORKDAY_SHIFT_KINDS = ["日勤", "管", "管理業務", "夜勤", "夜勤明け"]
+
+
+@dataclass(frozen=True)
+class ShiftSaveResult:
+    status: str
+    count: int = 0
+    message: str = ""
+    changed_cells: int = 0
+
+
+class ShiftUpdateBlockedError(RuntimeError):
+    """確定済み、または確定状態不明の月に対する更新拒否。"""
+
+
+SHIFT_SAVE_SAVED = "saved"
+SHIFT_SAVE_NO_CHANGE = "no_change"
+SHIFT_SAVE_DUPLICATE = "duplicate"
+SHIFT_SAVE_BLOCKED = "blocked"
+
+
+def show_shift_save_result(result, success_message=None):
+    """保存結果を誤解のない日本語メッセージで表示する。"""
+    if not isinstance(result, ShiftSaveResult):
+        st.success(success_message or "勤務データを保存しました。")
+        return
+    message = success_message or result.message
+    if result.status == SHIFT_SAVE_SAVED:
+        st.success(message or "勤務データを保存しました。")
+    elif result.status == SHIFT_SAVE_DUPLICATE:
+        st.warning(message or "重複しているため保存しませんでした。")
+    elif result.status == SHIFT_SAVE_BLOCKED:
+        st.error(message or "重大な問題があるため処理できませんでした。")
+    else:
+        st.info(message or "変更はありませんでした。")
+
+
+def queue_shift_save_result(result):
+    if isinstance(result, ShiftSaveResult):
+        st.session_state["shift_save_flash"] = {
+            "status": result.status,
+            "count": result.count,
+            "message": result.message,
+            "changed_cells": result.changed_cells,
+        }
+
+
+def render_queued_shift_save_result():
+    value = st.session_state.pop("shift_save_flash", None)
+    if not value:
+        return
+    show_shift_save_result(ShiftSaveResult(**value))
 
 # 帳票生成ロジックやレイアウトを変更した場合は、対応する値を更新する。
 STAFF_SHIFT_PDF_CACHE_VERSION = "1"
@@ -257,10 +310,8 @@ def get_staff_key_map(active_only=True):
     return mapping
 
 
-def get_king_of_time_export_staff(year, month):
-    """対象月の確定済みシフトに存在する職員を staff.id と表示名で返す。"""
-    if not shift_month_is_confirmed(year, month):
-        return []
+def _get_king_of_time_month_staff(year, month):
+    """対象月のシフトに存在する職員を staff.id と表示名で返す。"""
     shift_df = get_staff_shifts_month(year, month)
     if shift_df is None or shift_df.empty:
         return []
@@ -275,6 +326,13 @@ def get_king_of_time_export_staff(year, month):
         seen.add(staff_id)
         result.append((staff_id, staff_name))
     return sorted(result, key=lambda item: item[1])
+
+
+def get_king_of_time_export_staff(year, month):
+    """対象月の確定済みシフトに存在する職員を返す。"""
+    if not shift_month_is_confirmed(year, month):
+        return []
+    return _get_king_of_time_month_staff(year, month)
 
 
 def get_missing_staff_code_names(staff_names):
@@ -2331,6 +2389,7 @@ def shift_kind_from_editor_label(label):
         "管": ["管"],
         "夜": ["夜勤"],
         "明": ["夜勤明け"],
+        "休": ["休み"],
         "希": ["希望休"],
         "有": ["有休"],
         "他": ["その他"],
@@ -2357,25 +2416,63 @@ def get_shift_month_status(year, month):
             LIMIT 1
         """, (int(year), int(month)))
         if df.empty:
-            return {"is_confirmed": 0, "confirmed_at": "", "confirmed_by": ""}
+            return {"is_confirmed": 0, "confirmed_at": "", "confirmed_by": "", "status_error": ""}
         r = df.iloc[0]
         return {
             "is_confirmed": int(r.get("is_confirmed", 0) or 0),
             "confirmed_at": str(r.get("confirmed_at") or ""),
             "confirmed_by": str(r.get("confirmed_by") or ""),
+            "status_error": "",
         }
-    except Exception:
-        return {"is_confirmed": 0, "confirmed_at": "", "confirmed_by": ""}
+    except Exception as e:
+        return {
+            "is_confirmed": 0,
+            "confirmed_at": "",
+            "confirmed_by": "",
+            "status_error": str(e) or "確定状態を取得できませんでした。",
+        }
+
+
+def ensure_shift_month_editable(year, month):
+    """対象月を更新できることを共通判定し、安全でない場合は拒否する。"""
+    year = int(year)
+    month = int(month)
+    status = get_shift_month_status(year, month)
+    if status.get("status_error"):
+        raise ShiftUpdateBlockedError(
+            f"{year}年{month}月の確定状態を確認できないため、勤務データを更新できません。"
+            "時間をおいて再度お試しください。"
+        )
+    if status.get("is_confirmed"):
+        raise ShiftUpdateBlockedError(
+            f"{year}年{month}月の勤務表は確定済みのため更新できません。"
+            "修正する場合は、先に確定を解除してください。"
+        )
+    return status
+
+
+def ensure_shift_date_editable(shift_date):
+    """日付から対象月を求め、共通の更新可否判定を行う。"""
+    try:
+        target = pd.to_datetime(str(shift_date), errors="raise").date()
+    except Exception as e:
+        raise ValueError(f"勤務日を読み取れません：{shift_date}") from e
+    ensure_shift_month_editable(target.year, target.month)
+    return target
+
+
+def shift_month_is_read_only(status):
+    return bool(status.get("is_confirmed") or status.get("status_error"))
 
 
 def set_shift_month_status(year, month, is_confirmed, confirmed_by=""):
     """指定月のシフト確定／未確定を保存する。"""
-    try:
-        execute("""
+    execute_transaction([
+        ("""
             DELETE FROM shift_month_status
             WHERE shift_year=? AND shift_month=?
-        """, (int(year), int(month)))
-        execute("""
+        """, (int(year), int(month))),
+        ("""
             INSERT INTO shift_month_status
             (shift_year, shift_month, is_confirmed, confirmed_at, confirmed_by, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2387,10 +2484,11 @@ def set_shift_month_status(year, month, is_confirmed, confirmed_by=""):
             confirmed_by or "",
             now_text(),
             now_text(),
-        ))
-        clear_shift_caches()
-    except Exception as e:
-        st.warning(f"シフト確定状態の保存に失敗しました：{e}")
+        )),
+    ])
+    clear_shift_caches()
+    message = "この月のシフトを確定しました。" if is_confirmed else "この月のシフト確定を解除しました。"
+    return ShiftSaveResult(SHIFT_SAVE_SAVED, count=1, message=message)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_staff_shift_limits():
@@ -2713,18 +2811,20 @@ def clear_month_staff_shifts(year, month):
     指定月のシフトを全削除する。
     職員別勤務回数上限は残し、月間シフト表だけを空にして再入力できるようにする。
     """
-    last_day = calendar.monthrange(int(year), int(month))[1]
-    start = f"{int(year)}-{int(month):02d}-01"
-    end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
+    year = int(year)
+    month = int(month)
+    ensure_shift_month_editable(year, month)
+    last_day = calendar.monthrange(year, month)[1]
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{last_day:02d}"
     execute("DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ?", (start, end))
-    set_shift_month_status(int(year), int(month), False, current_login_user_for_shift())
     clear_shift_caches()
     try:
         st.session_state.pop("ai_shift_draft", None)
         st.session_state["shift_editor_reset_counter"] = int(st.session_state.get("shift_editor_reset_counter", 0) or 0) + 1
     except Exception:
         pass
-    return True
+    return ShiftSaveResult(SHIFT_SAVE_SAVED, message="この月のシフトを全クリアしました。")
 
 
 def shift_month_is_confirmed(year, month):
@@ -2765,15 +2865,19 @@ def get_staff_shifts_month(year, month, include_prev_day=False):
 
 def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_time=None, next_day=0, memo=""):
     """1件のシフトを追加保存する。"""
+    ensure_shift_date_editable(shift_date)
     staff_name = normalize_staff_name(staff_name)
     if not staff_name or not shift_kind:
-        return None
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存する勤務情報がありません。")
     existing_df = fetch_staff_shifts_raw(shift_date, shift_date)
     if existing_df is not None and not existing_df.empty:
         new_key = shift_duplicate_key(shift_date, shift_kind, staff_name)
         for _, row in existing_df.iterrows():
             if shift_duplicate_key(row.get("shift_date"), row.get("shift_kind"), row.get("staff_name")) == new_key:
-                return None
+                return ShiftSaveResult(
+                    SHIFT_SAVE_DUPLICATE,
+                    message="同じ職員・日付・勤務区分が登録済みのため、重複保存しませんでした。",
+                )
     if start_time is None or end_time is None:
         start_time, end_time, default_next = default_shift_times(shift_kind)
         next_day = default_next
@@ -2793,7 +2897,7 @@ def save_single_shift(shift_date, staff_name, shift_kind, start_time=None, end_t
         now_text(),
     ))
     clear_shift_caches()
-    return shift_id
+    return ShiftSaveResult(SHIFT_SAVE_SAVED, count=1, message="勤務を保存しました。")
 
 
 def save_day_shift_assignments(shift_date, assignments, memo="日付カードから編集"):
@@ -2801,6 +2905,7 @@ def save_day_shift_assignments(shift_date, assignments, memo="日付カードか
     選択日の職員別シフトをまとめて保存する。
     空欄は削除扱いにし、既存の管理業務表記も同じ職員・同じ日付として置き換える。
     """
+    ensure_shift_date_editable(shift_date)
     shift_date = str(shift_date)
     assignments = assignments or {}
     staff_names = []
@@ -2811,9 +2916,10 @@ def save_day_shift_assignments(shift_date, assignments, memo="日付カードか
             seen_staff_names.add(normalized)
             staff_names.append(normalized)
     if not staff_names:
-        return 0
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存対象の職員がいません。")
 
     existing_day_df = fetch_staff_shifts_raw(shift_date, shift_date)
+    operations = []
     for staff_name in staff_names:
         aliases = {staff_name}
         if existing_day_df is not None and not existing_day_df.empty:
@@ -2821,10 +2927,10 @@ def save_day_shift_assignments(shift_date, assignments, memo="日付カードか
                 if normalize_staff_name(old_name) == staff_name:
                     aliases.add(old_name)
         for alias in aliases:
-            execute(
+            operations.append((
                 "DELETE FROM staff_shifts WHERE shift_date=? AND staff_name=?",
                 (shift_date, alias),
-            )
+            ))
 
     params = []
     for staff_name in staff_names:
@@ -2850,15 +2956,20 @@ def save_day_shift_assignments(shift_date, assignments, memo="日付カードか
             ))
 
     params = dedupe_shift_insert_params(params)
-    saved = 0
     if params:
-        saved = execute_many("""
+        operations.append(("""
             INSERT INTO staff_shifts
             (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, params)
+        """, params, True))
+    execute_transaction(operations)
     clear_shift_caches()
-    return saved
+    return ShiftSaveResult(
+        SHIFT_SAVE_SAVED,
+        count=len(params),
+        changed_cells=len(staff_names),
+        message=f"この日のシフトを保存しました。登録件数：{len(params)}件",
+    )
 
 
 def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo=""):
@@ -2866,7 +2977,7 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
     1日分の基本シフトを保存する。
     同日の既存日勤・夜勤は一度削除し、日勤2名・夜勤1名として登録する。
     """
-    execute("DELETE FROM staff_shifts WHERE shift_date=? AND shift_kind IN ('日勤', '夜勤')", (shift_date,))
+    ensure_shift_date_editable(shift_date)
     params = []
     for staff_name in [day_staff_1, day_staff_2]:
         staff_name = normalize_staff_name(staff_name)
@@ -2879,15 +2990,77 @@ def save_basic_day_shift(shift_date, day_staff_1, day_staff_2, night_staff, memo
         params.append((shift_date, night_staff, "夜勤", stime, etime, nd, memo.strip() or None, now_text(), now_text()))
     params = dedupe_shift_insert_params(params)
     if not params:
-        clear_shift_caches()
-        return 0
-    saved = execute_many("""
-        INSERT INTO staff_shifts
-        (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, params)
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存する基本シフトがありません。")
+    execute_transaction([
+        (
+            "DELETE FROM staff_shifts WHERE shift_date=? AND shift_kind IN ('日勤', '夜勤')",
+            (shift_date,),
+        ),
+        ("""
+            INSERT INTO staff_shifts
+            (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, params, True),
+    ])
     clear_shift_caches()
-    return saved
+    return ShiftSaveResult(
+        SHIFT_SAVE_SAVED,
+        count=len(params),
+        message=f"基本シフトを保存しました。登録件数：{len(params)}件",
+    )
+
+
+def update_staff_shift(
+    shift_id, shift_date, staff_name, shift_kind, start_time=None, end_time=None,
+    next_day=0, memo="",
+):
+    """過去シフト更新を確定状態の共通ガード経由で実行する。"""
+    current_df = fetch_df(f"SELECT {SHIFT_COLUMNS} FROM staff_shifts WHERE id=? LIMIT 1", (int(shift_id),))
+    if current_df is None or current_df.empty:
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="更新対象のシフトが見つかりません。")
+    current = current_df.iloc[0]
+    current_date = ensure_shift_date_editable(current.get("shift_date"))
+    new_date = ensure_shift_date_editable(shift_date)
+    # 月をまたいで移動する場合も、移動元・移動先の両方を検査済みとする。
+    _ = current_date, new_date
+
+    staff_name = normalize_staff_name(staff_name)
+    if not staff_name or not shift_kind:
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="職員または勤務区分が未入力です。")
+
+    duplicate_df = fetch_staff_shifts_raw(str(shift_date), str(shift_date))
+    if duplicate_df is not None and not duplicate_df.empty:
+        new_key = shift_duplicate_key(shift_date, shift_kind, staff_name)
+        for _, row in duplicate_df.iterrows():
+            if int(row.get("id") or 0) == int(shift_id):
+                continue
+            if shift_duplicate_key(row.get("shift_date"), row.get("shift_kind"), row.get("staff_name")) == new_key:
+                return ShiftSaveResult(
+                    SHIFT_SAVE_DUPLICATE,
+                    message="同じ職員・日付・勤務区分が登録済みのため、更新しませんでした。",
+                )
+
+    execute("""
+        UPDATE staff_shifts
+        SET shift_date=?, staff_name=?, shift_kind=?, start_time=?, end_time=?, next_day=?, memo=?, updated_at=?
+        WHERE id=?
+    """, (
+        str(shift_date), staff_name, shift_kind, start_time or None, end_time or None,
+        int(next_day or 0), str(memo or "").strip() or None, now_text(), int(shift_id),
+    ))
+    clear_shift_caches()
+    return ShiftSaveResult(SHIFT_SAVE_SAVED, count=1, message="シフトを更新しました。")
+
+
+def delete_staff_shift(shift_id):
+    """過去シフト削除を確定状態の共通ガード経由で実行する。"""
+    current_df = fetch_df(f"SELECT {SHIFT_COLUMNS} FROM staff_shifts WHERE id=? LIMIT 1", (int(shift_id),))
+    if current_df is None or current_df.empty:
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="削除対象のシフトが見つかりません。")
+    ensure_shift_date_editable(current_df.iloc[0].get("shift_date"))
+    execute("DELETE FROM staff_shifts WHERE id=?", (int(shift_id),))
+    clear_shift_caches()
+    return ShiftSaveResult(SHIFT_SAVE_SAVED, count=1, message="シフトを削除しました。")
 
 
 MANAGEMENT_INDEX_KIND = "__management__"
@@ -3034,9 +3207,20 @@ def shift_day_actual_label_for_staff(df, staff_name, target_date, read_index=Non
     target_staff = normalize_staff_name(staff_name)
     kinds = read_index["kinds_by_staff_date"].get(target_staff, {}).get(str(target_date), ())
     for kind in kinds:
-        label = shift_short_label(str(kind or ""))
+        label = "休" if str(kind or "") == "休み" else shift_short_label(str(kind or ""))
         if label and label not in labels:
             labels.append(label)
+    return labels_to_cell_value(labels)
+
+
+def shift_day_editor_cell_value(df, staff_name, target_date, read_index=None):
+    """直接入力用。帳票では非表示の通常休も「休」として区別する。"""
+    read_index = read_index or build_shift_read_index(df)
+    labels = shift_day_labels_for_staff(df, staff_name, target_date, read_index)
+    target_staff = normalize_staff_name(staff_name)
+    kinds = read_index["kinds_by_staff_date"].get(target_staff, {}).get(str(target_date), ())
+    if "休み" in kinds and "休" not in labels:
+        labels.append("休")
     return labels_to_cell_value(labels)
 
 
@@ -3128,7 +3312,7 @@ def max_consecutive_ones(values):
 def create_editable_shift_matrix(staff_names, df, year, month, read_index=None):
     """
     st.data_editorで直接入力しやすい月間シフト表を作る。
-    各セルは「」「日」「管」「夜」「明」「希」「有」「他」からプルダウン入力する。
+    各セルは「」「日」「管」「夜」「明」「休」「希」「有」「他」からプルダウン入力する。
     """
     last_day = calendar.monthrange(int(year), int(month))[1]
     # 職員名は正規化し、空白違いの重複行を1行にまとめる。
@@ -3156,8 +3340,9 @@ def create_editable_shift_matrix(staff_names, df, year, month, read_index=None):
         row = {"職員名": staff_name}
         for d in range(1, last_day + 1):
             target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
-            labels = shift_day_labels_for_staff(df, staff_name, target_date, read_index)
-            row[str(d)] = labels_to_cell_value(labels)
+            row[str(d)] = shift_day_editor_cell_value(
+                df, staff_name, target_date, read_index
+            )
         rows.append(row)
 
     return pd.DataFrame(rows, columns=columns)
@@ -3165,13 +3350,16 @@ def create_editable_shift_matrix(staff_names, df, year, month, read_index=None):
 
 def save_shift_matrix_from_editor(year, month, edited_df):
     """
-    月間シフト表の直接編集内容をDBへ反映する。
-    既存の該当月・該当職員分はいったん削除し、セルの内容から再作成する。
+    月間シフト表の直接編集内容を差分保存する。
+    表示値が変わった職員・日付だけを同一トランザクションで置き換える。
     """
+    year = int(year)
+    month = int(month)
+    ensure_shift_month_editable(year, month)
     if edited_df is None or edited_df.empty:
-        return 0
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存する変更がありません。")
 
-    last_day = calendar.monthrange(int(year), int(month))[1]
+    last_day = calendar.monthrange(year, month)[1]
     staff_names = []
     seen_staff_names = set()
     for v in edited_df["職員名"].tolist():
@@ -3180,45 +3368,60 @@ def save_shift_matrix_from_editor(year, month, edited_df):
             seen_staff_names.add(ns)
             staff_names.append(ns)
     if not staff_names:
-        return 0
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存対象の職員がいません。")
 
-    start = f"{int(year)}-{int(month):02d}-01"
-    end = f"{int(year)}-{int(month):02d}-{last_day:02d}"
-
-    # 既存データに「職員 A」「職員A」のような空白違いがあっても、
-    # 同じ正規化名としてまとめて削除してから保存する。
+    first_date = date(year, month, 1)
+    start = first_date.strftime("%Y-%m-%d")
+    comparison_start = (first_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    end = f"{year}-{month:02d}-{last_day:02d}"
     existing_month_df = fetch_staff_shifts_raw(start, end)
+    comparison_df = fetch_staff_shifts_raw(comparison_start, end)
+    comparison_index = build_shift_read_index(comparison_df)
+
+    aliases_by_staff = {}
     for staff_name in staff_names:
         aliases = {staff_name}
         if existing_month_df is not None and not existing_month_df.empty:
             for old_name in existing_month_df["staff_name"].dropna().astype(str).unique().tolist():
                 if normalize_staff_name(old_name) == staff_name:
                     aliases.add(old_name)
-        for alias in aliases:
-            execute(
-                "DELETE FROM staff_shifts WHERE shift_date BETWEEN ? AND ? AND staff_name=?",
-                (start, end, alias),
-            )
+        aliases_by_staff[staff_name] = aliases
 
-    params = []
+    operations = []
+    insert_params = []
+    changed_cells = 0
     for _, row in edited_df.iterrows():
         staff_name = normalize_staff_name(row.get("職員名", ""))
         if not staff_name:
             continue
         for d in range(1, last_day + 1):
-            label = str(row.get(str(d), "") or "").strip()
-            # 明/休のような表示が残った場合でも分解して保存する。
+            target_date = f"{year}-{month:02d}-{d:02d}"
+            raw_label = row.get(str(d), "")
+            label = "" if pd.isna(raw_label) else str(raw_label or "").strip()
+            original_label = shift_day_editor_cell_value(
+                comparison_df,
+                staff_name,
+                target_date,
+                comparison_index,
+            )
+            if label == original_label:
+                continue
+
+            changed_cells += 1
+            for alias in aliases_by_staff.get(staff_name, {staff_name}):
+                operations.append((
+                    "DELETE FROM staff_shifts WHERE shift_date=? AND staff_name=?",
+                    (target_date, alias),
+                ))
+
             labels = [label] if "/" not in label else [x.strip() for x in label.split("/") if x.strip()]
             kinds = []
             for lab in labels:
                 kinds.extend(shift_kind_from_editor_label(lab))
-            if not kinds:
-                continue
-            shift_date = f"{int(year)}-{int(month):02d}-{d:02d}"
             for kind in kinds:
                 stime, etime, next_day = default_shift_times(kind)
-                params.append((
-                    shift_date,
+                insert_params.append((
+                    target_date,
                     staff_name,
                     kind,
                     stime or None,
@@ -3229,18 +3432,24 @@ def save_shift_matrix_from_editor(year, month, edited_df):
                     now_text(),
                 ))
 
-    params = dedupe_shift_insert_params(params)
-    if not params:
-        clear_shift_caches()
-        return 0
+    if not changed_cells:
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="変更されたセルはありません。")
 
-    saved = execute_many("""
-        INSERT INTO staff_shifts
-        (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, params)
+    insert_params = dedupe_shift_insert_params(insert_params)
+    if insert_params:
+        operations.append(("""
+            INSERT INTO staff_shifts
+            (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, insert_params, True))
+    execute_transaction(operations)
     clear_shift_caches()
-    return saved
+    return ShiftSaveResult(
+        SHIFT_SAVE_SAVED,
+        count=len(insert_params),
+        changed_cells=changed_cells,
+        message=f"月間シフト表の変更セルを保存しました。変更セル：{changed_cells}件",
+    )
 
 
 def create_shift_shortage_table(df, year, month, read_index=None):
@@ -3390,6 +3599,112 @@ def create_shift_quality_check_table(df, year, month, read_index=None, matrix=No
                     })
 
     return pd.DataFrame(rows, columns=["重要度", "種類", "日付", "職員名", "内容"])
+
+
+def create_shift_duplicate_check_table(raw_df, year, month):
+    """同一職員・同一日に複数の登録がある箇所を確定前に検出する。"""
+    columns = ["重要度", "種類", "日付", "職員名", "内容"]
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=columns)
+    work = raw_df.copy()
+    work["_staff"] = work["staff_name"].apply(normalize_staff_name)
+    work["_date"] = work["shift_date"].astype(str)
+    month_prefix = f"{int(year)}-{int(month):02d}-"
+    work = work[work["_date"].str.startswith(month_prefix) & work["_staff"].astype(bool)]
+    rows = []
+    for (shift_date, staff_name), group in work.groupby(["_date", "_staff"], sort=True):
+        if len(group) <= 1:
+            continue
+        kinds = "、".join(group["shift_kind"].fillna("").astype(str).tolist())
+        rows.append({
+            "重要度": "高",
+            "種類": "同一職員・同一日の重複",
+            "日付": shift_date,
+            "職員名": staff_name,
+            "内容": f"同じ日に{len(group)}件の勤務が登録されています：{kinds}",
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_shift_confirmation_errors(
+    shortage_ng, quality_checks, limit_checks, duplicate_checks,
+    kot_error_df=None, kot_generation_error=None,
+):
+    """既存チェックのうち、勤務表の確定を禁止する重大エラーを一覧化する。"""
+    columns = ["区分", "重要度", "日付", "職員名", "内容"]
+    rows = []
+
+    for _, row in (shortage_ng if shortage_ng is not None else pd.DataFrame()).iterrows():
+        rows.append({
+            "区分": "必要人数不足", "重要度": "高",
+            "日付": str(row.get("日付", "")), "職員名": "",
+            "内容": str(row.get("不足", "必要人数を満たしていません。")),
+        })
+
+    for _, row in (duplicate_checks if duplicate_checks is not None else pd.DataFrame()).iterrows():
+        rows.append({
+            "区分": str(row.get("種類", "重複")), "重要度": "高",
+            "日付": str(row.get("日付", "")), "職員名": str(row.get("職員名", "")),
+            "内容": str(row.get("内容", "同一職員・同一日に重複があります。")),
+        })
+
+    high_checks = quality_checks if quality_checks is not None else pd.DataFrame()
+    if not high_checks.empty and "重要度" in high_checks.columns:
+        high_checks = high_checks[high_checks["重要度"].astype(str) == "高"]
+    for _, row in high_checks.iterrows():
+        rows.append({
+            "区分": str(row.get("種類", "勤務チェック")), "重要度": "高",
+            "日付": str(row.get("日付", "")), "職員名": str(row.get("職員名", "")),
+            "内容": str(row.get("内容", "重大な勤務上の問題があります。")),
+        })
+
+    # 上限値は設定された最大値であり、重要度表示にかかわらず超過を確定禁止とする。
+    for _, row in (limit_checks if limit_checks is not None else pd.DataFrame()).iterrows():
+        rows.append({
+            "区分": str(row.get("種類", "勤務回数上限超過")), "重要度": "高",
+            "日付": "", "職員名": str(row.get("職員名", "")),
+            "内容": str(row.get("内容", "勤務回数上限を超えています。")),
+        })
+
+    for _, row in (kot_error_df if kot_error_df is not None else pd.DataFrame()).iterrows():
+        detail_parts = []
+        for column in row.index:
+            value = row.get(column, "")
+            if pd.isna(value) or not str(value).strip():
+                continue
+            detail_parts.append(f"{column}:{value}")
+        detail = " / ".join(detail_parts)
+        rows.append({
+            "区分": "KING OF TIME重大エラー", "重要度": "高",
+            "日付": str(row.get("勤務日", row.get("日付", ""))),
+            "職員名": str(row.get("職員名", row.get("名前", ""))),
+            "内容": detail or "KING OF TIME出力に重大エラーがあります。",
+        })
+    if kot_generation_error:
+        rows.append({
+            "区分": "KING OF TIME重大エラー", "重要度": "高",
+            "日付": "", "職員名": "", "内容": str(kot_generation_error),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def confirm_shift_month_if_valid(year, month, confirmation_errors, confirmed_by=""):
+    """重大エラーが0件の場合だけ対象月を確定する。"""
+    status = get_shift_month_status(int(year), int(month))
+    if status.get("status_error"):
+        raise ShiftUpdateBlockedError(
+            f"{int(year)}年{int(month)}月の確定状態を確認できないため、確定処理を実行できません。"
+        )
+    if status.get("is_confirmed"):
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="この月はすでに確定済みです。")
+    if confirmation_errors is not None and not confirmation_errors.empty:
+        return ShiftSaveResult(
+            SHIFT_SAVE_BLOCKED,
+            count=len(confirmation_errors),
+            message="重大な問題があるため勤務表を確定できません。内容を修正して再確認してください。",
+        )
+    set_shift_month_status(int(year), int(month), True, confirmed_by)
+    return ShiftSaveResult(SHIFT_SAVE_SAVED, count=1, message="この月のシフトを確定しました。")
 
 
 def parse_hour_from_time_text(value):
@@ -4095,11 +4410,20 @@ def save_ai_shift_draft_rows(draft_df):
     画面表示後に上限やシフトが変更されても、DB保存時に日勤・夜勤・合計上限を超えないようにする。
     """
     if draft_df is None or draft_df.empty:
-        return 0
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存するAIシフト案がありません。")
 
     save_targets = draft_df[draft_df.get("保存対象", False).astype(bool)].copy()
     if save_targets.empty:
-        return 0
+        return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="保存対象にできるAIシフト案がありません。")
+
+    # DB更新より前に、保存対象となる全日付の確定状態を検査する。
+    checked_months = set()
+    for raw_date in save_targets["日付"].astype(str).tolist():
+        target = pd.to_datetime(raw_date, errors="raise").date()
+        key = (target.year, target.month)
+        if key not in checked_months:
+            ensure_shift_month_editable(*key)
+            checked_months.add(key)
 
     # 複数月が混在する可能性は低いが、安全のため日付順に処理する
     save_targets["_sort_date"] = save_targets["日付"].astype(str)
@@ -4148,14 +4472,21 @@ def save_ai_shift_draft_rows(draft_df):
 
     params = dedupe_shift_insert_params(params)
     if not params:
-        return 0
+        return ShiftSaveResult(
+            SHIFT_SAVE_DUPLICATE,
+            message="現在の勤務や上限と重複するため、保存できるAIシフト案はありませんでした。",
+        )
     saved = execute_many("""
         INSERT INTO staff_shifts
         (shift_date, staff_name, shift_kind, start_time, end_time, next_day, memo, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, params)
     clear_shift_caches()
-    return saved
+    return ShiftSaveResult(
+        SHIFT_SAVE_SAVED,
+        count=saved,
+        message=f"AIシフト案を {saved} 件保存しました。",
+    )
 
 def make_staff_shift_pdf(year, month):
     return report_make_staff_shift_pdf(
@@ -4342,7 +4673,8 @@ def _cached_shift_calendar_pdf(
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_king_of_time_clock_export(year, month, selected_staff_keys, report_signature, cache_version):
     return build_king_of_time_clock_export(
-        int(year), int(month), selected_staff_keys=list(selected_staff_keys)
+        int(year), int(month),
+        selected_staff_keys=None if selected_staff_keys is None else list(selected_staff_keys),
     )
 
 
@@ -4467,7 +4799,9 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None, r
     if message:
         st.success(message)
 
-    if month_status and month_status.get("is_confirmed"):
+    if month_status and month_status.get("status_error"):
+        st.error("確定状態を確認できないため、日別編集を停止しています。")
+    elif month_status and month_status.get("is_confirmed"):
         st.warning("この月は確定済みです。日別編集を保存する場合は、先に確定を解除してください。")
 
     with st.form(f"shift_day_editor_form_{selected_date.strftime('%Y%m%d')}"):
@@ -4484,22 +4818,25 @@ def render_selected_shift_day_editor(year, month, shift_df, month_status=None, r
                     SHIFT_EDITOR_OPTIONS,
                     index=current_index,
                     key=f"shift_day_select_{selected_date.strftime('%Y%m%d')}_{idx}_{staff_name}",
+                    disabled=bool(month_status and shift_month_is_read_only(month_status)),
                 )
         submitted = st.form_submit_button(
             "この日のシフトを保存",
             type="primary",
             use_container_width=True,
-            disabled=bool(month_status and month_status.get("is_confirmed")),
+            disabled=bool(month_status and shift_month_is_read_only(month_status)),
         )
 
     if not submitted:
         return
 
     try:
-        saved = save_day_shift_assignments(selected_date.strftime("%Y-%m-%d"), assignments)
+        result = save_day_shift_assignments(selected_date.strftime("%Y-%m-%d"), assignments)
         st.session_state["shift_editor_reset_counter"] = int(st.session_state.get("shift_editor_reset_counter", 0) or 0) + 1
-        st.session_state["last_shift_day_save_message"] = f"{date_label} のシフトを保存しました。登録件数：{saved}件"
+        st.session_state["last_shift_day_save_message"] = result.message
         st.rerun()
+    except ShiftUpdateBlockedError as e:
+        st.error(str(e))
     except Exception as e:
         st.error(f"この日のシフトを保存できませんでした：{e}")
 
@@ -4527,10 +4864,10 @@ def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_s
             options=SHIFT_EDITOR_OPTIONS,
             required=False,
             width="small",
-            help="日・管・夜・明・希・有・他を選択。空欄にすると削除扱いです。",
+            help="日・管・夜・明・休・希・有・他を選択。空欄にすると削除扱いです。",
         )
 
-    st.caption("各セルをクリックして、日・管・夜・明・希・有・他を直接入力できます。列見出しには曜日を表示しています。")
+    st.caption("各セルをクリックして、日・管・夜・明・休・希・有・他を直接入力できます。列見出しには曜日を表示しています。")
     edited_matrix = st.data_editor(
         editable_matrix,
         use_container_width=True,
@@ -4538,16 +4875,26 @@ def render_shift_editor(year, month, shift_df, staff_filter="全職員", month_s
         num_rows="fixed",
         column_config=column_config,
         key=f"shift_matrix_editor_{int(year)}_{int(month)}_{staff_filter}_{st.session_state.get('shift_editor_reset_counter', 0)}",
+        disabled=bool(month_status and shift_month_is_read_only(month_status)),
     )
 
-    if month_status and month_status.get("is_confirmed"):
-        st.warning("この月は確定済みです。修正する場合は、先に確定を解除してください。")
+    if month_status and shift_month_is_read_only(month_status):
+        if month_status.get("status_error"):
+            st.error("確定状態を確認できないため、月間シフト表の保存を停止しています。")
+        else:
+            st.warning("この月は確定済みです。修正する場合は、先に確定を解除してください。")
         return
     if st.button("月間シフト表の入力内容を保存", use_container_width=True, type="primary"):
-        saved = save_shift_matrix_from_editor(int(year), int(month), edited_matrix)
-        clear_shift_caches()
-        st.success(f"月間シフト表を保存しました。登録件数：{saved}件")
-        st.rerun()
+        try:
+            result = save_shift_matrix_from_editor(int(year), int(month), edited_matrix)
+            if result.status == SHIFT_SAVE_SAVED:
+                queue_shift_save_result(result)
+                st.rerun()
+            show_shift_save_result(result)
+        except ShiftUpdateBlockedError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"月間シフト表を保存できませんでした：{e}")
 
 
 def page_shift_manager():
@@ -4562,10 +4909,14 @@ def page_shift_manager():
         staff_filter = st.selectbox("表示する職員", ["全職員"] + get_active_staff(), key=f"shift_staff_filter_{int(shift_year)}_{int(shift_month)}")
 
     month_status = get_shift_month_status(int(shift_year), int(shift_month))
-    if month_status.get("is_confirmed"):
+    month_read_only = shift_month_is_read_only(month_status)
+    if month_status.get("status_error"):
+        st.error("この月の確定状態を確認できないため、勤務データの更新と確定操作を停止しています。")
+    elif month_status.get("is_confirmed"):
         st.success(f"この月のシフトは確定済みです。確定日時：{month_status.get('confirmed_at', '')}")
     else:
         st.info("この月のシフトは作成中です。")
+    render_queued_shift_save_result()
 
     staff_options = [""] + get_active_staff()
     shift_df = get_staff_shifts_month(int(shift_year), int(shift_month), include_prev_day=True)
@@ -4585,79 +4936,102 @@ def page_shift_manager():
         with st.form("hope_shift_form", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             with c1:
-                hope_date = st.date_input("日付", value=today, key="hope_date")
+                hope_date = st.date_input("日付", value=today, key="hope_date", disabled=month_read_only)
             with c2:
-                hope_staff = st.selectbox("職員", staff_options, key="hope_staff")
+                hope_staff = st.selectbox("職員", staff_options, key="hope_staff", disabled=month_read_only)
             with c3:
-                hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind")
-            hope_memo = st.text_input("メモ", placeholder="本人希望、通院、家庭都合など")
-            submit_hope = st.form_submit_button("保存")
+                hope_kind = st.selectbox("区分", ["希望休", "有休", "休み"], key="hope_kind", disabled=month_read_only)
+            hope_memo = st.text_input("メモ", placeholder="本人希望、通院、家庭都合など", disabled=month_read_only)
+            submit_hope = st.form_submit_button("保存", disabled=month_read_only)
         if submit_hope:
             if not hope_staff:
                 st.error("職員を選択してください。")
             else:
-                save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
-                clear_shift_caches()
-                st.success(f"{hope_staff} さんの {hope_kind} を保存しました。")
-                st.rerun()
+                try:
+                    result = save_single_shift(hope_date.strftime("%Y-%m-%d"), hope_staff, hope_kind, None, None, 0, hope_memo)
+                    if result.status == SHIFT_SAVE_SAVED:
+                        queue_shift_save_result(result)
+                        st.rerun()
+                    show_shift_save_result(result)
+                except ShiftUpdateBlockedError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"休暇・休みを保存できませんでした：{e}")
 
     with st.expander("1日分の基本シフト入力"):
         with st.form("basic_shift_form", clear_on_submit=True):
-            shift_date = st.date_input("シフト日", value=today)
+            shift_date = st.date_input("シフト日", value=today, disabled=month_read_only)
             c1, c2, c3 = st.columns(3)
             with c1:
-                day_staff_1 = st.selectbox("日勤1", staff_options, key="day_staff_1")
+                day_staff_1 = st.selectbox("日勤1", staff_options, key="day_staff_1", disabled=month_read_only)
             with c2:
-                day_staff_2 = st.selectbox("日勤2", staff_options, key="day_staff_2")
+                day_staff_2 = st.selectbox("日勤2", staff_options, key="day_staff_2", disabled=month_read_only)
             with c3:
-                night_staff = st.selectbox("夜勤", staff_options, key="night_staff")
-            shift_memo = st.text_input("シフトメモ")
-            submit_basic = st.form_submit_button("この日の基本シフトを保存")
+                night_staff = st.selectbox("夜勤", staff_options, key="night_staff", disabled=month_read_only)
+            shift_memo = st.text_input("シフトメモ", disabled=month_read_only)
+            submit_basic = st.form_submit_button("この日の基本シフトを保存", disabled=month_read_only)
         if submit_basic:
             if not day_staff_1 and not day_staff_2 and not night_staff:
                 st.error("少なくとも1名を選択してください。")
             else:
-                saved = save_basic_day_shift(shift_date.strftime("%Y-%m-%d"), day_staff_1, day_staff_2, night_staff, shift_memo)
-                clear_shift_caches()
-                st.success(f"{shift_date.strftime('%Y-%m-%d')} の基本シフトを {saved} 件保存しました。")
-                st.rerun()
+                try:
+                    result = save_basic_day_shift(shift_date.strftime("%Y-%m-%d"), day_staff_1, day_staff_2, night_staff, shift_memo)
+                    if result.status == SHIFT_SAVE_SAVED:
+                        queue_shift_save_result(result)
+                        st.rerun()
+                    show_shift_save_result(result)
+                except ShiftUpdateBlockedError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"基本シフトを保存できませんでした：{e}")
 
     with st.expander("個別シフトを追加・調整する"):
         with st.form("single_shift_form", clear_on_submit=True):
-            s_date = st.date_input("日付", value=today, key="single_shift_date")
+            s_date = st.date_input("日付", value=today, key="single_shift_date", disabled=month_read_only)
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                s_staff = st.selectbox("職員", staff_options, key="single_shift_staff")
+                s_staff = st.selectbox("職員", staff_options, key="single_shift_staff", disabled=month_read_only)
             with c2:
-                s_kind = st.selectbox("勤務区分", SHIFT_KINDS, key="single_shift_kind")
+                s_kind = st.selectbox("勤務区分", SHIFT_KINDS, key="single_shift_kind", disabled=month_read_only)
             default_start, default_end, default_next = default_shift_times("日勤")
             with c3:
-                s_start = st.text_input("開始", value=default_start, key="single_shift_start")
+                s_start = st.text_input("開始", value=default_start, key="single_shift_start", disabled=month_read_only)
             with c4:
-                s_end = st.text_input("終了", value=default_end, key="single_shift_end")
-            s_next = st.checkbox("終了は翌日", value=False)
-            s_memo = st.text_input("メモ", key="single_shift_memo")
-            add_single = st.form_submit_button("個別シフトを追加")
+                s_end = st.text_input("終了", value=default_end, key="single_shift_end", disabled=month_read_only)
+            s_next = st.checkbox("終了は翌日", value=False, disabled=month_read_only)
+            s_memo = st.text_input("メモ", key="single_shift_memo", disabled=month_read_only)
+            add_single = st.form_submit_button("個別シフトを追加", disabled=month_read_only)
         if add_single:
             if not s_staff:
                 st.error("職員を選択してください。")
             else:
-                save_single_shift(s_date.strftime("%Y-%m-%d"), s_staff, s_kind, s_start, s_end, 1 if s_next else 0, s_memo)
-                clear_shift_caches()
-                st.success("個別シフトを追加しました。")
-                st.rerun()
+                try:
+                    result = save_single_shift(s_date.strftime("%Y-%m-%d"), s_staff, s_kind, s_start, s_end, 1 if s_next else 0, s_memo)
+                    if result.status == SHIFT_SAVE_SAVED:
+                        queue_shift_save_result(result)
+                        st.rerun()
+                    show_shift_save_result(result)
+                except ShiftUpdateBlockedError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"個別シフトを保存できませんでした：{e}")
 
     with st.expander("月間シフトを全部クリアして再入力する"):
         st.warning("表示中の月のシフト入力内容をすべて削除します。職員別勤務回数上限は残ります。")
         clear_confirm = st.checkbox(
             f"{int(shift_year)}年{int(shift_month)}月のシフトを全クリアすることを確認しました",
             key=f"clear_month_shift_confirm_{int(shift_year)}_{int(shift_month)}",
+            disabled=month_read_only,
         )
-        if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm):
-            clear_month_staff_shifts(int(shift_year), int(shift_month))
-            clear_shift_caches()
-            st.success("この月のシフトを全クリアしました。")
-            st.rerun()
+        if st.button("この月のシフトを全クリアする", use_container_width=True, disabled=not clear_confirm or month_read_only):
+            try:
+                result = clear_month_staff_shifts(int(shift_year), int(shift_month))
+                queue_shift_save_result(result)
+                st.rerun()
+            except ShiftUpdateBlockedError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"この月のシフトを全クリアできませんでした：{e}")
 
     render_shift_editor(
         int(shift_year), int(shift_month), shift_df, staff_filter, month_status,
@@ -4707,12 +5081,18 @@ def page_shift_manager():
         st.dataframe(create_shift_matrix(preview_shift_df, int(shift_year), int(shift_month)), use_container_width=True, hide_index=True)
         c_save, c_clear = st.columns(2)
         with c_save:
-            if st.button("確認したAIシフト案を保存する", use_container_width=True):
-                saved = save_ai_shift_draft_rows(draft)
-                clear_shift_caches()
-                st.success(f"AIシフト案を {saved} 件保存しました。")
-                st.session_state.pop("ai_shift_draft", None)
-                st.rerun()
+            if st.button("確認したAIシフト案を保存する", use_container_width=True, disabled=month_read_only):
+                try:
+                    result = save_ai_shift_draft_rows(draft)
+                    if result.status == SHIFT_SAVE_SAVED:
+                        st.session_state.pop("ai_shift_draft", None)
+                        queue_shift_save_result(result)
+                        st.rerun()
+                    show_shift_save_result(result)
+                except ShiftUpdateBlockedError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"AIシフト案を保存できませんでした：{e}")
         with c_clear:
             if st.button("AIシフト案を破棄する", use_container_width=True):
                 st.session_state.pop("ai_shift_draft", None)
@@ -4730,6 +5110,12 @@ def page_shift_manager():
         shift_df, int(shift_year), int(shift_month), shift_read_index, matrix
     )
     limit_checks = create_shift_limit_check_table(matrix)
+    month_start = f"{int(shift_year)}-{int(shift_month):02d}-01"
+    month_end = f"{int(shift_year)}-{int(shift_month):02d}-{calendar.monthrange(int(shift_year), int(shift_month))[1]:02d}"
+    raw_month_shifts = fetch_staff_shifts_raw(month_start, month_end)
+    duplicate_checks = create_shift_duplicate_check_table(
+        raw_month_shifts, int(shift_year), int(shift_month)
+    )
     status_col = _status_column(shortage)
     shortage_ng = shortage[shortage[status_col].astype(str) != "OK"] if status_col and not shortage.empty else pd.DataFrame()
     c1, c2, c3, c4 = st.columns(4)
@@ -4758,6 +5144,9 @@ def page_shift_manager():
     else:
         st.warning("職員別の勤務回数上限を超えている箇所があります。")
         st.dataframe(limit_checks, use_container_width=True, hide_index=True)
+    if not duplicate_checks.empty:
+        st.error("同一職員・同一日に複数の勤務登録があります。")
+        st.dataframe(duplicate_checks, use_container_width=True, hide_index=True)
 
     st.markdown("### PDF/Excel/KING OF TIME CSV出力")
     st.caption("月間シフトカレンダーPDFは、保存済みの現在データから作成します。未保存の表編集はPDFに反映されません。先に保存してください。")
@@ -4846,6 +5235,7 @@ def page_shift_manager():
     kot_error_df = pd.DataFrame()
     kot_csv_bytes = None
     kot_generation_error = None
+    kot_report_signature = None
     try:
         kot_report_signature = _king_of_time_report_signature(
             shift_snapshot["base_hash"], shift_snapshot["kot_detail_hash"]
@@ -4860,22 +5250,59 @@ def page_shift_manager():
     except Exception as e:
         kot_generation_error = e
 
+    try:
+        if kot_report_signature is None:
+            raise RuntimeError("KING OF TIME検査用の帳票署名を作成できませんでした。")
+        _, confirmation_kot_error_df, _ = _cached_king_of_time_clock_export(
+            int(shift_year), int(shift_month), None,
+            kot_report_signature, KING_OF_TIME_CACHE_VERSION,
+        )
+        confirmation_kot_generation_error = None
+    except Exception as e:
+        confirmation_kot_error_df = pd.DataFrame()
+        confirmation_kot_generation_error = e
+
+    confirmation_errors = build_shift_confirmation_errors(
+        shortage_ng,
+        checks,
+        limit_checks,
+        duplicate_checks,
+        confirmation_kot_error_df,
+        confirmation_kot_generation_error,
+    )
+    if not confirmation_errors.empty:
+        st.error("重大な問題があるため、この勤務表は確定できません。")
+        st.dataframe(confirmation_errors, use_container_width=True, hide_index=True)
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if not month_status.get("is_confirmed"):
-            if st.button("この月のシフトを確定する", use_container_width=True):
-                if not checks.empty or not shortage_ng.empty:
-                    st.warning("確認事項または不足日があります。内容を確認したうえで、必要ならもう一度確定してください。")
-                set_shift_month_status(int(shift_year), int(shift_month), True, current_login_user_for_shift())
-                clear_shift_caches()
-                st.success("この月のシフトを確定しました。")
-                st.rerun()
+            if st.button(
+                "この月のシフトを確定する",
+                use_container_width=True,
+                disabled=bool(month_status.get("status_error") or not confirmation_errors.empty),
+            ):
+                try:
+                    result = confirm_shift_month_if_valid(
+                        int(shift_year), int(shift_month), confirmation_errors,
+                        current_login_user_for_shift(),
+                    )
+                    if result.status == SHIFT_SAVE_SAVED:
+                        queue_shift_save_result(result)
+                        st.rerun()
+                    show_shift_save_result(result)
+                except ShiftUpdateBlockedError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"勤務表を確定できませんでした：{e}")
         else:
             if st.button("確定を解除する", use_container_width=True):
-                set_shift_month_status(int(shift_year), int(shift_month), False, current_login_user_for_shift())
-                clear_shift_caches()
-                st.warning("この月のシフト確定を解除しました。")
-                st.rerun()
+                try:
+                    result = set_shift_month_status(int(shift_year), int(shift_month), False, current_login_user_for_shift())
+                    queue_shift_save_result(result)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"確定を解除できませんでした：{e}")
     with c2:
         if REPORTLAB_AVAILABLE:
             try:
@@ -4958,43 +5385,65 @@ def page_shift_manager():
         st.dataframe(search_df[["id", "shift_date", "staff_name", "shift_kind", "start_time", "end_time", "next_day", "memo"]], use_container_width=True, hide_index=True)
         selected_shift_id = st.selectbox("更新・削除するシフトID", search_df["id"].tolist())
         target = search_df[search_df["id"] == selected_shift_id].iloc[0]
+        target_date_for_status = pd.to_datetime(str(target["shift_date"]), errors="coerce")
+        target_month_status = (
+            get_shift_month_status(target_date_for_status.year, target_date_for_status.month)
+            if not pd.isna(target_date_for_status)
+            else {"is_confirmed": 0, "status_error": "勤務日を読み取れません。"}
+        )
+        target_read_only = shift_month_is_read_only(target_month_status)
+        if target_month_status.get("status_error"):
+            st.error("選択したシフトの確定状態を確認できないため、更新・削除を停止しています。")
+        elif target_month_status.get("is_confirmed"):
+            st.warning("選択したシフトの月は確定済みです。更新・削除する場合は先に確定を解除してください。")
         with st.form("shift_update_form"):
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                u_date = st.date_input("日付", value=datetime.strptime(target["shift_date"], "%Y-%m-%d").date())
+                u_date = st.date_input("日付", value=datetime.strptime(target["shift_date"], "%Y-%m-%d").date(), disabled=target_read_only)
             with c2:
                 current_staff = target["staff_name"] if target["staff_name"] in staff_options else ""
-                u_staff = st.selectbox("職員", staff_options, index=staff_options.index(current_staff) if current_staff in staff_options else 0)
+                u_staff = st.selectbox("職員", staff_options, index=staff_options.index(current_staff) if current_staff in staff_options else 0, disabled=target_read_only)
             with c3:
                 current_kind = shift_kind_for_selectbox(target["shift_kind"])
-                u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(current_kind) if current_kind in SHIFT_KINDS else 0)
+                u_kind = st.selectbox("勤務区分", SHIFT_KINDS, index=SHIFT_KINDS.index(current_kind) if current_kind in SHIFT_KINDS else 0, disabled=target_read_only)
             with c4:
-                u_next = st.checkbox("終了は翌日", value=bool(target["next_day"]))
-            u_start = st.text_input("開始時刻", value=format_time_for_display(target.get("start_time")))
-            u_end = st.text_input("終了時刻", value=format_time_for_display(target.get("end_time")))
-            u_memo = st.text_input("メモ", value=target["memo"] or "")
+                u_next = st.checkbox("終了は翌日", value=bool(target["next_day"]), disabled=target_read_only)
+            u_start = st.text_input("開始時刻", value=format_time_for_display(target.get("start_time")), disabled=target_read_only)
+            u_end = st.text_input("終了時刻", value=format_time_for_display(target.get("end_time")), disabled=target_read_only)
+            u_memo = st.text_input("メモ", value=target["memo"] or "", disabled=target_read_only)
             c_update, c_delete = st.columns(2)
             with c_update:
-                update_shift = st.form_submit_button("シフトを更新")
+                update_shift = st.form_submit_button("シフトを更新", disabled=target_read_only)
             with c_delete:
-                delete_shift = st.form_submit_button("シフトを削除")
+                delete_shift = st.form_submit_button("シフトを削除", disabled=target_read_only)
         if update_shift:
             if not u_staff:
                 st.error("職員を選択してください。")
             else:
-                execute("""
-                    UPDATE staff_shifts
-                    SET shift_date=?, staff_name=?, shift_kind=?, start_time=?, end_time=?, next_day=?, memo=?, updated_at=?
-                    WHERE id=?
-                """, (u_date.strftime("%Y-%m-%d"), u_staff, u_kind, u_start or None, u_end or None, 1 if u_next else 0, u_memo or None, now_text(), int(selected_shift_id)))
-                clear_shift_caches()
-                st.success("シフトを更新しました。")
-                st.rerun()
+                try:
+                    result = update_staff_shift(
+                        int(selected_shift_id), u_date.strftime("%Y-%m-%d"), u_staff, u_kind,
+                        u_start, u_end, 1 if u_next else 0, u_memo,
+                    )
+                    if result.status == SHIFT_SAVE_SAVED:
+                        queue_shift_save_result(result)
+                        st.rerun()
+                    show_shift_save_result(result)
+                except ShiftUpdateBlockedError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"シフトを更新できませんでした：{e}")
         if delete_shift:
-            execute("DELETE FROM staff_shifts WHERE id=?", (int(selected_shift_id),))
-            clear_shift_caches()
-            st.warning("シフトを削除しました。")
-            st.rerun()
+            try:
+                result = delete_staff_shift(int(selected_shift_id))
+                if result.status == SHIFT_SAVE_SAVED:
+                    queue_shift_save_result(result)
+                    st.rerun()
+                show_shift_save_result(result)
+            except ShiftUpdateBlockedError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"シフトを削除できませんでした：{e}")
 
     st.markdown("### カレンダー予定へのAI担当割当")
     events = monthly_events(int(shift_year), int(shift_month))
