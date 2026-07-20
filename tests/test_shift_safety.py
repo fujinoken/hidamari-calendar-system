@@ -252,6 +252,144 @@ class ShiftSafetyTests(unittest.TestCase):
         execute.assert_not_called()
 
 
+class ShiftNightRuleTests(unittest.TestCase):
+    @staticmethod
+    def quality(rows, year=2026, month=7):
+        return app.create_shift_quality_check_table(pd.DataFrame(rows), year, month)
+
+    @staticmethod
+    def row(shift_date, staff_name, shift_kind, **extra):
+        return {
+            "shift_date": shift_date,
+            "staff_name": staff_name,
+            "shift_kind": shift_kind,
+            **extra,
+        }
+
+    def test_shift_kind_classification_is_explicit(self):
+        expected = {
+            "日": app.SHIFT_CATEGORY_ACTUAL_WORK,
+            "管": app.SHIFT_CATEGORY_ACTUAL_WORK,
+            "夜": app.SHIFT_CATEGORY_NIGHT,
+            "明": app.SHIFT_CATEGORY_NIGHT_AFTER,
+            "休": app.SHIFT_CATEGORY_OFF,
+            "希": app.SHIFT_CATEGORY_OFF,
+            "有": app.SHIFT_CATEGORY_OFF,
+            "他": app.SHIFT_CATEGORY_ACTUAL_WORK,
+            "": app.SHIFT_CATEGORY_BLANK,
+        }
+        for symbol, category in expected.items():
+            with self.subTest(symbol=symbol):
+                self.assertEqual(app.classify_shift_kind_for_quality_check(symbol), category)
+
+    def test_night_to_night_after_is_normal_even_with_next_day_end_flag(self):
+        checks = self.quality([
+            self.row("2026-07-09", "田中", "夜勤", start_time="16:30", end_time="09:30", next_day=1),
+            self.row("2026-07-10", "田中", "夜勤明け"),
+        ])
+
+        night_checks = checks[checks["種類"].astype(str).str.contains("夜勤|明け翌日", regex=True)]
+        self.assertTrue(night_checks.empty)
+        errors = app.build_shift_confirmation_errors(
+            pd.DataFrame(), checks, pd.DataFrame(), pd.DataFrame()
+        )
+        self.assertTrue(errors.empty)
+
+    def test_night_to_actual_work_is_high_error_with_specific_dates_and_symbol(self):
+        for kind, symbol in (("日勤", "日"), ("管", "管"), ("夜勤", "夜"), ("その他", "他")):
+            with self.subTest(kind=kind):
+                checks = self.quality([
+                    self.row("2026-07-09", "田中", "夜勤"),
+                    self.row("2026-07-10", "田中", kind),
+                ])
+                errors = checks[
+                    (checks["種類"] == "夜勤翌日勤務")
+                    & (checks["重要度"] == "高")
+                ]
+                self.assertEqual(len(errors), 1)
+                detail = errors.iloc[0]["内容"]
+                self.assertIn("7月9日の夜勤", detail)
+                self.assertIn("7月10日", detail)
+                self.assertIn(f"「{symbol}」", detail)
+
+    def test_missing_night_after_is_medium_warning_for_blank_and_leave(self):
+        for kind, symbol in ((None, "空欄"), ("休み", "休"), ("希望休", "希"), ("有休", "有")):
+            with self.subTest(kind=kind):
+                rows = [self.row("2026-07-09", "田中", "夜勤")]
+                if kind:
+                    rows.append(self.row("2026-07-10", "田中", kind))
+                checks = self.quality(rows)
+                warning = checks[checks["種類"] == "夜勤明け未登録"]
+                self.assertEqual(len(warning), 1)
+                self.assertEqual(warning.iloc[0]["重要度"], "中")
+                self.assertIn(f"翌日の登録：{symbol}", warning.iloc[0]["内容"])
+                confirmation_errors = app.build_shift_confirmation_errors(
+                    pd.DataFrame(), checks, pd.DataFrame(), pd.DataFrame()
+                )
+                self.assertNotIn("夜勤明け未登録", confirmation_errors.get("区分", pd.Series(dtype=str)).tolist())
+
+    def test_night_after_then_day_is_attention_only_and_does_not_block_confirmation(self):
+        checks = self.quality([
+            self.row("2026-07-09", "田中", "夜勤"),
+            self.row("2026-07-10", "田中", "夜勤明け"),
+            self.row("2026-07-11", "田中", "日勤"),
+        ])
+        attention = checks[checks["種類"] == "明け翌日勤務（注意）"]
+        self.assertEqual(len(attention), 1)
+        self.assertEqual(attention.iloc[0]["重要度"], "中")
+        confirmation_errors = app.build_shift_confirmation_errors(
+            pd.DataFrame(), checks, pd.DataFrame(), pd.DataFrame()
+        )
+        self.assertTrue(confirmation_errors.empty)
+
+        with (
+            patch.object(app, "get_shift_month_status", return_value=_status()),
+            patch.object(app, "set_shift_month_status") as set_status,
+        ):
+            result = app.confirm_shift_month_if_valid(2026, 7, confirmation_errors, "tester")
+        self.assertEqual(result.status, app.SHIFT_SAVE_SAVED)
+        set_status.assert_called_once()
+
+    def test_month_year_leap_boundaries_and_date_types_are_normalized(self):
+        cases = (
+            (2026, 8, date(2026, 7, 31), datetime(2026, 8, 1, 0, 0)),
+            (2027, 1, datetime(2026, 12, 31, 16, 30), "2027-01-01 00:00:00"),
+            (2024, 3, "2024-02-29 16:30:00", date(2024, 3, 1)),
+        )
+        for year, month, night_date, after_date in cases:
+            with self.subTest(year=year, month=month):
+                checks = self.quality([
+                    self.row(night_date, "田中　太郎", "夜勤"),
+                    self.row(after_date, "田中 太郎", "夜勤明け"),
+                ], year, month)
+                self.assertNotIn("夜勤翌日勤務", checks["種類"].tolist())
+                self.assertNotIn("夜勤明け未登録", checks["種類"].tolist())
+
+    def test_other_staff_next_day_work_is_not_mistaken_for_night_staff(self):
+        checks = self.quality([
+            self.row("2026-07-09", "田中", "夜勤"),
+            self.row("2026-07-10", "佐藤", "日勤"),
+        ])
+        self.assertTrue(checks[checks["種類"] == "夜勤翌日勤務"].empty)
+
+    def test_real_night_next_day_error_still_blocks_confirmation(self):
+        checks = self.quality([
+            self.row("2026-07-09", "田中", "夜勤"),
+            self.row("2026-07-10", "田中", "日勤"),
+        ])
+        confirmation_errors = app.build_shift_confirmation_errors(
+            pd.DataFrame(), checks, pd.DataFrame(), pd.DataFrame()
+        )
+        self.assertIn("夜勤翌日勤務", confirmation_errors["区分"].tolist())
+        with (
+            patch.object(app, "get_shift_month_status", return_value=_status()),
+            patch.object(app, "set_shift_month_status") as set_status,
+        ):
+            result = app.confirm_shift_month_if_valid(2026, 7, confirmation_errors, "tester")
+        self.assertEqual(result.status, app.SHIFT_SAVE_BLOCKED)
+        set_status.assert_not_called()
+
+
 class ShiftManagerUiHelperTests(unittest.TestCase):
     def test_month_navigation_handles_year_boundaries(self):
         self.assertEqual(app.calculate_shift_month(2026, 7, -1), (2026, 6))

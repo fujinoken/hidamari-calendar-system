@@ -126,6 +126,67 @@ NIGHT_LIMIT_SHIFT_KINDS = ["夜勤"]
 MANAGEMENT_SHIFT_KINDS = ["管", "管理業務"]
 WORKDAY_SHIFT_KINDS = ["日勤", "管", "管理業務", "夜勤", "夜勤明け"]
 
+SHIFT_CATEGORY_ACTUAL_WORK = "actual_work"
+SHIFT_CATEGORY_NIGHT = "night"
+SHIFT_CATEGORY_NIGHT_AFTER = "night_after"
+SHIFT_CATEGORY_OFF = "off"
+SHIFT_CATEGORY_BLANK = "blank"
+SHIFT_CATEGORY_UNKNOWN = "unknown"
+
+SHIFT_RULE_KIND_LABELS = {
+    "日勤": "日",
+    "管": "管",
+    "管理業務": "管",
+    "夜勤": "夜",
+    "夜勤明け": "明",
+    "休み": "休",
+    "希望休": "希",
+    "有休": "有",
+    "その他": "他",
+}
+
+
+def classify_shift_kind_for_quality_check(shift_kind):
+    """夜勤前後チェック専用に、勤務種別を業務上の意味で明示分類する。"""
+    kind = str(shift_kind or "").strip()
+    if not kind:
+        return SHIFT_CATEGORY_BLANK
+    if kind in ("夜", "夜勤"):
+        return SHIFT_CATEGORY_NIGHT
+    if kind in ("明", "夜勤明け"):
+        return SHIFT_CATEGORY_NIGHT_AFTER
+    if kind in ("休", "休み", "希", "希望休", "有", "有休"):
+        return SHIFT_CATEGORY_OFF
+    if kind in ("日", "日勤", "管", "管理業務", "他", "その他"):
+        return SHIFT_CATEGORY_ACTUAL_WORK
+    return SHIFT_CATEGORY_UNKNOWN
+
+
+def normalize_shift_date_text(value):
+    """date・datetime・文字列の勤務日をYYYY-MM-DDへ正規化する。"""
+    if value is None or (not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)):
+        return ""
+    parsed = pd.to_datetime(value, errors="coerce")
+    if not pd.isna(parsed):
+        return parsed.strftime("%Y-%m-%d")
+    return str(value).strip()
+
+
+def format_shift_rule_date(value):
+    parsed = pd.to_datetime(normalize_shift_date_text(value), errors="coerce")
+    if pd.isna(parsed):
+        return str(value)
+    return f"{parsed.month}月{parsed.day}日"
+
+
+def format_shift_rule_kinds(kinds):
+    labels = []
+    for kind in kinds or ():
+        label = SHIFT_RULE_KIND_LABELS.get(str(kind or "").strip(), str(kind or "").strip())
+        if label and label not in labels:
+            labels.append(label)
+    return "・".join(labels) if labels else "空欄"
+
 
 @dataclass(frozen=True)
 class ShiftSaveResult:
@@ -2712,7 +2773,7 @@ def shift_duplicate_key(shift_date, shift_kind, staff_name, staff_id=None):
         staff_part = ("id", staff_key)
     else:
         staff_part = ("name", normalize_staff_name(staff_name))
-    return (str(shift_date or "").strip(), str(shift_kind or "").strip(), staff_part)
+    return (normalize_shift_date_text(shift_date), str(shift_kind or "").strip(), staff_part)
 
 
 def dedupe_shift_insert_params(params):
@@ -3225,8 +3286,8 @@ def build_shift_read_index(df, report_year=None, report_month=None):
             shift_date_value = values[positions["shift_date"]]
             staff_name_value = values[positions["staff_name"]]
             shift_kind_value = values[positions["shift_kind"]]
-            date_text = str(shift_date_value)
-            kind_text = str(shift_kind_value)
+            date_text = normalize_shift_date_text(shift_date_value)
+            kind_text = "" if pd.isna(shift_kind_value) else str(shift_kind_value).strip()
             staff_name_for_normalization = None if pd.isna(staff_name_value) else staff_name_value
             raw_staff_name = "" if staff_name_for_normalization is None else str(staff_name_value)
             normalized_staff_name = normalize_staff_name(staff_name_for_normalization)
@@ -3612,23 +3673,27 @@ def create_shift_quality_check_table(df, year, month, read_index=None, matrix=No
 
     if read_index is None:
         read_index = build_shift_read_index(df)
-    raw_kinds_by_staff_date = read_index["raw_kinds_by_staff_date"]
-    staff_names = list(read_index["raw_staff_names"])
+    kinds_by_staff_date = read_index["kinds_by_staff_date"]
+    staff_names = list(read_index["normalized_staff_names"])
     for staff_name in staff_names:
         work_flags = []
+        staff_dates = kinds_by_staff_date.get(staff_name, {})
         for d in range(1, last_day + 1):
             target_date = f"{int(year)}-{int(month):02d}-{d:02d}"
-            staff_dates = raw_kinds_by_staff_date.get(staff_name, {})
             kinds = list(staff_dates.get(target_date, ()))
+            categories = [classify_shift_kind_for_quality_check(kind) for kind in kinds]
 
             # 希望休・有休に勤務が重なっている
-            if any(k in kinds for k in OFF_OR_BLOCKING_SHIFT_KINDS) and any(k in kinds for k in ACTIVE_SHIFT_KINDS):
+            if (
+                SHIFT_CATEGORY_OFF in categories
+                and any(category in (SHIFT_CATEGORY_ACTUAL_WORK, SHIFT_CATEGORY_NIGHT, SHIFT_CATEGORY_NIGHT_AFTER) for category in categories)
+            ):
                 rows.append({
                     "重要度": "高",
                     "種類": "休み希望と勤務の重複",
                     "日付": target_date,
                     "職員名": staff_name,
-                    "内容": "休み・希望休・有休・その他と、日勤・夜勤・明けが同日に入っています。",
+                    "内容": "休み・希望休・有休と、実勤務・夜勤・明けが同日に入っています。",
                 })
 
             # 同じ日に日勤と夜勤が重なっている
@@ -3641,50 +3706,68 @@ def create_shift_quality_check_table(df, year, month, read_index=None, matrix=No
                     "内容": "同じ日に日勤と夜勤が入っています。日/夜入力は禁止です。",
                 })
 
-            # 夜勤翌日は「明」、明け翌日は「休み」を基本にする
+            # 夜勤翌日は「明」を基本とし、実勤務との衝突と明け未登録を分ける。
             try:
                 prev_date = (date(int(year), int(month), d) - timedelta(days=1)).strftime("%Y-%m-%d")
                 prev_kinds = list(staff_dates.get(prev_date, ()))
 
                 if "夜勤" in prev_kinds:
-                    if any(k in WORKDAY_SHIFT_KINDS for k in kinds):
+                    conflict_kinds = [
+                        kind for kind in kinds
+                        if classify_shift_kind_for_quality_check(kind)
+                        in (SHIFT_CATEGORY_ACTUAL_WORK, SHIFT_CATEGORY_NIGHT)
+                    ]
+                    if conflict_kinds:
                         rows.append({
                             "重要度": "高",
                             "種類": "夜勤翌日勤務",
                             "日付": target_date,
                             "職員名": staff_name,
-                            "内容": "夜勤の翌日に勤務が入っています。翌日は明け扱いにしてください。",
+                            "内容": (
+                                f"{format_shift_rule_date(prev_date)}の夜勤に対し、"
+                                f"{format_shift_rule_date(target_date)}に"
+                                f"「{format_shift_rule_kinds(conflict_kinds)}」が登録されています。"
+                            ),
                         })
-                    if "夜勤明け" not in kinds:
+                    elif "夜勤明け" not in kinds:
                         rows.append({
                             "重要度": "中",
-                            "種類": "夜勤翌日明け未登録",
+                            "種類": "夜勤明け未登録",
                             "日付": target_date,
                             "職員名": staff_name,
-                            "内容": "夜勤の翌日に「明」が登録されていません。",
+                            "内容": (
+                                f"{format_shift_rule_date(prev_date)}の夜勤に対し、"
+                                f"{format_shift_rule_date(target_date)}に「明」が登録されていません。"
+                                f"翌日の登録：{format_shift_rule_kinds(kinds)}"
+                            ),
                         })
 
                 if "夜勤明け" in prev_kinds:
-                    if any(k in WORKDAY_SHIFT_KINDS for k in kinds):
-                        rows.append({
-                            "重要度": "高",
-                            "種類": "明け翌日勤務",
-                            "日付": target_date,
-                            "職員名": staff_name,
-                            "内容": "明けの翌日に勤務が入っています。原則として休みにしてください。",
-                        })
-                    if not any(k in kinds for k in ["休み", "有休", "希望休"]):
+                    following_work = [
+                        kind for kind in kinds
+                        if classify_shift_kind_for_quality_check(kind)
+                        in (SHIFT_CATEGORY_ACTUAL_WORK, SHIFT_CATEGORY_NIGHT)
+                    ]
+                    if following_work:
                         rows.append({
                             "重要度": "中",
-                            "種類": "明け翌日休み未登録",
+                            "種類": "明け翌日勤務（注意）",
                             "日付": target_date,
                             "職員名": staff_name,
-                            "内容": "明けの翌日に休みが登録されていません。",
+                            "内容": (
+                                f"{format_shift_rule_date(prev_date)}の明け翌日に、"
+                                f"{format_shift_rule_date(target_date)}の"
+                                f"「{format_shift_rule_kinds(following_work)}」があります。"
+                                "休息時間を確認してください。"
+                            ),
                         })
             except Exception:
                 pass
 
-            work_flags.append(1 if any(k in WORKDAY_SHIFT_KINDS for k in kinds) else 0)
+            work_flags.append(1 if any(
+                category in (SHIFT_CATEGORY_ACTUAL_WORK, SHIFT_CATEGORY_NIGHT)
+                for category in categories
+            ) else 0)
 
         # 5連勤・6連勤以上
         cur = 0
@@ -3737,7 +3820,7 @@ def create_shift_duplicate_check_table(raw_df, year, month):
         return pd.DataFrame(columns=columns)
     work = raw_df.copy()
     work["_staff"] = work["staff_name"].apply(normalize_staff_name)
-    work["_date"] = work["shift_date"].astype(str)
+    work["_date"] = work["shift_date"].apply(normalize_shift_date_text)
     month_prefix = f"{int(year)}-{int(month):02d}-"
     work = work[work["_date"].str.startswith(month_prefix) & work["_staff"].astype(bool)]
     rows = []
@@ -4016,9 +4099,10 @@ def get_staff_day_shift_kinds(df, staff_name, target_date):
     target_staff = normalize_staff_name(staff_name)
     tmp = df.copy()
     tmp["_staff_norm"] = tmp["staff_name"].apply(normalize_staff_name)
+    tmp["_shift_date_norm"] = tmp["shift_date"].apply(normalize_shift_date_text)
     day_df = tmp[
         (tmp["_staff_norm"] == target_staff) &
-        (tmp["shift_date"].astype(str) == str(target_date))
+        (tmp["_shift_date_norm"] == normalize_shift_date_text(target_date))
     ]
     if day_df.empty:
         return []
