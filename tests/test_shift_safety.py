@@ -147,7 +147,7 @@ class ShiftSafetyTests(unittest.TestCase):
             self.assertEqual(confirmed.status, app.SHIFT_SAVE_SAVED)
             set_status.assert_called_once_with(2026, 7, True, "tester")
 
-    def test_confirmation_error_rules_separate_high_and_medium_checks(self):
+    def test_confirmation_rules_separate_staffing_shortages_and_quality_warnings(self):
         shortage = pd.DataFrame([{"日付": "2026-07-01", "不足": "夜勤あと1"}])
         quality = pd.DataFrame([
             {"重要度": "中", "種類": "5連勤", "日付": "2026-07-05", "職員名": "A", "内容": "注意"},
@@ -158,12 +158,73 @@ class ShiftSafetyTests(unittest.TestCase):
         kot = pd.DataFrame([{"職員名": "E", "勤務日": "2026-07-08", "項目": "従業員コード", "内容": "未登録"}])
 
         errors = app.build_shift_confirmation_errors(shortage, quality, limits, duplicates, kot)
+        warnings = app.build_shift_quality_warnings(quality, limits, duplicates, kot)
 
-        self.assertEqual(len(errors), 5)
-        self.assertNotIn("5連勤", errors["区分"].tolist())
-        self.assertIn("6連勤", errors["区分"].tolist())
-        self.assertIn("合計上限超過", errors["区分"].tolist())
-        self.assertIn("KING OF TIME重大エラー", errors["区分"].tolist())
+        self.assertEqual(errors["区分"].tolist(), ["必要人数不足"])
+        self.assertEqual(len(warnings), 5)
+        self.assertIn("5連勤", warnings["区分"].tolist())
+        self.assertIn("6連勤", warnings["区分"].tolist())
+        self.assertIn("合計上限超過", warnings["区分"].tolist())
+        self.assertIn("KING OF TIME確認事項", warnings["区分"].tolist())
+
+    def test_day_night_and_combined_shortages_are_detailed_and_block_confirmation(self):
+        cases = (
+            ("日勤不足", 1, 1, ["日勤"]),
+            ("夜勤不足", 2, 0, ["夜勤"]),
+            ("日勤夜勤不足", 0, 0, ["日勤", "夜勤"]),
+        )
+        for label, day_count, night_count, expected_kinds in cases:
+            with self.subTest(label=label):
+                shortage = pd.DataFrame([{
+                    "日付": "2026-07-01",
+                    "日勤人数": day_count,
+                    "夜勤人数": night_count,
+                    "状態": "要確認",
+                }])
+                staffing_shortages = app.build_shift_confirmation_errors(
+                    shortage, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+                )
+                self.assertEqual(staffing_shortages["勤務区分"].tolist(), expected_kinds)
+                self.assertFalse(app.can_finalize_shift(staffing_shortages))
+                with (
+                    patch.object(app, "get_shift_month_status", return_value=_status()),
+                    patch.object(app, "set_shift_month_status") as set_status,
+                ):
+                    result = app.confirm_shift_month_if_valid(
+                        2026, 7, staffing_shortages, "tester"
+                    )
+                self.assertEqual(result.status, app.SHIFT_SAVE_BLOCKED)
+                self.assertIn("必要人数", result.message)
+                set_status.assert_not_called()
+
+    def test_quality_warnings_do_not_block_confirmation(self):
+        quality = pd.DataFrame([{
+            "重要度": "高", "種類": "6連勤", "日付": "2026-07-06",
+            "職員名": "A", "内容": "要調整",
+        }])
+        limits = pd.DataFrame([{
+            "重要度": "高", "種類": "日勤上限超過",
+            "職員名": "A", "内容": "11/10",
+        }])
+        warnings = app.build_shift_quality_warnings(
+            quality, limits, pd.DataFrame(), pd.DataFrame()
+        )
+        staffing_shortages = app.build_shift_confirmation_errors(
+            pd.DataFrame(), quality, limits, pd.DataFrame()
+        )
+
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(staffing_shortages.empty)
+        self.assertTrue(app.can_finalize_shift(staffing_shortages))
+        with (
+            patch.object(app, "get_shift_month_status", return_value=_status()),
+            patch.object(app, "set_shift_month_status") as set_status,
+        ):
+            result = app.confirm_shift_month_if_valid(
+                2026, 7, staffing_shortages, "tester"
+            )
+        self.assertEqual(result.status, app.SHIFT_SAVE_SAVED)
+        set_status.assert_called_once_with(2026, 7, True, "tester")
 
     def test_monthly_editor_updates_only_changed_cell_and_preserves_other_records(self):
         month_rows = pd.DataFrame([
@@ -372,22 +433,26 @@ class ShiftNightRuleTests(unittest.TestCase):
         ])
         self.assertTrue(checks[checks["種類"] == "夜勤翌日勤務"].empty)
 
-    def test_real_night_next_day_error_still_blocks_confirmation(self):
+    def test_real_night_next_day_error_is_warning_and_does_not_block_confirmation(self):
         checks = self.quality([
             self.row("2026-07-09", "田中", "夜勤"),
             self.row("2026-07-10", "田中", "日勤"),
         ])
-        confirmation_errors = app.build_shift_confirmation_errors(
+        staffing_shortages = app.build_shift_confirmation_errors(
             pd.DataFrame(), checks, pd.DataFrame(), pd.DataFrame()
         )
-        self.assertIn("夜勤翌日勤務", confirmation_errors["区分"].tolist())
+        warnings = app.build_shift_quality_warnings(
+            checks, pd.DataFrame(), pd.DataFrame()
+        )
+        self.assertTrue(staffing_shortages.empty)
+        self.assertIn("夜勤翌日勤務", warnings["区分"].tolist())
         with (
             patch.object(app, "get_shift_month_status", return_value=_status()),
             patch.object(app, "set_shift_month_status") as set_status,
         ):
-            result = app.confirm_shift_month_if_valid(2026, 7, confirmation_errors, "tester")
-        self.assertEqual(result.status, app.SHIFT_SAVE_BLOCKED)
-        set_status.assert_not_called()
+            result = app.confirm_shift_month_if_valid(2026, 7, staffing_shortages, "tester")
+        self.assertEqual(result.status, app.SHIFT_SAVE_SAVED)
+        set_status.assert_called_once_with(2026, 7, True, "tester")
 
 
 class ShiftManagerUiHelperTests(unittest.TestCase):

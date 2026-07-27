@@ -3842,38 +3842,82 @@ def build_shift_confirmation_errors(
     shortage_ng, quality_checks, limit_checks, duplicate_checks,
     kot_error_df=None, kot_generation_error=None,
 ):
-    """既存チェックのうち、勤務表の確定を禁止する重大エラーを一覧化する。"""
-    columns = ["区分", "重要度", "日付", "職員名", "内容"]
+    """勤務表の確定を禁止する、日勤・夜勤の必要人数不足だけを一覧化する。"""
+    columns = [
+        "区分", "重要度", "日付", "勤務区分",
+        "必要人数", "配置人数", "不足人数", "内容",
+    ]
     rows = []
 
     for _, row in (shortage_ng if shortage_ng is not None else pd.DataFrame()).iterrows():
-        rows.append({
-            "区分": "必要人数不足", "重要度": "高",
-            "日付": str(row.get("日付", "")), "職員名": "",
-            "内容": str(row.get("不足", "必要人数を満たしていません。")),
-        })
+        shift_date = str(row.get("日付", ""))
+        staffing_details = (
+            ("日勤", 2, row.get("日勤人数")),
+            ("夜勤", 1, row.get("夜勤人数")),
+        )
+        detailed_row_added = False
+        for shift_kind, required_count, assigned_value in staffing_details:
+            try:
+                assigned_count = int(assigned_value)
+            except (TypeError, ValueError):
+                continue
+            if assigned_count >= required_count:
+                continue
+            shortage_count = required_count - assigned_count
+            rows.append({
+                "区分": "必要人数不足",
+                "重要度": "確定不可",
+                "日付": shift_date,
+                "勤務区分": shift_kind,
+                "必要人数": required_count,
+                "配置人数": assigned_count,
+                "不足人数": shortage_count,
+                "内容": (
+                    f"{shift_kind}の必要人数{required_count}名に対し、"
+                    f"配置人数は{assigned_count}名です（あと{shortage_count}名）。"
+                ),
+            })
+            detailed_row_added = True
+        if not detailed_row_added:
+            rows.append({
+                "区分": "必要人数不足",
+                "重要度": "確定不可",
+                "日付": shift_date,
+                "勤務区分": "",
+                "必要人数": "",
+                "配置人数": "",
+                "不足人数": "",
+                "内容": str(row.get("不足", "必要人数を満たしていません。")),
+            })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_shift_quality_warnings(
+    quality_checks, limit_checks, duplicate_checks,
+    kot_error_df=None, kot_generation_error=None,
+):
+    """必要人数不足以外の既存チェックを、確定を妨げない確認用警告にまとめる。"""
+    columns = ["区分", "重要度", "日付", "職員名", "内容"]
+    rows = []
 
     for _, row in (duplicate_checks if duplicate_checks is not None else pd.DataFrame()).iterrows():
         rows.append({
-            "区分": str(row.get("種類", "重複")), "重要度": "高",
+            "区分": str(row.get("種類", "重複")), "重要度": str(row.get("重要度", "高")),
             "日付": str(row.get("日付", "")), "職員名": str(row.get("職員名", "")),
             "内容": str(row.get("内容", "同一職員・同一日に重複があります。")),
         })
 
-    high_checks = quality_checks if quality_checks is not None else pd.DataFrame()
-    if not high_checks.empty and "重要度" in high_checks.columns:
-        high_checks = high_checks[high_checks["重要度"].astype(str) == "高"]
-    for _, row in high_checks.iterrows():
+    for _, row in (quality_checks if quality_checks is not None else pd.DataFrame()).iterrows():
         rows.append({
-            "区分": str(row.get("種類", "勤務チェック")), "重要度": "高",
+            "区分": str(row.get("種類", "勤務チェック")), "重要度": str(row.get("重要度", "警告")),
             "日付": str(row.get("日付", "")), "職員名": str(row.get("職員名", "")),
-            "内容": str(row.get("内容", "重大な勤務上の問題があります。")),
+            "内容": str(row.get("内容", "勤務上の確認事項があります。")),
         })
 
-    # 上限値は設定された最大値であり、重要度表示にかかわらず超過を確定禁止とする。
     for _, row in (limit_checks if limit_checks is not None else pd.DataFrame()).iterrows():
         rows.append({
-            "区分": str(row.get("種類", "勤務回数上限超過")), "重要度": "高",
+            "区分": str(row.get("種類", "勤務回数上限超過")), "重要度": str(row.get("重要度", "警告")),
             "日付": "", "職員名": str(row.get("職員名", "")),
             "内容": str(row.get("内容", "勤務回数上限を超えています。")),
         })
@@ -3887,21 +3931,26 @@ def build_shift_confirmation_errors(
             detail_parts.append(f"{column}:{value}")
         detail = " / ".join(detail_parts)
         rows.append({
-            "区分": "KING OF TIME重大エラー", "重要度": "高",
+            "区分": "KING OF TIME確認事項", "重要度": "警告",
             "日付": str(row.get("勤務日", row.get("日付", ""))),
             "職員名": str(row.get("職員名", row.get("名前", ""))),
-            "内容": detail or "KING OF TIME出力に重大エラーがあります。",
+            "内容": detail or "KING OF TIME出力に確認事項があります。",
         })
     if kot_generation_error:
         rows.append({
-            "区分": "KING OF TIME重大エラー", "重要度": "高",
+            "区分": "KING OF TIME確認事項", "重要度": "警告",
             "日付": "", "職員名": "", "内容": str(kot_generation_error),
         })
     return pd.DataFrame(rows, columns=columns)
 
 
-def confirm_shift_month_if_valid(year, month, confirmation_errors, confirmed_by=""):
-    """重大エラーが0件の場合だけ対象月を確定する。"""
+def can_finalize_shift(staffing_shortages):
+    """日勤・夜勤の必要人数不足がなければ確定可能とする。"""
+    return staffing_shortages is None or staffing_shortages.empty
+
+
+def confirm_shift_month_if_valid(year, month, staffing_shortages, confirmed_by=""):
+    """日勤・夜勤の必要人数不足が0件の場合だけ対象月を確定する。"""
     status = get_shift_month_status(int(year), int(month))
     if status.get("status_error"):
         raise ShiftUpdateBlockedError(
@@ -3909,11 +3958,11 @@ def confirm_shift_month_if_valid(year, month, confirmation_errors, confirmed_by=
         )
     if status.get("is_confirmed"):
         return ShiftSaveResult(SHIFT_SAVE_NO_CHANGE, message="この月はすでに確定済みです。")
-    if confirmation_errors is not None and not confirmation_errors.empty:
+    if not can_finalize_shift(staffing_shortages):
         return ShiftSaveResult(
             SHIFT_SAVE_BLOCKED,
-            count=len(confirmation_errors),
-            message="重大な問題があるため勤務表を確定できません。内容を修正して再確認してください。",
+            count=len(staffing_shortages),
+            message="日勤・夜勤の必要人数を満たしていない日があるため、この勤務表は確定できません。",
         )
     set_shift_month_status(int(year), int(month), True, confirmed_by)
     return ShiftSaveResult(SHIFT_SAVE_SAVED, count=1, message="この月のシフトを確定しました。")
@@ -5345,11 +5394,19 @@ def page_shift_manager():
     )
     status_col = _status_column(shortage)
     shortage_ng = shortage[shortage[status_col].astype(str) != "OK"] if status_col and not shortage.empty else pd.DataFrame()
+    staffing_shortages = build_shift_confirmation_errors(
+        shortage_ng, checks, limit_checks, duplicate_checks
+    )
+    quality_warning_count = (
+        (0 if checks is None or checks.empty else len(checks))
+        + (0 if limit_checks.empty else len(limit_checks))
+        + (0 if duplicate_checks.empty else len(duplicate_checks))
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("人員不足日", len(shortage_ng))
+        st.metric("人員不足", len(staffing_shortages))
     with c2:
-        st.metric("重複・連勤警告", 0 if checks is None or checks.empty else len(checks))
+        st.metric("確認事項・警告", quality_warning_count)
     with c3:
         st.metric("上限超過", 0 if limit_checks.empty else len(limit_checks))
     with c4:
@@ -5372,7 +5429,7 @@ def page_shift_manager():
         st.warning("職員別の勤務回数上限を超えている箇所があります。")
         st.dataframe(limit_checks, use_container_width=True, hide_index=True)
     if not duplicate_checks.empty:
-        st.error("同一職員・同一日に複数の勤務登録があります。")
+        st.warning("同一職員・同一日に複数の勤務登録があります。内容を確認してください。")
         st.dataframe(duplicate_checks, use_container_width=True, hide_index=True)
 
     st.markdown("### PDF/Excel/KING OF TIME CSV出力")
@@ -5492,17 +5549,20 @@ def page_shift_manager():
         confirmation_kot_error_df = pd.DataFrame()
         confirmation_kot_generation_error = e
 
-    confirmation_errors = build_shift_confirmation_errors(
-        shortage_ng,
+    quality_warnings = build_shift_quality_warnings(
         checks,
         limit_checks,
         duplicate_checks,
         confirmation_kot_error_df,
         confirmation_kot_generation_error,
     )
-    if not confirmation_errors.empty:
-        st.error("重大な問題があるため、この勤務表は確定できません。")
-        st.dataframe(confirmation_errors, use_container_width=True, hide_index=True)
+    if not staffing_shortages.empty:
+        st.error("日勤・夜勤の必要人数を満たしていない日があるため、この勤務表は確定できません。")
+        st.dataframe(staffing_shortages, use_container_width=True, hide_index=True)
+    elif not quality_warnings.empty:
+        st.warning("シフト確認事項があります。内容を確認したうえで確定してください。")
+    if not quality_warnings.empty:
+        st.dataframe(quality_warnings, use_container_width=True, hide_index=True)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -5510,12 +5570,15 @@ def page_shift_manager():
             if st.button(
                 "この月のシフトを確定する",
                 use_container_width=True,
-                disabled=bool(month_status.get("status_error") or not confirmation_errors.empty),
+                disabled=bool(
+                    month_status.get("status_error")
+                    or not can_finalize_shift(staffing_shortages)
+                ),
             ):
                 try:
                     with st.spinner("確定しています…"):
                         result = confirm_shift_month_if_valid(
-                            int(shift_year), int(shift_month), confirmation_errors,
+                            int(shift_year), int(shift_month), staffing_shortages,
                             current_login_user_for_shift(),
                         )
                     if result.status == SHIFT_SAVE_SAVED:
