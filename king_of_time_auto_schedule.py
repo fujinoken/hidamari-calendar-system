@@ -13,16 +13,13 @@ from datetime import date, timedelta
 import pandas as pd
 
 
-CSV_COLUMNS = [
-    "従業員コード", "名前", "週の番号", "曜日の番号", "曜日",
-    "パターンコード", "パターン名", "勤務日種別コード", "勤務日種別名", "休暇区分名",
-]
-PREVIEW_COLUMNS = ["元の日付", "元のシフト区分"] + CSV_COLUMNS
+CSV_COLUMNS = ["勤務日", "従業員コード", "パターンコード"]
+PREVIEW_COLUMNS = ["元の日付", "元のシフト区分", "職員名"] + CSV_COLUMNS
 ISSUE_COLUMNS = ["種別", "職員名", "日付", "内容"]
 WEEKDAY_LABELS = {1: "日", 2: "月", 3: "火", 4: "水", 5: "木", 6: "金", 7: "土", 8: "祝"}
 WORK_SHIFT_KINDS = {"日勤", "夜勤", "管", "管理", "管理勤務", "管理業務"}
 NIGHT_AFTER_KINDS = {"明", "明け", "夜勤明け"}
-REST_SHIFT_KINDS = {"休み", "希望休"}
+EXCLUDED_SHIFT_KINDS = {"休", "休み", "有休", "希望休"} | NIGHT_AFTER_KINDS
 
 
 def _blank(value):
@@ -53,11 +50,8 @@ def validate_employee_code(value):
 
 def validate_pattern(pattern):
     code = normalize_employee_code(pattern.get("pattern_code"))
-    name = "" if _blank(pattern.get("pattern_name")) else str(pattern.get("pattern_name")).strip()
     if not re.fullmatch(r"[A-Za-z0-9]{3,10}", code):
         return "KING OF TIMEパターンコードは3～10文字の半角英数字で設定してください"
-    if len(name) > 100:
-        return "KING OF TIMEパターン名は100文字以内で設定してください"
     return ""
 
 
@@ -124,7 +118,6 @@ def japan_holiday_dates(year):
 def csv_bytes(rows, columns=CSV_COLUMNS, encoding="cp932"):
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=list(columns), extrasaction="ignore", lineterminator="\r\n")
-    writer.writeheader()
     for row in rows:
         writer.writerow({column: "" if _blank(row.get(column)) else row.get(column) for column in columns})
     return output.getvalue().encode(encoding)
@@ -143,7 +136,7 @@ def _result(preview_rows, errors, warnings):
                 value.encode("cp932")
             except UnicodeEncodeError:
                 errors.append(_issue(
-                    "重大エラー", row.get("名前", ""), row.get("元の日付", ""),
+                    "重大エラー", row.get("職員名", ""), row.get("元の日付", ""),
                     f"{column}「{value}」にcp932で表現できない文字が含まれています",
                 ))
     error_df = pd.DataFrame(errors, columns=ISSUE_COLUMNS)
@@ -190,8 +183,6 @@ def build_auto_schedule_export(
         code, message = validate_employee_code(staff.get("staff_code"))
         if message:
             errors.append(_issue("重大エラー", name, "", message))
-        elif len(name) > 80:
-            errors.append(_issue("重大エラー", name, "", "名前は80文字以内で設定してください"))
         else:
             valid_staff[name] = code
 
@@ -203,8 +194,6 @@ def build_auto_schedule_export(
             frame[column] = ""
     sort_columns = [column for column in ("shift_date", "staff_name", "shift_kind", "id") if column in frame]
     frame = frame.sort_values(sort_columns, kind="stable")
-    holiday_dates = set(holiday_dates) if holiday_dates is not None else japan_holiday_dates(year)
-
     for _, row in frame.iterrows():
         staff_name = str(row.get("staff_name") or "").strip()
         if staff_name not in valid_staff:
@@ -218,8 +207,8 @@ def build_auto_schedule_export(
             continue
         if target.year != year or target.month != month:
             continue
-        if shift_kind in NIGHT_AFTER_KINDS:
-            warnings.append(_issue("警告", staff_name, raw_date, "出力対象外の「明」です"))
+        if shift_kind in EXCLUDED_SHIFT_KINDS:
+            warnings.append(_issue("警告", staff_name, raw_date, f"出力対象外の「{shift_kind}」です"))
             continue
         if not shift_kind:
             warnings.append(_issue("警告", staff_name, raw_date, "未確定シフトのため出力しません"))
@@ -233,59 +222,26 @@ def build_auto_schedule_export(
                 errors.append(_issue("重大エラー", staff_name, raw_date, f"{shift_kind}の{pattern_error}"))
                 continue
             pattern_code = normalize_employee_code(pattern.get("pattern_code"))
-            pattern_name = "" if _blank(pattern.get("pattern_name")) else str(pattern.get("pattern_name")).strip()
-            day_type_code = str(pattern.get("day_type_code") or "1")
-            day_type_name = str(pattern.get("day_type_name") or "平日")
-            leave_name = "" if _blank(pattern.get("leave_name")) else str(pattern.get("leave_name")).strip()
-        elif shift_kind in REST_SHIFT_KINDS:
-            pattern_code = pattern_name = ""
-            day_type_code = str(settings.get("rest_day_type_code") or "3")
-            day_type_name = str(settings.get("rest_day_type_name") or "法定外休日")
-            leave_name = str(settings.get("rest_leave_name") or "公休")
-        elif shift_kind == "有休":
-            pattern_code = pattern_name = ""
-            day_type_code = str(settings.get("paid_day_type_code") or "1")
-            day_type_name = str(settings.get("paid_day_type_name") or "平日")
-            leave_name = str(settings.get("paid_leave_name") or "有休")
         else:
             warnings.append(_issue("警告", staff_name, raw_date, f"勤務扱いか休日扱いか未設定の区分「{shift_kind}」です"))
             continue
 
-        week = calendar_week_number(target)
-        day_number = weekday_number(target, holiday_as_eight, target in holiday_dates)
-        normal_day_number = weekday_number(target)
-        if shift_kind in REST_SHIFT_KINDS and str(settings.get("statutory_weekday") or "") == str(normal_day_number):
-            day_type_code, day_type_name = "2", "法定休日"
-        elif shift_kind in WORK_SHIFT_KINDS and target in holiday_dates:
-            holiday_code = str(settings.get("holiday_day_type_code") or "1")
-            day_type_code = holiday_code
-            day_type_name = {"1": "平日", "2": "法定休日", "3": "法定外休日"}.get(holiday_code, "平日")
-        if not 1 <= week <= 6:
-            errors.append(_issue("重大エラー", staff_name, raw_date, "週の番号が不正です"))
-            continue
-        if not 1 <= day_number <= 8:
-            errors.append(_issue("重大エラー", staff_name, raw_date, "曜日の番号が不正です"))
-            continue
         preview_rows.append({
             "元の日付": target.isoformat(), "元のシフト区分": shift_kind,
-            "従業員コード": valid_staff[staff_name], "名前": staff_name,
-            "週の番号": week, "曜日の番号": day_number, "曜日": WEEKDAY_LABELS[day_number],
-            "パターンコード": pattern_code, "パターン名": pattern_name,
-            "勤務日種別コード": day_type_code, "勤務日種別名": day_type_name,
-            "休暇区分名": leave_name,
+            "職員名": staff_name, "勤務日": target.strftime("%Y%m%d"),
+            "従業員コード": valid_staff[staff_name], "パターンコード": pattern_code,
         })
 
     preview_rows.sort(key=lambda item: (
-        item["従業員コード"], item["週の番号"], item["曜日の番号"],
-        item["元の日付"], item["元のシフト区分"],
+        item["勤務日"], item["従業員コード"], item["パターンコード"],
     ))
     seen = set()
     for row in preview_rows:
-        key = (row["従業員コード"], row["週の番号"], row["曜日の番号"])
+        key = (row["従業員コード"], row["勤務日"])
         if key in seen:
             errors.append(_issue(
-                "重大エラー", row["名前"], row["元の日付"],
-                f"同一職員・同一週・同一曜日の行が重複しています（{key[1]}週・曜日{key[2]}）",
+                "重大エラー", row["職員名"], row["元の日付"],
+                f"同一職員・同一勤務日の行が重複しています（{key[1]}）",
             ))
         seen.add(key)
     return _result(preview_rows, errors, warnings)
